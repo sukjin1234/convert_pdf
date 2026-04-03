@@ -34,16 +34,19 @@ _ocr_reader: Optional[easyocr.Reader] = None
 _ocr_reader_langs: Optional[str] = None
 _IMG_RE = re.compile(r"!\[([^\]]*)\]\((.+?\.(?:png|jpe?g|gif|bmp|webp))\)", re.IGNORECASE)
 
-# ── 하이브리드 백엔드 자동 관리 ──────────────────────────────
+# ── 하이브리드 백엔드 설정 ───────────────────────────────────
 HYBRID_PORT = int(os.environ.get("HYBRID_PORT", "5002"))
 HYBRID_URL = f"http://127.0.0.1:{HYBRID_PORT}"
 HYBRID_OCR_LANG = os.environ.get("HYBRID_OCR_LANG", "ko,en")
 HYBRID_FORCE_OCR = os.environ.get("HYBRID_FORCE_OCR", "").strip().lower() in (
     "1", "true", "yes", "on",
 )
-HYBRID_PAGE_CHUNK = 1
-# 임시 하이브리드 프로세스를 N청크마다 재시작해서 메모리(std::bad_alloc) 누적을 끊는다.
-HYBRID_RECYCLE_EVERY = max(1, int(os.environ.get("HYBRID_RECYCLE_EVERY", "10")))
+# 한 청크에 넣을 페이지 수. bad_alloc이 ~28페이지에서 나므로 10이면 안전.
+HYBRID_PAGE_CHUNK = max(1, int(os.environ.get("HYBRID_PAGE_CHUNK", "10")))
+# 같은 임시 하이브리드에서 이만큼 청크를 처리한 뒤 재시작 (메모리 해제)
+HYBRID_RECYCLE_EVERY = max(1, int(os.environ.get("HYBRID_RECYCLE_EVERY", "2")))
+# 동시에 띄울 임시 하이브리드 프로세스 수 (GPU 메모리에 따라 조절)
+HYBRID_WORKERS = max(1, int(os.environ.get("HYBRID_WORKERS", "2")))
 
 _hybrid_proc: Optional[subprocess.Popen] = None
 _hybrid_child_force_ocr: bool = HYBRID_FORCE_OCR
@@ -134,76 +137,72 @@ async def _restart_hybrid(force_ocr: bool) -> None:
         print("[hybrid] 재시작 시간 초과", flush=True)
 
 
-# ── 임시(ephemeral) 하이브리드로 물리 청크 변환 ──────────────
+# ── 병렬 임시 하이브리드 변환 ─────────────────────────────────
 
-async def _convert_chunks_with_ephemeral(
-    in_path: str,
-    tmpdir: str,
+def _pre_extract_chunks(
+    in_path: str, tmpdir: str, n_pages: int, chunk_size: int,
+) -> list[tuple[int, int, str, str]]:
+    """원본 PDF를 한 번만 읽어 모든 청크 PDF + 출력 디렉터리를 미리 생성한다."""
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(in_path)
+    infos: list[tuple[int, int, str, str]] = []
+    for start in range(1, n_pages + 1, chunk_size):
+        end = min(start + chunk_size - 1, n_pages)
+        chunk_pdf = os.path.join(tmpdir, f"_chunk_{start}_{end}.pdf")
+        writer = PdfWriter()
+        for i in range(start - 1, end):
+            writer.add_page(reader.pages[i])
+        with open(chunk_pdf, "wb") as f:
+            writer.write(f)
+        chunk_out = os.path.join(tmpdir, f"out_{start}_{end}")
+        os.makedirs(chunk_out, exist_ok=True)
+        infos.append((start, end, chunk_pdf, chunk_out))
+    return infos
+
+
+async def _worker_loop(
+    worker_id: int,
+    chunk_indices: list[int],
+    chunk_infos: list[tuple[int, int, str, str]],
+    cli: str,
+    force_ocr: bool,
     kwargs_base: dict,
     n_pages: int,
-    eff_page_chunk: int,
-    force_ocr: bool,
-    ocr_lang: str,
-) -> tuple[str, Optional[JSONResponse]]:
-    """1-page 청크마다 잘린 PDF를 임시 하이브리드 서버로 변환한다.
-    HYBRID_RECYCLE_EVERY 청크마다 프로세스를 kill→재시작해서 네이티브 메모리 누적을 끊는다.
-    """
-    cli = _find_hybrid_cli()
-    if cli is None:
-        return "", JSONResponse(
-            status_code=503,
-            content={"ok": False, "error": "opendataloader-pdf-hybrid CLI를 찾을 수 없습니다."},
-        )
-
-    chunk_ranges = [
-        (s, min(s + eff_page_chunk - 1, n_pages))
-        for s in range(1, n_pages + 1, eff_page_chunk)
-    ]
-    total = len(chunk_ranges)
-    print(f"[hybrid-eph] 총 {n_pages}페이지 → {total}청크, 매 {HYBRID_RECYCLE_EVERY}청크마다 재활용", flush=True)
-
-    parts: list[str] = []
+    results: list[Optional[str]],
+    errors: list[Optional[str]],
+) -> None:
+    """한 워커가 할당된 청크들을 순서대로 처리한다.
+    HYBRID_RECYCLE_EVERY 청크마다 임시 하이브리드를 재시작한다."""
     proc: Optional[subprocess.Popen] = None
     eph_url: Optional[str] = None
     done_on_proc = 0
 
     try:
-        for idx, (start, end) in enumerate(chunk_ranges):
+        for idx in chunk_indices:
+            start, end, chunk_pdf, chunk_out = chunk_infos[idx]
+
             if proc is None or done_on_proc >= HYBRID_RECYCLE_EVERY:
                 if proc is not None:
                     _kill_proc(proc)
                     proc = None
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
                 port = _pick_free_port()
                 eph_url = f"http://127.0.0.1:{port}"
                 cmd = _build_hybrid_cmd(cli, force_ocr, port)
-                print(f"[hybrid-eph] 임시 하이브리드 시작 port={port} (청크 {idx+1}/{total}부터)", flush=True)
-                proc = subprocess.Popen(cmd)
-                if not await _wait_reachable(eph_url, proc):
-                    code = proc.poll()
-                    return "", JSONResponse(
-                        status_code=503,
-                        content={
-                            "ok": False,
-                            "error": f"임시 하이브리드 기동 실패 (exit={code}, port={port})",
-                        },
-                    )
-                print(f"[hybrid-eph] 준비 완료 ({eph_url})", flush=True)
-                done_on_proc = 0
-
-            chunk_pdf_name = f"_chunk_{start}_{end}.pdf"
-            chunk_pdf = os.path.join(tmpdir, chunk_pdf_name)
-            chunk_stem = _stem(chunk_pdf_name)
-            try:
-                _extract_pdf_pages(in_path, chunk_pdf, start, end)
-            except Exception as ex:
-                return "", JSONResponse(
-                    status_code=500,
-                    content={"ok": False, "error": f"PDF 분할 실패 (페이지 {start}-{end}): {ex}"},
+                print(
+                    f"[worker-{worker_id}] 임시 하이브리드 시작 port={port} "
+                    f"(청크 {idx+1}/{len(chunk_infos)}부터)",
+                    flush=True,
                 )
-
-            chunk_out = os.path.join(tmpdir, f"out_{start}_{end}")
-            os.makedirs(chunk_out, exist_ok=True)
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                if not await _wait_reachable(eph_url, proc):
+                    errors[idx] = f"임시 하이브리드 기동 실패 (worker={worker_id}, port={port})"
+                    return
+                print(f"[worker-{worker_id}] 준비 완료 ({eph_url})", flush=True)
+                done_on_proc = 0
 
             chunk_kw = {
                 **kwargs_base,
@@ -211,32 +210,157 @@ async def _convert_chunks_with_ephemeral(
                 "output_dir": chunk_out,
                 "hybrid_url": eph_url,
             }
-            opendataloader_pdf.convert(**chunk_kw)
-            done_on_proc += 1
 
-            md_path = _find(chunk_out, f"{chunk_stem}.md") or _find(chunk_out, "*.md")
-            if not md_path:
-                return "", JSONResponse(
-                    status_code=500,
-                    content={
-                        "ok": False,
-                        "error": f"Markdown 출력 없음 (페이지 {start}-{end}/{n_pages})",
-                    },
+            t0 = time.monotonic()
+            hybrid_ok = True
+            try:
+                await asyncio.to_thread(lambda kw=chunk_kw: opendataloader_pdf.convert(**kw))
+            except Exception as e:
+                hybrid_ok = False
+                print(
+                    f"[worker-{worker_id}] 하이브리드 실패 (페이지 {start}-{end}), "
+                    f"non-hybrid fallback 시도: {type(e).__name__}",
+                    flush=True,
                 )
 
-            with open(md_path, encoding="utf-8") as f:
-                chunk_md = f.read()
-            chunk_md = _replace_images_with_ocr(chunk_md, chunk_out, ocr_lang)
-            parts.append(
-                f"\n\n<!-- opendataloader: PDF pages {start}-{end} of {n_pages} -->\n\n"
-                f"{chunk_md}"
-            )
-            print(f"[hybrid-eph] 페이지 {start}-{end}/{n_pages} 완료 ({idx+1}/{total})", flush=True)
+            done_on_proc += 1
+            chunk_stem = _stem(os.path.basename(chunk_pdf))
+
+            # 하이브리드 성공 시에도 출력이 짧으면 partial_success → fallback 대상
+            md_text: Optional[str] = None
+            if hybrid_ok:
+                md_path = _find(chunk_out, f"{chunk_stem}.md") or _find(chunk_out, "*.md")
+                if md_path:
+                    with open(md_path, encoding="utf-8") as f:
+                        md_text = f.read()
+                expected_pages = end - start + 1
+                if md_text is not None and expected_pages > 1 and len(md_text.strip()) < expected_pages * 50:
+                    print(
+                        f"[worker-{worker_id}] 출력이 짧음 ({len(md_text.strip())} chars, "
+                        f"예상 {expected_pages * 50}+), non-hybrid fallback 시도",
+                        flush=True,
+                    )
+                    hybrid_ok = False
+
+            if not hybrid_ok:
+                fallback_out = chunk_out + "_fb"
+                os.makedirs(fallback_out, exist_ok=True)
+                fallback_kw = {
+                    "input_path": [chunk_pdf],
+                    "output_dir": fallback_out,
+                    "format": "markdown",
+                    "image_output": "external",
+                    "image_format": "png",
+                    "quiet": True,
+                }
+                try:
+                    await asyncio.to_thread(lambda kw=fallback_kw: opendataloader_pdf.convert(**kw))
+                    fb_md_path = _find(fallback_out, f"{chunk_stem}.md") or _find(fallback_out, "*.md")
+                    if fb_md_path:
+                        with open(fb_md_path, encoding="utf-8") as f:
+                            fb_text = f.read()
+                        if md_text is None or len(fb_text.strip()) > len(md_text.strip()):
+                            md_text = fb_text
+                            print(
+                                f"[worker-{worker_id}] fallback 성공 (페이지 {start}-{end}, "
+                                f"{len(fb_text.strip())} chars)",
+                                flush=True,
+                            )
+                except Exception as e2:
+                    print(f"[worker-{worker_id}] fallback도 실패: {e2}", flush=True)
+
+            elapsed = time.monotonic() - t0
+            if md_text is not None:
+                results[idx] = md_text
+                print(
+                    f"[worker-{worker_id}] 페이지 {start}-{end}/{n_pages} 완료 "
+                    f"({elapsed:.1f}초)",
+                    flush=True,
+                )
+            else:
+                errors[idx] = f"Markdown 출력 없음 (페이지 {start}-{end}/{n_pages})"
     finally:
         if proc is not None:
             _kill_proc(proc)
-            print("[hybrid-eph] 임시 하이브리드 종료", flush=True)
+            print(f"[worker-{worker_id}] 임시 하이브리드 종료", flush=True)
 
+
+async def _convert_chunks_parallel(
+    in_path: str,
+    tmpdir: str,
+    kwargs_base: dict,
+    n_pages: int,
+    force_ocr: bool,
+    ocr_lang: str,
+) -> tuple[str, Optional[JSONResponse]]:
+    """청크를 여러 임시 하이브리드 워커로 병렬 변환한다."""
+    cli = _find_hybrid_cli()
+    if cli is None:
+        return "", JSONResponse(
+            status_code=503,
+            content={"ok": False, "error": "opendataloader-pdf-hybrid CLI를 찾을 수 없습니다."},
+        )
+
+    t_total = time.monotonic()
+
+    # 1) 청크 PDF 일괄 추출
+    t0 = time.monotonic()
+    chunk_infos = _pre_extract_chunks(in_path, tmpdir, n_pages, HYBRID_PAGE_CHUNK)
+    total = len(chunk_infos)
+    print(
+        f"[convert] {n_pages}페이지 → {total}청크({HYBRID_PAGE_CHUNK}p) 추출 완료 "
+        f"({time.monotonic() - t0:.1f}초), 워커 {HYBRID_WORKERS}개 병렬",
+        flush=True,
+    )
+
+    # 2) 라운드로빈으로 워커에 청크 배분
+    worker_chunks: list[list[int]] = [[] for _ in range(HYBRID_WORKERS)]
+    for i in range(total):
+        worker_chunks[i % HYBRID_WORKERS].append(i)
+
+    results: list[Optional[str]] = [None] * total
+    errors: list[Optional[str]] = [None] * total
+
+    # 3) 병렬 변환
+    tasks = [
+        _worker_loop(
+            worker_id=w,
+            chunk_indices=indices,
+            chunk_infos=chunk_infos,
+            cli=cli,
+            force_ocr=force_ocr,
+            kwargs_base=kwargs_base,
+            n_pages=n_pages,
+            results=results,
+            errors=errors,
+        )
+        for w, indices in enumerate(worker_chunks)
+        if indices
+    ]
+    await asyncio.gather(*tasks)
+
+    # 4) 에러 체크
+    first_err = next((e for e in errors if e), None)
+    if first_err and all(r is None for r in results):
+        return "", JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": first_err},
+        )
+
+    # 5) OCR + 조립 (순차 — EasyOCR은 thread-safe 아님)
+    parts: list[str] = []
+    for i, (start, end, _, chunk_out) in enumerate(chunk_infos):
+        md = results[i]
+        if md is None:
+            md = f"<!-- 변환 실패: {errors[i] or 'unknown'} -->"
+        else:
+            md = _replace_images_with_ocr(md, chunk_out, ocr_lang)
+        parts.append(
+            f"\n\n<!-- opendataloader: PDF pages {start}-{end} of {n_pages} -->\n\n{md}"
+        )
+
+    elapsed_total = time.monotonic() - t_total
+    print(f"[convert] 전체 변환 완료: {n_pages}페이지, {elapsed_total:.1f}초", flush=True)
     return "".join(parts).lstrip(), None
 
 
@@ -318,8 +442,7 @@ async def convert(
     eff_force_ocr = hybrid_force_ocr if hybrid_force_ocr is not None else HYBRID_FORCE_OCR
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        safe_name = "input.pdf"
-        in_path = os.path.join(tmpdir, safe_name)
+        in_path = os.path.join(tmpdir, "input.pdf")
         out_dir = os.path.join(tmpdir, "out")
         os.makedirs(out_dir)
 
@@ -335,7 +458,8 @@ async def convert(
         )
 
         print(
-            f"[convert] use_hybrid={use_hybrid} pages={n_pages} chunk={HYBRID_PAGE_CHUNK} "
+            f"[convert] use_hybrid={use_hybrid} pages={n_pages} "
+            f"chunk={HYBRID_PAGE_CHUNK} workers={HYBRID_WORKERS} "
             f"force_ocr={eff_force_ocr} will_chunk={will_chunk}",
             flush=True,
         )
@@ -353,30 +477,27 @@ async def convert(
             kwargs["hybrid_url"] = hybrid_url
             kwargs["hybrid_fallback"] = True
 
-        stem = _stem(safe_name)
+        stem = _stem("input.pdf")
         markdown: str
 
         try:
             if will_chunk:
-                # ── 물리 청크: 임시 하이브리드로 N페이지씩 ──
                 if use_hybrid:
                     lang_changed = ocr_lang.strip() != HYBRID_OCR_LANG
                     if lang_changed:
                         _update_ocr_lang(ocr_lang.strip())
 
-                markdown, err_resp = await _convert_chunks_with_ephemeral(
+                markdown, err_resp = await _convert_chunks_parallel(
                     in_path=in_path,
                     tmpdir=tmpdir,
                     kwargs_base=kwargs,
                     n_pages=n_pages,
-                    eff_page_chunk=HYBRID_PAGE_CHUNK,
                     force_ocr=eff_force_ocr,
                     ocr_lang=ocr_lang,
                 )
                 if err_resp is not None:
                     return err_resp
             else:
-                # ── 단일 변환 (페이지 적거나 non-hybrid) ──
                 if use_hybrid:
                     lang_changed = ocr_lang.strip() != HYBRID_OCR_LANG
                     if lang_changed:
@@ -489,7 +610,6 @@ def _pdf_page_count(path: str) -> Optional[int]:
         print("[page_count] pypdf 미설치 — pip install pypdf", flush=True)
         return None
 
-    # 방법 1: pypdf
     try:
         with open(path, "rb") as f:
             n = len(PdfReader(f).pages)
@@ -498,7 +618,6 @@ def _pdf_page_count(path: str) -> Optional[int]:
     except Exception as e:
         print(f"[page_count] pypdf 실패: {e}", flush=True)
 
-    # 방법 2: 바이너리에서 /Type /Page 개수 세기 (근사치)
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -511,16 +630,6 @@ def _pdf_page_count(path: str) -> Optional[int]:
         print(f"[page_count] regex fallback 실패: {e2}", flush=True)
 
     return None
-
-
-def _extract_pdf_pages(src_pdf: str, dst_pdf: str, page_start_1: int, page_end_1: int) -> None:
-    from pypdf import PdfReader, PdfWriter
-    reader = PdfReader(src_pdf)
-    writer = PdfWriter()
-    for i in range(page_start_1 - 1, page_end_1):
-        writer.add_page(reader.pages[i])
-    with open(dst_pdf, "wb") as f:
-        writer.write(f)
 
 
 def _find(directory: str, pattern: str) -> Optional[str]:
@@ -536,4 +645,9 @@ if __name__ == "__main__":
     print(f"[GPU] CUDA 사용: {USE_GPU}", flush=True)
     if USE_GPU:
         print(f"[GPU] 디바이스: {torch.cuda.get_device_name(0)}", flush=True)
+    print(
+        f"[설정] CHUNK={HYBRID_PAGE_CHUNK}p RECYCLE={HYBRID_RECYCLE_EVERY} "
+        f"WORKERS={HYBRID_WORKERS}",
+        flush=True,
+    )
     uvicorn.run("main:app", host="localhost", port=8000, reload=True)

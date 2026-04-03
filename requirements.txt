@@ -1,5 +1,15 @@
+# --- 웹 API ---
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
+
+# --- PDF 변환 (하이브리드 포함) ---
 opendataloader-pdf[hybrid]>=2.0.0
 pypdf>=4.0.0
+
+# --- 이미지 전처리·마크다운 이미지 OCR ---
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+easyocr>=1.7.0
+# GPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch>=2.0.0
