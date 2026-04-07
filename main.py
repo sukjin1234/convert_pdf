@@ -41,7 +41,7 @@ DEFAULT_OCR_LANG     = os.environ.get("HYBRID_OCR_LANG", "ko,en")
 DEFAULT_FORCE_OCR    = os.environ.get("HYBRID_FORCE_OCR", "").strip().lower() in ("1", "true", "yes", "on")
 HYBRID_PAGE_CHUNK    = max(1, int(os.environ.get("HYBRID_PAGE_CHUNK", "10")))
 HYBRID_RECYCLE_EVERY = max(1, int(os.environ.get("HYBRID_RECYCLE_EVERY", "2")))
-HYBRID_WORKERS       = max(1, int(os.environ.get("HYBRID_WORKERS", "2")))
+HYBRID_WORKERS       = max(1, int(os.environ.get("HYBRID_WORKERS", "4")))
 MAX_UPLOAD_MB        = int(os.environ.get("MAX_UPLOAD_MB", "200"))
 RAG_TABLE_RECORD_MAX_ROWS = max(1, int(os.environ.get("RAG_TABLE_RECORD_MAX_ROWS", "40")))
 RAG_TABLE_CELL_MAX_CHARS = max(32, int(os.environ.get("RAG_TABLE_CELL_MAX_CHARS", "180")))
@@ -470,6 +470,7 @@ def _format_ocr_lines_for_markdown(lines: list[str]) -> str:
 
 def _extract_ocr_lines(reader: easyocr.Reader, img_array: np.ndarray) -> list[str]:
     """좌표/신뢰도 기반으로 OCR 결과를 정렬해 문장 순서를 안정화한다."""
+    img_array = _preprocess_for_ocr(img_array)
     lines_with_pos: list[tuple[float, float, str]] = []
     img_h = int(img_array.shape[0]) if hasattr(img_array, "shape") else 1000
 
@@ -597,6 +598,26 @@ def _read_image(path: str) -> Optional[np.ndarray]:
         return None
 
 
+def _preprocess_for_ocr(img: np.ndarray) -> np.ndarray:
+    """OCR 전처리: 그레이스케일 변환 → 소형 이미지 확대 → CLAHE 대비 향상 → 가우시안 노이즈 제거."""
+    if img is None:
+        return img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
+
+    # 너무 작은 이미지는 확대 (OCR 인식률 향상)
+    h, w = gray.shape[:2]
+    if min(h, w) < 100:
+        scale = max(2.0, 200.0 / min(h, w))
+        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+    # 지역 대비 향상 (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    # 가우시안 노이즈 제거
+    return cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+
 async def _replace_images_with_ocr(markdown: str, out_dir: str, lang_csv: str) -> str:
     """Markdown 내 이미지 참조를 OCR 텍스트 또는 Markdown 표로 대체한다.
 
@@ -683,56 +704,29 @@ def _norm_cell(v) -> str:
     return s
 
 
-def _df_to_markdown(df) -> str:
-    """pandas DataFrame → Markdown 표 문자열.
+def _rows_to_markdown(headers: list[str], data_rows: list[list[str]]) -> str:
+    """정규화된 헤더·데이터 행 → Markdown 표 문자열.
 
-    처리 순서:
-    1. 정수형 컬럼 인덱스 → 첫 행을 헤더로 승격
-    2. 셀 정규화 (<br> / \\n → 공백, | 이스케이프)
-    3. 완전히 빈 행 제거
-    4. 다중 헤더 행 감지·합성 (주 헤더 + 서브헤더 → 하나의 헤더 행)
-    5. 빈 셀은 보존 (과도한 값 전파로 인한 오답 방지)
+    1. 완전히 빈 행 제거
+    2. 다중 헤더 감지·합성 (헤더에 빈 열이 있고 첫 데이터 행이 그 자리를 채우면 서브헤더로 간주)
     """
-    if df is None or df.empty:
+    data_rows = [r for r in data_rows if any(r)]
+    if not data_rows:
         return ""
 
-    # 1) 정수형 컬럼 → 첫 행 헤더 승격
-    cols = list(df.columns)
-    if all(isinstance(c, int) for c in cols) and len(df) > 0:
-        candidate = [_norm_cell(v) for v in df.iloc[0]]
-        if any(candidate):  # 완전히 비어있지 않으면 헤더로
-            df = df.iloc[1:].reset_index(drop=True)
-            df.columns = candidate
-            cols = candidate
-
-    # 2) 정규화된 행 목록 생성
-    headers = [_norm_cell(c) for c in cols]
-    all_rows = [[_norm_cell(v) for v in row] for _, row in df.iterrows()]
-
-    # 3) 완전히 빈 행 제거
-    all_rows = [r for r in all_rows if any(r)]
-
-    if not all_rows:
-        return ""
-
-    # 4) 다중 헤더 감지: 헤더에 빈 열이 있고 첫 데이터 행이 그 위치를 채우면 서브헤더로 간주
     empty_h_pos = [i for i, h in enumerate(headers) if not h]
-    if empty_h_pos and all_rows:
-        first = all_rows[0]
+    if empty_h_pos:
+        first = data_rows[0]
         filled_at_empty = sum(1 for i in empty_h_pos if i < len(first) and first[i])
         if filled_at_empty >= max(1, len(empty_h_pos) // 2):
             merged: list[str] = []
             for i, h in enumerate(headers):
                 sub = first[i] if i < len(first) else ""
-                if h and sub:
-                    merged.append(f"{h} {sub}")
-                else:
-                    merged.append(h or sub)
+                merged.append(f"{h} {sub}" if h and sub else h or sub)
             headers = merged
-            all_rows = all_rows[1:]
-            all_rows = [r for r in all_rows if any(r)]
+            data_rows = [r for r in data_rows[1:] if any(r)]
 
-    if not all_rows:
+    if not data_rows:
         return ""
 
     n = len(headers)
@@ -740,11 +734,29 @@ def _df_to_markdown(df) -> str:
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
-    for row in all_rows:
+    for row in data_rows:
         padded = row + [""] * (n - len(row))
         lines.append("| " + " | ".join(padded[:n]) + " |")
-
     return "\n".join(lines)
+
+
+def _df_to_markdown(df) -> str:
+    """pandas DataFrame → Markdown 표 문자열.
+    정수형 컬럼 인덱스 → 첫 행 헤더 승격 후 _rows_to_markdown 위임."""
+    if df is None or df.empty:
+        return ""
+
+    cols = list(df.columns)
+    if all(isinstance(c, int) for c in cols) and len(df) > 0:
+        candidate = [_norm_cell(v) for v in df.iloc[0]]
+        if any(candidate):
+            df = df.iloc[1:].reset_index(drop=True)
+            df.columns = candidate
+            cols = candidate
+
+    headers = [_norm_cell(c) for c in cols]
+    all_rows = [[_norm_cell(v) for v in row] for _, row in df.iterrows()]
+    return _rows_to_markdown(headers, all_rows)
 
 
 def _image_to_markdown_table(img_path: str, img2table_ocr) -> Optional[str]:
@@ -757,8 +769,9 @@ def _image_to_markdown_table(img_path: str, img2table_ocr) -> Optional[str]:
         extracted = doc.extract_tables(
             ocr=img2table_ocr,
             implicit_rows=True,       # 명시적 구분선 없는 행도 감지
+            implicit_columns=True,    # 명시적 구분선 없는 열도 감지
             borderless_tables=True,   # 테두리 없는 표도 감지
-            min_confidence=50,
+            min_confidence=60,        # 노이즈 오인식 방지를 위해 상향
         )
 
         if not extracted:
@@ -787,52 +800,15 @@ def _image_to_markdown_table(img_path: str, img2table_ocr) -> Optional[str]:
 
 def _raw_table_to_markdown(raw_table: list[list[Optional[str]]]) -> Optional[str]:
     """pdfplumber raw 표 (리스트의 리스트) → Markdown 표 문자열.
-
-    pdfplumber는 병합 셀(rowspan/colspan)을 None으로 반환한다.
-    _df_to_markdown과 동일한 전처리(빈 행 제거, 다중 헤더 합성)를 적용한다."""
+    pdfplumber는 병합 셀(rowspan/colspan)을 None으로 반환한다."""
     if not raw_table or len(raw_table) < 2:
         return None
-
-    # 헤더 결정 (첫 행)
     header = [_norm_cell(v) for v in raw_table[0]]
     if len(header) < 2:
         return None
-
-    # 데이터 행 정규화
     data_rows = [[_norm_cell(v) for v in row] for row in raw_table[1:]]
-
-    # 완전히 빈 행 제거
-    data_rows = [r for r in data_rows if any(r)]
-    if not data_rows:
-        return None
-
-    # 다중 헤더 감지 (헤더에 빈 열이 있고 첫 데이터 행이 그 위치를 채우는 경우)
-    empty_h_pos = [i for i, h in enumerate(header) if not h]
-    if empty_h_pos and data_rows:
-        first = data_rows[0]
-        filled_at_empty = sum(1 for i in empty_h_pos if i < len(first) and first[i])
-        if filled_at_empty >= max(1, len(empty_h_pos) // 2):
-            merged: list[str] = []
-            for i, h in enumerate(header):
-                sub = first[i] if i < len(first) else ""
-                merged.append(f"{h} {sub}" if h and sub else h or sub)
-            header = merged
-            data_rows = data_rows[1:]
-            data_rows = [r for r in data_rows if any(r)]
-
-    if not data_rows:
-        return None
-
-    n = len(header)
-    lines = [
-        "| " + " | ".join(header) + " |",
-        "| " + " | ".join("---" for _ in header) + " |",
-    ]
-    for row in data_rows:
-        padded = row + [""] * (n - len(row))
-        lines.append("| " + " | ".join(padded[:n]) + " |")
-
-    return "\n".join(lines)
+    md = _rows_to_markdown(header, data_rows)
+    return md or None
 
 
 def _configure_pymupdf_logging(fitz_mod: Any) -> None:
@@ -942,7 +918,7 @@ def _pdf_tables_with_pdfplumber(pdf_path: str) -> dict[int, list[str]]:
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page_num, page in enumerate(pdf.pages, start=1):
-                # 1차: 격자선 기반 (정확도 높음)
+                # 1차: 완전한 격자선 기반 (정확도 가장 높음)
                 tables = page.extract_tables({
                     "vertical_strategy": "lines_strict",
                     "horizontal_strategy": "lines_strict",
@@ -952,7 +928,18 @@ def _pdf_tables_with_pdfplumber(pdf_path: str) -> dict[int, list[str]]:
                     "min_words_vertical": 1,
                     "min_words_horizontal": 1,
                 })
-                # 2차: 텍스트 정렬 기반 (격자선 없는 표)
+                # 2차: 일반 선 기반 (점선·불완전 선 포함)
+                if not tables:
+                    tables = page.extract_tables({
+                        "vertical_strategy": "lines",
+                        "horizontal_strategy": "lines",
+                        "snap_tolerance": 5,
+                        "join_tolerance": 5,
+                        "edge_min_length": 3,
+                        "min_words_vertical": 1,
+                        "min_words_horizontal": 1,
+                    })
+                # 3차: 텍스트 정렬 기반 (격자선 없는 표)
                 if not tables:
                     tables = page.extract_tables({
                         "vertical_strategy": "text",
@@ -1271,8 +1258,7 @@ def _pdf_page_count(path: str) -> Optional[int]:
     try:
         with open(path, "rb") as f:
             raw = f.read()
-        import re as _re
-        count = len(_re.findall(rb"/Type\s*/Page(?!s)", raw))
+        count = len(re.findall(rb"/Type\s*/Page(?!s)", raw))
         if count > 0:
             logger.info("[page_count] regex fallback → %d페이지", count)
             return count
