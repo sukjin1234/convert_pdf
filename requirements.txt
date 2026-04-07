@@ -1,15 +1,34 @@
-# --- 웹 API ---
+# ============================================================
+# 필수 의존성 (main.py 기본 실행)
+# ============================================================
+
+# 웹 API
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
 
-# --- PDF 변환 (하이브리드 포함) ---
+# PDF 변환/청크 처리
 opendataloader-pdf[hybrid]>=2.0.0
 pypdf>=4.0.0
 
-# --- 이미지 전처리·마크다운 이미지 OCR ---
+# OCR / 이미지 처리
 numpy>=1.24.0
 opencv-python-headless>=4.8.0
 easyocr>=1.7.0
-# GPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 torch>=2.0.0
+
+# 디지털 PDF 표 추출 (1순위)
+pymupdf>=1.23.0
+
+# ============================================================
+# 선택 의존성 (없어도 서버는 동작, 표 인식 기능만 축소)
+# ============================================================
+
+# 이미지 표 구조화 (img2table 미설치 시 이미지 OCR 텍스트로 fallback)
+# img2table>=1.3.0
+
+# 디지털 표 보조 fallback (pymupdf 실패/미지원 PDF 대응)
+# pdfplumber>=0.11.0
+
+# CUDA 12.4 예시:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
