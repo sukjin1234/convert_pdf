@@ -391,13 +391,19 @@ def _read_rendered_markdown(output_dir: Path) -> str:
     markdown_path = _first_file(output_dir, (".md", ".markdown"))
     json_path = _first_file(output_dir, (".json",))
     fallback = _normalize_markdown(markdown_path.read_text(encoding="utf-8")) if markdown_path else ""
+    json_requires_ocr_fallback = False
 
     if json_path:
         with json_path.open(encoding="utf-8") as f:
             doc = json.load(f)
         markdown = render_document_pages_to_markdown(doc, fallback)
-        if _has_meaningful_markdown(markdown) and not _has_unresolved_visual_pages(markdown):
-            return markdown
+        if _has_meaningful_markdown(markdown):
+            if not _has_unresolved_visual_pages(markdown):
+                return markdown
+            json_requires_ocr_fallback = True
+
+    if json_requires_ocr_fallback:
+        raise ConversionError("OpenDataLoader produced visual pages without OCR text or image description.")
 
     if (
         fallback

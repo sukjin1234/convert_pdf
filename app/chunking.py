@@ -218,9 +218,14 @@ def _heading_path_title(heading_path: dict[int, str]) -> str:
 
 def _title_for_blocks(blocks: list[Block], fallback: str) -> str:
     heading_path: dict[int, str] = {}
+    has_top_level_heading = False
     for block in blocks:
         if block.heading_level is not None and block.heading_text:
+            if block.heading_level == 1:
+                has_top_level_heading = True
             heading_path = _updated_heading_path(heading_path, block.heading_level, block.heading_text)
+    if heading_path and not has_top_level_heading and fallback != "Document section":
+        return fallback
     return _heading_path_title(heading_path) if heading_path else fallback
 
 

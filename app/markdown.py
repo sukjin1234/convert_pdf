@@ -4,6 +4,13 @@ import re
 from collections import defaultdict
 from typing import Any
 
+_WIDE_TABLE_COLUMN_LIMIT = 12
+_COMPLEX_TABLE_COLUMN_LIMIT = 6
+_LONG_TABLE_COLUMN_LIMIT = 8
+_MARKDOWN_TABLE_LINE_LIMIT = 1600
+_MAX_RECORD_TABLE_HEADER_ROWS = 6
+_VALUE_MARKER_RE = re.compile(r"^(?:[\u25c8\u25cb\u25cf\u25a0\u25a1\u2610\u2611\u2713\u2714\u2717OXox-]+|N/A|n/a)$")
+
 
 def render_document_to_markdown(doc: dict[str, Any] | None, fallback_markdown: str = "") -> str:
     if not doc:
@@ -139,6 +146,9 @@ def _render_table(element: dict[str, Any]) -> str:
         header = [f"Column {index}" for index in range(1, width + 1)]
         body = matrix
 
+    if _should_render_table_as_records(matrix):
+        return _render_table_records(matrix)
+
     lines = [
         "| " + " | ".join(_escape_table_cell(cell) for cell in header) + " |",
         "| " + " | ".join("---" for _ in range(width)) + " |",
@@ -146,6 +156,183 @@ def _render_table(element: dict[str, Any]) -> str:
     for row in body:
         lines.append("| " + " | ".join(_escape_table_cell(cell) for cell in row) + " |")
     return "\n".join(lines)
+
+
+def _should_render_table_as_records(matrix: list[list[str]]) -> bool:
+    width = max(len(row) for row in matrix)
+    if width > _WIDE_TABLE_COLUMN_LIMIT:
+        return True
+
+    header_depth = _infer_record_table_header_depth(matrix)
+    if header_depth > 1 and width >= _COMPLEX_TABLE_COLUMN_LIMIT:
+        return True
+
+    return width >= _LONG_TABLE_COLUMN_LIMIT and _max_markdown_table_line_length(matrix) > _MARKDOWN_TABLE_LINE_LIMIT
+
+
+def _render_table_records(matrix: list[list[str]]) -> str:
+    if not matrix:
+        return ""
+
+    width = max(len(row) for row in matrix)
+    matrix = [row + [""] * (width - len(row)) for row in matrix]
+    header_depth = _infer_record_table_header_depth(matrix)
+    header_rows = matrix[:header_depth]
+    body_rows = _fill_record_row_context(matrix[header_depth:])
+    labels = _dedupe_labels(_record_table_column_labels(header_rows, width))
+
+    lines = ["**Table records:**"]
+    for row in body_rows:
+        fields = []
+        for label, cell in zip(labels, row):
+            value = _normalize_inline_cell(cell)
+            if value:
+                fields.append(f"{label}: {value}")
+        if fields:
+            lines.append("- " + "; ".join(fields))
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _infer_record_table_header_depth(matrix: list[list[str]]) -> int:
+    if len(matrix) <= 1:
+        return 1
+
+    width = max(len(row) for row in matrix)
+    matrix = [row + [""] * (width - len(row)) for row in matrix]
+    max_header_rows = min(_MAX_RECORD_TABLE_HEADER_ROWS, len(matrix) - 1)
+    for index in range(1, max_header_rows + 1):
+        if _looks_like_record_table_data_row(matrix[index], matrix[:index], width):
+            return index
+    return 1
+
+
+def _looks_like_record_table_data_row(row: list[str], previous_rows: list[list[str]], width: int) -> bool:
+    normalized = [_normalize_inline_cell(cell) for cell in row]
+    cells = [cell for cell in normalized if cell]
+    if len(cells) < 2:
+        return False
+    if not any(normalized[: min(3, width)]):
+        return False
+
+    value_count = sum(1 for cell in cells if _looks_like_table_value(cell))
+    if value_count >= 2:
+        return True
+
+    previous_density = max((_row_density(previous_row, width) for previous_row in previous_rows), default=0.0)
+    row_density = len(cells) / width
+    return len(previous_rows) >= 2 and row_density >= 0.45 and row_density > previous_density + 0.15
+
+
+def _record_table_column_labels(header_rows: list[list[str]], width: int) -> list[str]:
+    filled_rows = []
+    last_header_index = len(header_rows) - 1
+    for row_index, row in enumerate(header_rows):
+        if row_index == last_header_index:
+            filled_rows.append(_normalize_header_row(row, width))
+        else:
+            filled_rows.append(_forward_fill_header_row(row, width))
+
+    labels = []
+    for column_index in range(width):
+        parts = []
+        for row in filled_rows:
+            part = row[column_index]
+            if part and part not in parts:
+                parts.append(part)
+        labels.append(" > ".join(parts) if parts else f"Column {column_index + 1}")
+    return labels
+
+
+def _fill_record_row_context(rows: list[list[str]]) -> list[list[str]]:
+    context_columns = _record_context_columns(rows)
+    carried = [""] * (max((len(row) for row in rows), default=0))
+    filled_rows = []
+
+    for row in rows:
+        values = [_normalize_inline_cell(cell) for cell in row]
+        if not any(values):
+            continue
+        for column_index in context_columns:
+            if column_index >= len(values):
+                continue
+            if values[column_index]:
+                carried[column_index] = values[column_index]
+            elif carried[column_index] and any(values[column_index + 1 :]):
+                values[column_index] = carried[column_index]
+        filled_rows.append(values)
+
+    return filled_rows
+
+
+def _record_context_columns(rows: list[list[str]]) -> list[int]:
+    width = max((len(row) for row in rows), default=0)
+    context_columns = []
+    for column_index in range(min(width, 5)):
+        values = [
+            _normalize_inline_cell(row[column_index])
+            for row in rows
+            if column_index < len(row) and _normalize_inline_cell(row[column_index])
+        ]
+        if not values:
+            continue
+        value_ratio = sum(1 for value in values if _looks_like_table_value(value)) / len(values)
+        if value_ratio > 0.45 and column_index > 0:
+            break
+        context_columns.append(column_index)
+    return context_columns
+
+
+def _looks_like_table_value(value: str) -> bool:
+    value = _normalize_inline_cell(value)
+    return bool(re.search(r"\d", value) or _VALUE_MARKER_RE.fullmatch(value))
+
+
+def _row_density(row: list[str], width: int) -> float:
+    if width <= 0:
+        return 0.0
+    return sum(1 for cell in row if _normalize_inline_cell(cell)) / width
+
+
+def _max_markdown_table_line_length(matrix: list[list[str]]) -> int:
+    max_length = 0
+    for row in matrix:
+        row_length = sum(len(_escape_table_cell(cell)) + 3 for cell in row) + 2
+        max_length = max(max_length, row_length)
+    return max_length
+
+
+def _normalize_header_row(row: list[str], width: int) -> list[str]:
+    return [
+        _normalize_inline_cell(row[column_index] if column_index < len(row) else "")
+        for column_index in range(width)
+    ]
+
+
+def _forward_fill_header_row(row: list[str], width: int) -> list[str]:
+    filled = []
+    previous = ""
+    for column_index in range(width):
+        value = _normalize_inline_cell(row[column_index] if column_index < len(row) else "")
+        if value:
+            previous = value
+        filled.append(value or previous)
+    return filled
+
+
+def _dedupe_labels(labels: list[str]) -> list[str]:
+    counts: dict[str, int] = defaultdict(int)
+    deduped = []
+    for label in labels:
+        counts[label] += 1
+        deduped.append(label if counts[label] == 1 else f"{label} {counts[label]}")
+    return deduped
+
+
+def _normalize_inline_cell(value: str) -> str:
+    value = value.replace("<br>", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
 
 
 def _table_row_to_cells(row: dict[str, Any]) -> list[str]:

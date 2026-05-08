@@ -114,6 +114,153 @@ class MarkdownRendererTest(unittest.TestCase):
         self.assertLess(markdown.index("# Visual Notice"), markdown.index("**Image summary:**"))
         self.assertLess(markdown.index("**Image summary:**"), markdown.index("Contact the admissions office"))
 
+    def test_renders_wide_multi_header_table_as_records(self):
+        doc = {
+            "kids": [
+                {
+                    "type": "table",
+                    "rows": [
+                        {
+                            "type": "table row",
+                            "cells": [
+                                {"column number": 1, "content": "Department"},
+                                {"column number": 2, "content": "Admission"},
+                                {"column number": 8, "content": "Regular"},
+                            ],
+                        },
+                        {
+                            "type": "table row",
+                            "cells": [
+                                {"column number": 2, "content": "Early"},
+                                {"column number": 5, "content": "Special"},
+                                {"column number": 8, "content": "General"},
+                            ],
+                        },
+                        {
+                            "type": "table row",
+                            "cells": [
+                                {"column number": 1, "content": "Engineering"},
+                                {"column number": 2, "content": "Mechanical"},
+                                {"column number": 3, "content": "Day"},
+                                {"column number": 4, "content": "2"},
+                                {"column number": 5, "content": "100"},
+                                {"column number": 6, "content": "49"},
+                                {"column number": 7, "content": "21"},
+                                {"column number": 8, "content": "5"},
+                                {"column number": 9, "content": "1"},
+                                {"column number": 10, "content": "1"},
+                                {"column number": 11, "content": "◈"},
+                                {"column number": 12, "content": "2"},
+                                {"column number": 13, "content": "◈"},
+                            ],
+                        },
+                    ],
+                }
+            ]
+        }
+
+        markdown = render_document_to_markdown(doc)
+
+        self.assertIn("**Table records:**", markdown)
+        self.assertNotIn("| Department |", markdown)
+        self.assertIn("Department: Engineering", markdown)
+        self.assertIn("Admission > Early", markdown)
+        self.assertIn("Regular > General", markdown)
+        self.assertIn("Regular > General: 5", markdown)
+        self.assertNotIn("Regular > General 2", markdown)
+        self.assertIn("Mechanical", markdown)
+
+    def test_renders_complex_medium_table_as_records(self):
+        doc = {
+            "kids": [
+                {
+                    "type": "table",
+                    "rows": [
+                        {
+                            "type": "table row",
+                            "cells": [
+                                {"column number": 1, "content": "Area"},
+                                {"column number": 2, "content": "Program"},
+                                {"column number": 3, "content": "2025"},
+                                {"column number": 6, "content": "2026"},
+                            ],
+                        },
+                        {
+                            "type": "table row",
+                            "cells": [
+                                {"column number": 3, "content": "Spring"},
+                                {"column number": 4, "content": "Fall"},
+                                {"column number": 6, "content": "Spring"},
+                                {"column number": 7, "content": "Fall"},
+                                {"column number": 8, "content": "Notes"},
+                            ],
+                        },
+                        {
+                            "type": "table row",
+                            "cells": [
+                                {"column number": 1, "content": "Engineering"},
+                                {"column number": 2, "content": "Mechanical"},
+                                {"column number": 3, "content": "10"},
+                                {"column number": 4, "content": "12"},
+                                {"column number": 6, "content": "14"},
+                                {"column number": 7, "content": "16"},
+                                {"column number": 8, "content": "Open"},
+                            ],
+                        },
+                        {
+                            "type": "table row",
+                            "cells": [
+                                {"column number": 2, "content": "Electrical"},
+                                {"column number": 3, "content": "8"},
+                                {"column number": 4, "content": "9"},
+                                {"column number": 6, "content": "10"},
+                                {"column number": 7, "content": "11"},
+                                {"column number": 8, "content": "Open"},
+                            ],
+                        },
+                    ],
+                }
+            ]
+        }
+
+        markdown = render_document_to_markdown(doc)
+
+        self.assertIn("**Table records:**", markdown)
+        self.assertNotIn("| Area | Program |", markdown)
+        self.assertIn("Area: Engineering; Program: Mechanical", markdown)
+        self.assertIn("2025 > Spring: 10", markdown)
+        self.assertIn("Area: Engineering; Program: Electrical", markdown)
+
+    def test_keeps_simple_medium_table_as_markdown(self):
+        doc = {
+            "kids": [
+                {
+                    "type": "table",
+                    "rows": [
+                        {
+                            "type": "table row",
+                            "cells": [
+                                {"column number": index, "content": f"H{index}"}
+                                for index in range(1, 9)
+                            ],
+                        },
+                        {
+                            "type": "table row",
+                            "cells": [
+                                {"column number": index, "content": f"V{index}"}
+                                for index in range(1, 9)
+                            ],
+                        },
+                    ],
+                }
+            ]
+        }
+
+        markdown = render_document_to_markdown(doc)
+
+        self.assertIn("| H1 | H2 | H3 | H4 | H5 | H6 | H7 | H8 |", markdown)
+        self.assertNotIn("**Table records:**", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()
