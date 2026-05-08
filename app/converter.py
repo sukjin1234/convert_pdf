@@ -6,12 +6,17 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import BinaryIO, Sequence
 
 from .chunking import ChunkingOptions, prepare_parent_child_markdown
@@ -20,10 +25,46 @@ from .markdown import render_document_pages_to_markdown
 
 logger = logging.getLogger(__name__)
 _LOCAL_CONVERSION_LOCK = threading.Lock()
+_DEFAULT_HYBRID_PORT = 5002
 
 
 class ConversionError(RuntimeError):
     pass
+
+
+@dataclass
+class _TemporaryHybridServer:
+    process: subprocess.Popen
+    url: str
+    port: int
+
+    def close(self) -> None:
+        if self.port == _DEFAULT_HYBRID_PORT:
+            return
+        _terminate_process_tree(self.process)
+
+
+class _ConversionContext:
+    def __init__(self, settings: Settings, *, use_ocr: bool):
+        self._settings = settings
+        self._use_ocr = use_ocr
+        self._hybrid_server: _TemporaryHybridServer | None = None
+
+    @property
+    def settings(self) -> Settings:
+        return self._settings
+
+    def hybrid_settings(self) -> Settings:
+        if not self._settings.spawn_hybrid_per_conversion:
+            return self._settings
+        if self._hybrid_server is None:
+            self._hybrid_server = _start_temporary_hybrid_server(self._settings, use_ocr=self._use_ocr)
+        return replace(self._settings, hybrid_url=self._hybrid_server.url)
+
+    def close(self) -> None:
+        if self._hybrid_server is not None:
+            self._hybrid_server.close()
+            self._hybrid_server = None
 
 
 @dataclass(frozen=True)
@@ -40,11 +81,25 @@ class PdfConverter:
             safe_name = f"{Path(safe_name).stem or 'document'}.pdf"
 
         self.settings.tmp_root.mkdir(parents=True, exist_ok=True)
-        with _conversion_lock(self.settings):
-            markdown = self._convert_pdf_bytes_locked(pdf_bytes, safe_name, use_ocr=use_ocr)
+        context = _ConversionContext(self.settings, use_ocr=use_ocr)
+        try:
+            if self.settings.spawn_hybrid_per_conversion:
+                markdown = self._convert_pdf_bytes_locked(pdf_bytes, safe_name, use_ocr=use_ocr, context=context)
+            else:
+                with _conversion_lock(self.settings):
+                    markdown = self._convert_pdf_bytes_locked(pdf_bytes, safe_name, use_ocr=use_ocr, context=context)
+        finally:
+            context.close()
         return _prepare_for_dify_chunks(markdown, self.settings)
 
-    def _convert_pdf_bytes_locked(self, pdf_bytes: bytes, safe_name: str, *, use_ocr: bool) -> str:
+    def _convert_pdf_bytes_locked(
+        self,
+        pdf_bytes: bytes,
+        safe_name: str,
+        *,
+        use_ocr: bool,
+        context: _ConversionContext,
+    ) -> str:
         with tempfile.TemporaryDirectory(prefix="convert-", dir=self.settings.tmp_root) as tmp:
             tmp_dir = Path(tmp)
             input_path = tmp_dir / safe_name
@@ -70,7 +125,7 @@ class PdfConverter:
                 return _convert_pdf_file(
                     rasterized_ocr_path,
                     tmp_dir / f"output-{label}-ocr",
-                    self.settings,
+                    context,
                     hybrid_mode="full",
                     image_output="external",
                 )
@@ -86,7 +141,7 @@ class PdfConverter:
                     raise ConversionError("PDF conversion failed after OCR fallback attempt: " + "; ".join(errors)) from ocr_exc
 
             try:
-                return _convert_pdf_file(input_path, tmp_dir / "output-original", self.settings)
+                return _convert_pdf_file(input_path, tmp_dir / "output-original", context)
             except ConversionError as exc:
                 errors.append(f"original: {exc}")
                 logger.info("Original PDF conversion failed; trying fallbacks. error=%s", exc)
@@ -100,7 +155,7 @@ class PdfConverter:
                     return _convert_pdf_file(
                         qpdf_repaired_path,
                         tmp_dir / "output-qpdf-repaired",
-                        self.settings,
+                        context,
                     )
                 except ConversionError as exc:
                     errors.append(f"qpdf-repaired: {exc}")
@@ -113,7 +168,7 @@ class PdfConverter:
                 repair_source = qpdf_repaired_path if qpdf_repaired_path and qpdf_repaired_path.exists() else input_path
                 try:
                     _repair_pdf(repair_source, repaired_path)
-                    return _convert_pdf_file(repaired_path, tmp_dir / "output-repaired", self.settings)
+                    return _convert_pdf_file(repaired_path, tmp_dir / "output-repaired", context)
                 except ConversionError as exc:
                     errors.append(f"repaired: {exc}")
                     logger.info("Repaired PDF conversion failed. error=%s", exc)
@@ -214,15 +269,109 @@ def _unlock_file(lock_file: BinaryIO) -> None:
     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def build_hybrid_server_command(settings: Settings, port: int, *, use_ocr: bool) -> list[str]:
+    command = [
+        settings.hybrid_server_cli,
+        "--host",
+        settings.hybrid_server_host,
+        "--port",
+        str(port),
+        "--log-level",
+        "warning",
+        "--device",
+        settings.hybrid_server_device,
+    ]
+    if use_ocr:
+        if settings.hybrid_server_ocr_engine:
+            command.extend(["--ocr-engine", settings.hybrid_server_ocr_engine])
+        if settings.hybrid_server_ocr_lang:
+            command.extend(["--ocr-lang", settings.hybrid_server_ocr_lang])
+        if settings.hybrid_server_enrich_picture_description:
+            command.append("--enrich-picture-description")
+    else:
+        command.append("--no-ocr")
+    return command
+
+
+def _start_temporary_hybrid_server(settings: Settings, *, use_ocr: bool) -> _TemporaryHybridServer:
+    port = _find_available_hybrid_port(settings)
+    url = f"http://{settings.hybrid_server_host}:{port}"
+    command = build_hybrid_server_command(settings, port, use_ocr=use_ocr)
+    logger.info("Starting temporary hybrid server on %s", url)
+
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "text": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        process = subprocess.Popen(command, **kwargs)
+    except OSError as exc:
+        raise ConversionError("Could not start temporary hybrid server.") from exc
+
+    try:
+        _wait_for_hybrid_server(url, process, settings.hybrid_server_startup_timeout_seconds)
+    except Exception:
+        _terminate_process_tree(process)
+        raise
+
+    return _TemporaryHybridServer(process=process, url=url, port=port)
+
+
+def _find_available_hybrid_port(settings: Settings) -> int:
+    default_port = _url_port(settings.hybrid_url) or _DEFAULT_HYBRID_PORT
+    for _ in range(20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((settings.hybrid_server_host, 0))
+            port = int(sock.getsockname()[1])
+        if port != default_port and port != _DEFAULT_HYBRID_PORT:
+            return port
+    raise ConversionError("Could not allocate a temporary hybrid server port.")
+
+
+def _wait_for_hybrid_server(url: str, process: subprocess.Popen, timeout_seconds: int) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    health_url = f"{url}/health"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise ConversionError("Temporary hybrid server exited before becoming ready.")
+        if _hybrid_health_ok(health_url):
+            return
+        time.sleep(0.5)
+    raise ConversionError("Temporary hybrid server did not become ready before timeout.")
+
+
+def _hybrid_health_ok(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=1.0) as response:
+            return 200 <= response.status < 300
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def _url_port(url: str) -> int | None:
+    try:
+        return urlparse(url).port
+    except ValueError:
+        return None
+
+
 def _convert_pdf_file(
     input_path: Path,
     output_dir: Path,
-    settings: Settings,
+    context: _ConversionContext,
     *,
     hybrid_mode: str | None = None,
     image_output: str = "external",
 ) -> str:
     native_error = None
+    settings = context.settings
     if settings.native_text_layer_first and hybrid_mode is None:
         try:
             return _convert_pdf_file_native(input_path, output_dir.with_name(f"{output_dir.name}-native"), settings)
@@ -234,7 +383,7 @@ def _convert_pdf_file(
         return _convert_pdf_file_hybrid(
             input_path,
             output_dir,
-            settings,
+            context.hybrid_settings(),
             hybrid_mode=hybrid_mode,
             image_output=image_output,
         )
@@ -370,6 +519,17 @@ def _run_command(command: Sequence[str], timeout_seconds: int) -> None:
     if process.returncode != 0:
         logger.warning("OpenDataLoader failed. stdout=%s stderr=%s", stdout[-2000:], stderr[-2000:])
         raise ConversionError("OpenDataLoader conversion failed.")
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    _kill_process_tree(process.pid)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
 
 
 def _kill_process_tree(pid: int) -> None:

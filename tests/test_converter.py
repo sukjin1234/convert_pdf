@@ -12,11 +12,93 @@ from app.converter import (
     _read_rendered_markdown,
     build_opendataloader_native_command,
     build_opendataloader_command,
+    build_hybrid_server_command,
     sanitize_filename,
 )
 
 
 class ConverterTest(unittest.TestCase):
+    def test_hybrid_server_command_disables_ocr_when_not_selected(self):
+        settings = Settings(hybrid_server_cli="opendataloader-pdf-hybrid")
+        command = build_hybrid_server_command(settings, 5101, use_ocr=False)
+
+        self.assertEqual(command[:5], ["opendataloader-pdf-hybrid", "--host", "127.0.0.1", "--port", "5101"])
+        self.assertIn("--no-ocr", command)
+        self.assertNotIn("--force-ocr", command)
+        self.assertNotIn("--enrich-picture-description", command)
+
+    def test_hybrid_server_command_enables_ocr_options_when_selected(self):
+        settings = Settings(
+            hybrid_server_cli="opendataloader-pdf-hybrid",
+            hybrid_server_ocr_engine="easyocr",
+            hybrid_server_ocr_lang="ko,en",
+            hybrid_server_enrich_picture_description=True,
+        )
+        command = build_hybrid_server_command(settings, 5102, use_ocr=True)
+
+        self.assertIn("--ocr-engine", command)
+        self.assertEqual(command[command.index("--ocr-engine") + 1], "easyocr")
+        self.assertIn("--ocr-lang", command)
+        self.assertEqual(command[command.index("--ocr-lang") + 1], "ko,en")
+        self.assertIn("--enrich-picture-description", command)
+        self.assertNotIn("--no-ocr", command)
+
+    def test_uses_temporary_hybrid_server_per_conversion(self):
+        class FakeHybridServer:
+            url = "http://127.0.0.1:5103"
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                tmp_root=Path(tmp),
+                native_text_layer_first=False,
+                spawn_hybrid_per_conversion=True,
+                prepare_dify_parent_child_chunks=False,
+            )
+            converter = PdfConverter(settings)
+            fake_server = FakeHybridServer()
+
+            with (
+                patch("app.converter._start_temporary_hybrid_server", return_value=fake_server) as start_server,
+                patch("app.converter._run_command") as run_command,
+                patch("app.converter._read_rendered_markdown", return_value="markdown"),
+            ):
+                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "policy.pdf")
+
+        self.assertEqual(result, "markdown")
+        start_server.assert_called_once()
+        command = run_command.call_args.args[0]
+        self.assertEqual(command[command.index("--hybrid-url") + 1], fake_server.url)
+        self.assertTrue(fake_server.closed)
+
+    def test_uses_shared_hybrid_server_when_per_conversion_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                tmp_root=Path(tmp),
+                hybrid_url="http://localhost:5002",
+                native_text_layer_first=False,
+                spawn_hybrid_per_conversion=False,
+                prepare_dify_parent_child_chunks=False,
+            )
+            converter = PdfConverter(settings)
+
+            with (
+                patch("app.converter._start_temporary_hybrid_server") as start_server,
+                patch("app.converter._run_command") as run_command,
+                patch("app.converter._read_rendered_markdown", return_value="markdown"),
+            ):
+                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "policy.pdf")
+
+        self.assertEqual(result, "markdown")
+        start_server.assert_not_called()
+        command = run_command.call_args.args[0]
+        self.assertEqual(command[command.index("--hybrid-url") + 1], "http://localhost:5002")
+
     def test_command_forces_hybrid_with_no_fallback(self):
         settings = Settings()
         command = build_opendataloader_command(Path("input.pdf"), Path("out"), settings)

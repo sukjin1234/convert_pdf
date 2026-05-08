@@ -38,6 +38,23 @@ def _default_opendataloader_cli() -> str:
     return "opendataloader-pdf"
 
 
+def _default_opendataloader_hybrid_cli() -> str:
+    explicit = os.getenv("ODL_HYBRID_CLI")
+    if explicit:
+        return explicit
+
+    executable_dir = Path(sys.executable).resolve().parent
+    candidates = []
+    if os.name == "nt":
+        candidates.append(executable_dir / "Scripts" / "opendataloader-pdf-hybrid.exe")
+    candidates.append(executable_dir / "opendataloader-pdf-hybrid")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return "opendataloader-pdf-hybrid"
+
+
 def _default_opendataloader_jar() -> str | None:
     explicit = os.getenv("ODL_JAR")
     if explicit:
@@ -62,6 +79,14 @@ class Settings:
     hybrid_url: str = os.getenv("ODL_HYBRID_URL", "http://localhost:5002")
     hybrid_mode: str = os.getenv("ODL_HYBRID_MODE", "auto").lower()
     hybrid_timeout_ms: int = _env_int("ODL_HYBRID_TIMEOUT_MS", 300_000)
+    spawn_hybrid_per_conversion: bool = _env_bool("ODL_SPAWN_HYBRID_PER_CONVERSION", True)
+    hybrid_server_cli: str = _default_opendataloader_hybrid_cli()
+    hybrid_server_host: str = os.getenv("ODL_HYBRID_SERVER_HOST", "127.0.0.1")
+    hybrid_server_startup_timeout_seconds: int = _env_int("ODL_HYBRID_SERVER_STARTUP_TIMEOUT_SECONDS", 120)
+    hybrid_server_ocr_engine: str = os.getenv("ODL_HYBRID_OCR_ENGINE", "easyocr")
+    hybrid_server_ocr_lang: str = os.getenv("ODL_HYBRID_OCR_LANG", "ko,en")
+    hybrid_server_device: str = os.getenv("ODL_HYBRID_DEVICE", "auto")
+    hybrid_server_enrich_picture_description: bool = _env_bool("ODL_HYBRID_ENRICH_PICTURE_DESCRIPTION", True)
     conversion_timeout_seconds: int = _env_int("ODL_CONVERSION_TIMEOUT_SECONDS", 360)
     tmp_root: Path = Path(os.getenv("ODL_TMP_ROOT", str(Path(tempfile.gettempdir()) / "dify-opendataloader")))
     max_pdf_bytes: int = _env_int("ODL_MAX_PDF_BYTES", 80 * 1024 * 1024)
@@ -94,6 +119,8 @@ class Settings:
             raise ValueError("ODL_HYBRID_MODE must be either 'auto' or 'full'.")
         if self.hybrid_timeout_ms <= 0:
             raise ValueError("ODL_HYBRID_TIMEOUT_MS must be positive.")
+        if self.hybrid_server_startup_timeout_seconds <= 0:
+            raise ValueError("ODL_HYBRID_SERVER_STARTUP_TIMEOUT_SECONDS must be positive.")
         if self.conversion_timeout_seconds <= 0:
             raise ValueError("ODL_CONVERSION_TIMEOUT_SECONDS must be positive.")
         if self.max_pdf_bytes <= 0:
