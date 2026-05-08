@@ -58,7 +58,7 @@ Third paragraph explains exceptions and approval records.
 
         self.assertGreater(result.count("<<<CHILD_BREAK>>>"), 1)
         self.assertIn("Previous context:", result)
-        self.assertIn("Next context:", result)
+        self.assertNotIn("Next context:", result)
         self.assertIn("Second paragraph explains", result)
 
     def test_keeps_markdown_table_in_one_child(self):

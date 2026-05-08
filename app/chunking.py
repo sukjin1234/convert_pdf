@@ -63,14 +63,9 @@ def prepare_parent_child_markdown(markdown: str, options: ChunkingOptions | None
                 options.child_overlap_chars,
                 from_end=True,
             )
-            next_context = _context_snippet(
-                children[index + 1] if index + 1 < len(children) else [],
-                options.child_overlap_chars,
-                from_end=False,
-            )
             rendered_children.append(options.child_delimiter)
             rendered_children.append(
-                _render_child(parent, child_blocks, previous_context, next_context)
+                _render_child(parent, child_blocks, previous_context)
             )
 
         rendered_parents.append(
@@ -160,7 +155,6 @@ def _render_child(
     parent: ParentSection,
     child_blocks: list[Block],
     previous_context: str,
-    next_context: str,
 ) -> str:
     parts = [
         f"Section: {parent.title}",
@@ -168,8 +162,6 @@ def _render_child(
     ]
     if previous_context:
         parts.append(f"> Previous context: {previous_context}")
-    if next_context:
-        parts.append(f"> Next context: {next_context}")
     parts.append("Content:")
     parts.append(_blocks_markdown(child_blocks))
     return "\n\n".join(part for part in parts if part).strip()
