@@ -70,6 +70,7 @@ class ConverterTest(unittest.TestCase):
                 qpdf_repair_pdf_on_failure=True,
                 repair_pdf_on_failure=False,
                 rasterize_pdf_on_failure=False,
+                prepare_dify_parent_child_chunks=False,
             )
             converter = PdfConverter(settings)
 
@@ -89,6 +90,7 @@ class ConverterTest(unittest.TestCase):
                 qpdf_repair_pdf_on_failure=False,
                 repair_pdf_on_failure=True,
                 rasterize_pdf_on_failure=False,
+                prepare_dify_parent_child_chunks=False,
             )
             converter = PdfConverter(settings)
 
@@ -108,6 +110,7 @@ class ConverterTest(unittest.TestCase):
                 qpdf_repair_pdf_on_failure=False,
                 repair_pdf_on_failure=True,
                 rasterize_pdf_on_failure=True,
+                prepare_dify_parent_child_chunks=False,
             )
             converter = PdfConverter(settings)
 

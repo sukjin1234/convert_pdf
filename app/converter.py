@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Sequence
 
+from .chunking import ChunkingOptions, prepare_parent_child_markdown
 from .config import Settings, get_settings
 from .markdown import render_document_pages_to_markdown, render_document_to_markdown
 
@@ -40,7 +41,8 @@ class PdfConverter:
 
         self.settings.tmp_root.mkdir(parents=True, exist_ok=True)
         with _conversion_lock(self.settings):
-            return self._convert_pdf_bytes_locked(pdf_bytes, safe_name)
+            markdown = self._convert_pdf_bytes_locked(pdf_bytes, safe_name)
+        return _prepare_for_dify_chunks(markdown, self.settings)
 
     def _convert_pdf_bytes_locked(self, pdf_bytes: bytes, safe_name: str) -> str:
         with tempfile.TemporaryDirectory(prefix="convert-", dir=self.settings.tmp_root) as tmp:
@@ -130,6 +132,21 @@ def sanitize_filename(filename: str) -> str:
     name = Path(filename or "document.pdf").name
     name = re.sub(r"[^A-Za-z0-9_ .-]+", "_", name).strip(" .")
     return name or "document.pdf"
+
+
+def _prepare_for_dify_chunks(markdown: str, settings: Settings) -> str:
+    if not settings.prepare_dify_parent_child_chunks:
+        return markdown
+    return prepare_parent_child_markdown(
+        markdown,
+        ChunkingOptions(
+            parent_delimiter=settings.dify_parent_delimiter,
+            child_delimiter=settings.dify_child_delimiter,
+            parent_max_chars=settings.dify_parent_max_chars,
+            child_target_chars=settings.dify_child_target_chars,
+            child_overlap_chars=settings.dify_child_overlap_chars,
+        ),
+    )
 
 
 @contextmanager

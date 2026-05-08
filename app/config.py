@@ -74,6 +74,12 @@ class Settings:
     rasterize_pdf_on_failure: bool = _env_bool("ODL_RASTERIZE_PDF_ON_FAILURE", True)
     rasterize_dpi: int = _env_int("ODL_RASTERIZE_DPI", 180)
     native_text_layer_first: bool = _env_bool("ODL_NATIVE_TEXT_LAYER_FIRST", True)
+    prepare_dify_parent_child_chunks: bool = _env_bool("ODL_PREPARE_DIFY_PARENT_CHILD_CHUNKS", True)
+    dify_parent_delimiter: str = os.getenv("ODL_DIFY_PARENT_DELIMITER", "<<<PARENT_BREAK>>>")
+    dify_child_delimiter: str = os.getenv("ODL_DIFY_CHILD_DELIMITER", "<<<CHILD_BREAK>>>")
+    dify_parent_max_chars: int = _env_int("ODL_DIFY_PARENT_MAX_CHARS", 4500)
+    dify_child_target_chars: int = _env_int("ODL_DIFY_CHILD_TARGET_CHARS", 900)
+    dify_child_overlap_chars: int = _env_int("ODL_DIFY_CHILD_OVERLAP_CHARS", 180)
 
     def validate(self) -> None:
         cli_name = Path(self.opendataloader_cli).name.lower()
@@ -94,6 +100,19 @@ class Settings:
             raise ValueError("ODL_MAX_PDF_BYTES must be positive.")
         if self.rasterize_dpi <= 0:
             raise ValueError("ODL_RASTERIZE_DPI must be positive.")
+        if self.prepare_dify_parent_child_chunks:
+            if not self.dify_parent_delimiter.strip():
+                raise ValueError("ODL_DIFY_PARENT_DELIMITER must not be empty.")
+            if not self.dify_child_delimiter.strip():
+                raise ValueError("ODL_DIFY_CHILD_DELIMITER must not be empty.")
+            if self.dify_parent_delimiter == self.dify_child_delimiter:
+                raise ValueError("ODL_DIFY_PARENT_DELIMITER and ODL_DIFY_CHILD_DELIMITER must differ.")
+            if self.dify_parent_max_chars <= 0:
+                raise ValueError("ODL_DIFY_PARENT_MAX_CHARS must be positive.")
+            if self.dify_child_target_chars <= 0:
+                raise ValueError("ODL_DIFY_CHILD_TARGET_CHARS must be positive.")
+            if self.dify_child_overlap_chars < 0:
+                raise ValueError("ODL_DIFY_CHILD_OVERLAP_CHARS must be zero or positive.")
 
 
 def get_settings() -> Settings:
