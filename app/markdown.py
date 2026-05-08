@@ -204,6 +204,9 @@ def _render_page(elements: list[dict[str, Any]]) -> str:
     for element in elements:
         if _element_type(element) in {"image", "picture", "figure"}:
             has_image = True
+            rendered = _render_element(element)
+            if rendered:
+                blocks.append(rendered)
             continue
         rendered = _render_element(element)
         if rendered:

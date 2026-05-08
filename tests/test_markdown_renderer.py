@@ -94,6 +94,26 @@ class MarkdownRendererTest(unittest.TestCase):
         self.assertIn("- 1958: School opened", markdown)
         self.assertIn("- 2024: Free major added", markdown)
 
+    def test_renders_page_image_description_in_flow(self):
+        doc = {
+            "kids": [
+                {"type": "heading", "page number": 1, "heading level": 1, "content": "Visual Notice"},
+                {
+                    "type": "picture",
+                    "page number": 1,
+                    "description": "The poster states that applications close on March 8.",
+                },
+                {"type": "paragraph", "page number": 1, "content": "Contact the admissions office for details."},
+            ]
+        }
+
+        markdown = render_document_pages_to_markdown(doc)
+
+        self.assertIn("# Visual Notice", markdown)
+        self.assertIn("**Image summary:** The poster states that applications close on March 8.", markdown)
+        self.assertLess(markdown.index("# Visual Notice"), markdown.index("**Image summary:**"))
+        self.assertLess(markdown.index("**Image summary:**"), markdown.index("Contact the admissions office"))
+
 
 if __name__ == "__main__":
     unittest.main()

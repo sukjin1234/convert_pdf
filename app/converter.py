@@ -16,7 +16,7 @@ from typing import BinaryIO, Sequence
 
 from .chunking import ChunkingOptions, prepare_parent_child_markdown
 from .config import Settings, get_settings
-from .markdown import render_document_pages_to_markdown, render_document_to_markdown
+from .markdown import render_document_pages_to_markdown
 
 logger = logging.getLogger(__name__)
 _LOCAL_CONVERSION_LOCK = threading.Lock()
@@ -59,6 +59,20 @@ class PdfConverter:
             except ConversionError as exc:
                 errors.append(f"original: {exc}")
                 logger.info("Original PDF conversion failed; trying fallbacks. error=%s", exc)
+                if _requires_ocr_fallback(exc) and self.settings.rasterize_pdf_on_failure:
+                    try:
+                        rasterized_ocr_path = tmp_dir / "rasterized-ocr.pdf"
+                        _rasterize_pdf(input_path, rasterized_ocr_path, self.settings.rasterize_dpi)
+                        return _convert_pdf_file(
+                            rasterized_ocr_path,
+                            tmp_dir / "output-rasterized-ocr",
+                            self.settings,
+                            hybrid_mode="full",
+                            image_output="external",
+                        )
+                    except ConversionError as ocr_exc:
+                        errors.append(f"rasterized-ocr: {ocr_exc}")
+                        logger.info("Rasterized OCR conversion failed. error=%s", ocr_exc)
 
             if self.settings.qpdf_repair_pdf_on_failure:
                 qpdf_repaired_path = tmp_dir / "qpdf-repaired.pdf"
@@ -90,7 +104,7 @@ class PdfConverter:
                             tmp_dir / "output-repaired-ocr",
                             self.settings,
                             hybrid_mode="full",
-                            image_output="off",
+                            image_output="external",
                         )
                     except ConversionError as exc:
                         errors.append(f"repaired-ocr: {exc}")
@@ -106,7 +120,7 @@ class PdfConverter:
                         tmp_dir / "output-rasterized",
                         self.settings,
                         hybrid_mode="full",
-                        image_output="off",
+                        image_output="external",
                     )
                 except ConversionError as exc:
                     errors.append(f"rasterized: {exc}")
@@ -147,6 +161,11 @@ def _prepare_for_dify_chunks(markdown: str, settings: Settings) -> str:
             child_overlap_chars=settings.dify_child_overlap_chars,
         ),
     )
+
+
+def _requires_ocr_fallback(exc: ConversionError) -> bool:
+    message = str(exc).lower()
+    return "ocr fallback required" in message or "visual pages without ocr text" in message
 
 
 @contextmanager
@@ -370,23 +389,24 @@ def _kill_process_tree(pid: int) -> None:
 
 def _read_rendered_markdown(output_dir: Path) -> str:
     markdown_path = _first_file(output_dir, (".md", ".markdown"))
-    if markdown_path:
-        markdown = _normalize_markdown(markdown_path.read_text(encoding="utf-8"))
-        if _has_page_separators(markdown) and _has_meaningful_markdown(markdown):
-            return markdown
-
     json_path = _first_file(output_dir, (".json",))
+    fallback = _normalize_markdown(markdown_path.read_text(encoding="utf-8")) if markdown_path else ""
 
-    fallback = markdown_path.read_text(encoding="utf-8") if markdown_path else ""
-    doc = None
     if json_path:
         with json_path.open(encoding="utf-8") as f:
             doc = json.load(f)
+        markdown = render_document_pages_to_markdown(doc, fallback)
+        if _has_meaningful_markdown(markdown) and not _has_unresolved_visual_pages(markdown):
+            return markdown
 
-    markdown = render_document_to_markdown(doc, fallback)
-    if not _has_meaningful_markdown(markdown):
-        raise ConversionError("OpenDataLoader produced no Markdown.")
-    return markdown
+    if (
+        fallback
+        and _has_meaningful_markdown(fallback)
+        and not _has_unresolved_visual_pages(fallback)
+    ):
+        return fallback
+
+    raise ConversionError("OpenDataLoader produced no usable text or image description; OCR fallback required.")
 
 
 def _read_generated_markdown(output_dir: Path) -> str:
@@ -405,6 +425,8 @@ def _read_generated_markdown(output_dir: Path) -> str:
 
     if not _has_meaningful_markdown(markdown):
         raise ConversionError("OpenDataLoader produced no Markdown.")
+    if _has_unresolved_visual_pages(markdown):
+        raise ConversionError("OpenDataLoader produced visual pages without OCR text or image description.")
     if _has_page_separators(markdown) and not _has_enough_page_content(markdown):
         raise ConversionError("OpenDataLoader produced too few content pages.")
     return markdown
@@ -480,10 +502,54 @@ def _has_meaningful_markdown(markdown: str) -> bool:
     if not stripped:
         return False
     stripped = re.sub(r"(?m)^\s*--- Page \d+ ---\s*$", "", stripped)
-    stripped = re.sub(r"(?m)^\s*!\[[^\]]*\]\(<[^>]+>\)\s*$", "", stripped)
+    stripped = re.sub(r"(?m)^\s*!\[[^\]]*\]\((?:<[^>]+>|[^)]+)\)\s*$", "", stripped)
+    stripped = re.sub(r"(?m)^>\s*Image-only page\. No embedded text layer was available\.\s*$", "", stripped)
+    stripped = re.sub(
+        r"(?m)^>\s*\uc774\ubbf8\uc9c0/\ub3c4\uc2dd \uc911\uc2ec \ud398\uc774\uc9c0\ub85c, PDF \ud14d\uc2a4\ud2b8 \ub808\uc774\uc5b4\uc5d0\uc11c \ud655\uc778\ub418\ub294 \ubb38\uad6c\ub9cc \ud3ec\ud568\ud588\uc2b5\ub2c8\ub2e4\.\s*$",
+        "",
+        stripped,
+    )
     stripped = re.sub(r"(?m)^\s*\|(?:\s*\|)+\s*$", "", stripped)
     stripped = re.sub(r"(?m)^\s*\|(?:\s*:?-+:?\s*\|)+\s*$", "", stripped)
     return bool(stripped.strip())
+
+
+def _has_unresolved_visual_pages(markdown: str) -> bool:
+    pages = re.split(r"(?m)^\s*--- Page \d+ ---\s*$", markdown)
+    pages = pages[1:] if len(pages) > 1 else pages
+    for page in pages:
+        if not _has_visual_placeholder(page):
+            continue
+        content = _strip_visual_noise(page)
+        content = re.sub(r"(?m)^#{1,6}\s+.*$", "", content)
+        if not _content_fingerprint(content):
+            return True
+    return False
+
+
+def _has_visual_placeholder(markdown: str) -> bool:
+    return bool(
+        re.search(r"(?m)^>\s*Image-only page\. No embedded text layer was available\.\s*$", markdown)
+        or re.search(
+            r"(?m)^>\s*\uc774\ubbf8\uc9c0/\ub3c4\uc2dd \uc911\uc2ec \ud398\uc774\uc9c0\ub85c, PDF \ud14d\uc2a4\ud2b8 \ub808\uc774\uc5b4\uc5d0\uc11c \ud655\uc778\ub418\ub294 \ubb38\uad6c\ub9cc \ud3ec\ud568\ud588\uc2b5\ub2c8\ub2e4\.\s*$",
+            markdown,
+        )
+    )
+
+
+def _strip_visual_noise(markdown: str) -> str:
+    stripped = re.sub(r"(?m)^\s*!\[[^\]]*\]\((?:<[^>]+>|[^)]+)\)\s*$", "", markdown)
+    stripped = re.sub(r"(?m)^>\s*Image-only page\. No embedded text layer was available\.\s*$", "", stripped)
+    stripped = re.sub(
+        r"(?m)^>\s*\uc774\ubbf8\uc9c0/\ub3c4\uc2dd \uc911\uc2ec \ud398\uc774\uc9c0\ub85c, PDF \ud14d\uc2a4\ud2b8 \ub808\uc774\uc5b4\uc5d0\uc11c \ud655\uc778\ub418\ub294 \ubb38\uad6c\ub9cc \ud3ec\ud568\ud588\uc2b5\ub2c8\ub2e4\.\s*$",
+        "",
+        stripped,
+    )
+    return stripped
+
+
+def _content_fingerprint(value: str) -> str:
+    return "".join(re.findall(r"[0-9A-Za-z\uac00-\ud7a3]+", value.lower()))
 
 
 def _has_page_separators(markdown: str) -> bool:

@@ -1,3 +1,4 @@
+import json
 import unittest
 import tempfile
 from pathlib import Path
@@ -132,6 +133,36 @@ class ConverterTest(unittest.TestCase):
         repair.assert_called_once()
         rasterize.assert_called_once()
 
+    def test_rasterizes_directly_when_original_needs_ocr_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                tmp_root=Path(tmp),
+                qpdf_repair_pdf_on_failure=True,
+                repair_pdf_on_failure=True,
+                rasterize_pdf_on_failure=True,
+                prepare_dify_parent_child_chunks=False,
+            )
+            converter = PdfConverter(settings)
+
+            with (
+                patch("app.converter._convert_pdf_file") as convert,
+                patch("app.converter._rasterize_pdf") as rasterize,
+                patch("app.converter._repair_pdf") as repair,
+                patch("app.converter._repair_pdf_with_pikepdf") as qpdf_repair,
+            ):
+                convert.side_effect = [
+                    ConversionError("OpenDataLoader produced no usable text or image description; OCR fallback required."),
+                    "ocr markdown",
+                ]
+
+                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "scan.pdf")
+
+        self.assertEqual(result, "ocr markdown")
+        self.assertEqual(convert.call_count, 2)
+        rasterize.assert_called_once()
+        repair.assert_not_called()
+        qpdf_repair.assert_not_called()
+
     def test_rejects_page_separator_only_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
@@ -144,7 +175,66 @@ class ConverterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
             (output_dir / "out.md").write_text(
-                "\n\n--- Page 1 ---\n\n![image 1](<images/page1.png>)\n\n",
+                "\n\n--- Page 1 ---\n\n![image 1](images/page1.png)\n\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ConversionError):
+                _read_rendered_markdown(output_dir)
+
+    def test_rejects_image_only_placeholder_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "out.md").write_text(
+                "\n\n--- Page 1 ---\n\n> Image-only page. No embedded text layer was available.\n\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ConversionError):
+                _read_rendered_markdown(output_dir)
+
+    def test_prefers_json_image_description_over_markdown_image_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "out.md").write_text(
+                "\n\n--- Page 1 ---\n\n# Product Overview\n\n![image 1](images/page1.png)\n\n",
+                encoding="utf-8",
+            )
+            (output_dir / "out.json").write_text(
+                json.dumps(
+                    {
+                        "kids": [
+                            {"type": "heading", "page number": 1, "heading level": 1, "content": "Product Overview"},
+                            {
+                                "type": "picture",
+                                "page number": 1,
+                                "description": "The image says the application period is March 4 to March 8.",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = _read_rendered_markdown(output_dir)
+
+        self.assertIn("--- Page 1 ---", result)
+        self.assertIn("# Product Overview", result)
+        self.assertIn("**Image summary:** The image says the application period is March 4 to March 8.", result)
+
+    def test_rejects_visual_page_with_heading_but_no_ocr_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "out.md").write_text("\n\n--- Page 1 ---\n\n# Product Overview\n\n", encoding="utf-8")
+            (output_dir / "out.json").write_text(
+                json.dumps(
+                    {
+                        "kids": [
+                            {"type": "heading", "page number": 1, "heading level": 1, "content": "Product Overview"},
+                            {"type": "picture", "page number": 1},
+                        ]
+                    }
+                ),
                 encoding="utf-8",
             )
 
