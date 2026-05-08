@@ -76,6 +76,12 @@ class Settings:
     native_text_layer_first: bool = _env_bool("ODL_NATIVE_TEXT_LAYER_FIRST", True)
 
     def validate(self) -> None:
+        cli_name = Path(self.opendataloader_cli).name.lower()
+        if cli_name.startswith("opendataloader-pdf-hybrid"):
+            raise ValueError(
+                "ODL_CLI must point to opendataloader-pdf, not opendataloader-pdf-hybrid. "
+                "Start opendataloader-pdf-hybrid once as the shared backend."
+            )
         if self.hybrid_backend.lower() == "off":
             raise ValueError("Hybrid conversion must stay enabled.")
         if self.hybrid_mode not in {"auto", "full"}:

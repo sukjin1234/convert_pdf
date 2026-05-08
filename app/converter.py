@@ -8,14 +8,17 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import BinaryIO, Sequence
 
 from .config import Settings, get_settings
 from .markdown import render_document_pages_to_markdown, render_document_to_markdown
 
 logger = logging.getLogger(__name__)
+_LOCAL_CONVERSION_LOCK = threading.Lock()
 
 
 class ConversionError(RuntimeError):
@@ -36,6 +39,10 @@ class PdfConverter:
             safe_name = f"{Path(safe_name).stem or 'document'}.pdf"
 
         self.settings.tmp_root.mkdir(parents=True, exist_ok=True)
+        with _conversion_lock(self.settings):
+            return self._convert_pdf_bytes_locked(pdf_bytes, safe_name)
+
+    def _convert_pdf_bytes_locked(self, pdf_bytes: bytes, safe_name: str) -> str:
         with tempfile.TemporaryDirectory(prefix="convert-", dir=self.settings.tmp_root) as tmp:
             tmp_dir = Path(tmp)
             input_path = tmp_dir / safe_name
@@ -123,6 +130,50 @@ def sanitize_filename(filename: str) -> str:
     name = Path(filename or "document.pdf").name
     name = re.sub(r"[^A-Za-z0-9_ .-]+", "_", name).strip(" .")
     return name or "document.pdf"
+
+
+@contextmanager
+def _conversion_lock(settings: Settings):
+    lock_path = settings.tmp_root / "opendataloader-conversion.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _LOCAL_CONVERSION_LOCK:
+        with lock_path.open("a+b") as lock_file:
+            _lock_file(lock_file)
+            try:
+                yield
+            finally:
+                _unlock_file(lock_file)
+
+
+def _lock_file(lock_file: BinaryIO) -> None:
+    lock_file.seek(0)
+    if not lock_file.read(1):
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(lock_file: BinaryIO) -> None:
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _convert_pdf_file(

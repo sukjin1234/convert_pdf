@@ -57,6 +57,12 @@ class ConverterTest(unittest.TestCase):
     def test_sanitizes_filename(self):
         self.assertEqual(sanitize_filename("../bad:name?.pdf"), "bad_name_.pdf")
 
+    def test_rejects_hybrid_server_binary_as_converter_cli(self):
+        settings = Settings(opendataloader_cli="opendataloader-pdf-hybrid")
+
+        with self.assertRaisesRegex(ValueError, "ODL_CLI must point to opendataloader-pdf"):
+            settings.validate()
+
     def test_retries_qpdf_repaired_pdf_after_original_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(
