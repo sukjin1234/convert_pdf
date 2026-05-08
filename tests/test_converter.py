@@ -43,7 +43,31 @@ class ConverterTest(unittest.TestCase):
         self.assertIn("--enrich-picture-description", command)
         self.assertNotIn("--no-ocr", command)
 
-    def test_uses_temporary_hybrid_server_per_conversion(self):
+    def test_uses_primary_hybrid_server_first_when_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                tmp_root=Path(tmp),
+                hybrid_url="http://localhost:5002",
+                native_text_layer_first=False,
+                spawn_hybrid_per_conversion=True,
+                prepare_dify_parent_child_chunks=False,
+            )
+            converter = PdfConverter(settings)
+
+            with (
+                patch("app.converter._hybrid_health_ok", return_value=True),
+                patch("app.converter._start_temporary_hybrid_server") as start_server,
+                patch("app.converter._run_command") as run_command,
+                patch("app.converter._read_rendered_markdown", return_value="markdown"),
+            ):
+                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "policy.pdf")
+
+        self.assertEqual(result, "markdown")
+        start_server.assert_not_called()
+        command = run_command.call_args.args[0]
+        self.assertEqual(command[command.index("--hybrid-url") + 1], "http://localhost:5002")
+
+    def test_uses_temporary_hybrid_server_when_primary_is_busy_or_unavailable(self):
         class FakeHybridServer:
             url = "http://127.0.0.1:5103"
 
@@ -64,6 +88,7 @@ class ConverterTest(unittest.TestCase):
             fake_server = FakeHybridServer()
 
             with (
+                patch("app.converter._try_acquire_primary_hybrid", return_value=None),
                 patch("app.converter._start_temporary_hybrid_server", return_value=fake_server) as start_server,
                 patch("app.converter._run_command") as run_command,
                 patch("app.converter._read_rendered_markdown", return_value="markdown"),
@@ -334,6 +359,18 @@ class ConverterTest(unittest.TestCase):
             with self.assertRaises(ConversionError):
                 _read_rendered_markdown(output_dir)
 
+    def test_allows_image_only_placeholder_when_ocr_is_not_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "out.md").write_text(
+                "\n\n--- Page 1 ---\n\n> Image-only page. No embedded text layer was available.\n\n",
+                encoding="utf-8",
+            )
+
+            result = _read_rendered_markdown(output_dir, allow_unresolved_visual_pages=True)
+
+        self.assertIn("Image-only page", result)
+
     def test_prefers_json_image_description_over_markdown_image_link(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
@@ -381,6 +418,27 @@ class ConverterTest(unittest.TestCase):
 
             with self.assertRaises(ConversionError):
                 _read_rendered_markdown(output_dir)
+
+    def test_allows_visual_page_without_ocr_text_when_ocr_is_not_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "out.md").write_text("\n\n--- Page 1 ---\n\n# Product Overview\n\n", encoding="utf-8")
+            (output_dir / "out.json").write_text(
+                json.dumps(
+                    {
+                        "kids": [
+                            {"type": "heading", "page number": 1, "heading level": 1, "content": "Product Overview"},
+                            {"type": "picture", "page number": 1},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = _read_rendered_markdown(output_dir, allow_unresolved_visual_pages=True)
+
+        self.assertIn("# Product Overview", result)
+        self.assertIn("이미지/도식 중심 페이지", result)
 
     def test_reads_native_markdown_with_page_order_and_tables(self):
         markdown = "\n\n--- Page 26 ---\n\n| Category | Unit |\n| --- | --- |\n| Engineering | Free Major |\n"

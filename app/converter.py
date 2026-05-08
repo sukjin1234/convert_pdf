@@ -44,20 +44,42 @@ class _TemporaryHybridServer:
         _terminate_process_tree(self.process)
 
 
+@dataclass
+class _PrimaryHybridLease:
+    lock_file: BinaryIO
+
+    def close(self) -> None:
+        try:
+            _unlock_file(self.lock_file)
+        finally:
+            self.lock_file.close()
+
+
 class _ConversionContext:
     def __init__(self, settings: Settings, *, use_ocr: bool):
         self._settings = settings
         self._use_ocr = use_ocr
+        self._primary_lease: _PrimaryHybridLease | None = None
         self._hybrid_server: _TemporaryHybridServer | None = None
 
     @property
     def settings(self) -> Settings:
         return self._settings
 
+    @property
+    def use_ocr(self) -> bool:
+        return self._use_ocr
+
     def hybrid_settings(self) -> Settings:
         if not self._settings.spawn_hybrid_per_conversion:
             return self._settings
+        if self._primary_lease is not None:
+            return self._settings
         if self._hybrid_server is None:
+            self._primary_lease = _try_acquire_primary_hybrid(self._settings)
+            if self._primary_lease is not None:
+                logger.info("Using primary hybrid server at %s", self._settings.hybrid_url)
+                return self._settings
             self._hybrid_server = _start_temporary_hybrid_server(self._settings, use_ocr=self._use_ocr)
         return replace(self._settings, hybrid_url=self._hybrid_server.url)
 
@@ -65,6 +87,9 @@ class _ConversionContext:
         if self._hybrid_server is not None:
             self._hybrid_server.close()
             self._hybrid_server = None
+        if self._primary_lease is not None:
+            self._primary_lease.close()
+            self._primary_lease = None
 
 
 @dataclass(frozen=True)
@@ -269,6 +294,45 @@ def _unlock_file(lock_file: BinaryIO) -> None:
     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def _try_acquire_primary_hybrid(settings: Settings) -> _PrimaryHybridLease | None:
+    if not _hybrid_health_ok(_hybrid_health_url(settings.hybrid_url)):
+        return None
+
+    lock_path = settings.tmp_root / "opendataloader-primary-hybrid.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+b")
+    if _try_lock_file(lock_file):
+        return _PrimaryHybridLease(lock_file=lock_file)
+
+    lock_file.close()
+    return None
+
+
+def _try_lock_file(lock_file: BinaryIO) -> bool:
+    lock_file.seek(0)
+    if not lock_file.read(1):
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    import fcntl
+
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
 def build_hybrid_server_command(settings: Settings, port: int, *, use_ocr: bool) -> list[str]:
     command = [
         settings.hybrid_server_cli,
@@ -337,7 +401,7 @@ def _find_available_hybrid_port(settings: Settings) -> int:
 
 def _wait_for_hybrid_server(url: str, process: subprocess.Popen, timeout_seconds: int) -> None:
     deadline = time.monotonic() + timeout_seconds
-    health_url = f"{url}/health"
+    health_url = _hybrid_health_url(url)
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise ConversionError("Temporary hybrid server exited before becoming ready.")
@@ -353,6 +417,10 @@ def _hybrid_health_ok(url: str) -> bool:
             return 200 <= response.status < 300
     except (OSError, urllib.error.URLError):
         return False
+
+
+def _hybrid_health_url(url: str) -> str:
+    return f"{url.rstrip('/')}/health"
 
 
 def _url_port(url: str) -> int | None:
@@ -386,6 +454,7 @@ def _convert_pdf_file(
             context.hybrid_settings(),
             hybrid_mode=hybrid_mode,
             image_output=image_output,
+            allow_unresolved_visual_pages=not context.use_ocr,
         )
     except ConversionError as exc:
         if native_error is not None:
@@ -407,6 +476,7 @@ def _convert_pdf_file_hybrid(
     *,
     hybrid_mode: str | None = None,
     image_output: str = "external",
+    allow_unresolved_visual_pages: bool = False,
 ) -> str:
     output_dir.mkdir()
     command = build_opendataloader_command(
@@ -417,7 +487,10 @@ def _convert_pdf_file_hybrid(
         image_output=image_output,
     )
     _run_command(command, settings.conversion_timeout_seconds)
-    return _read_rendered_markdown(output_dir)
+    return _read_rendered_markdown(
+        output_dir,
+        allow_unresolved_visual_pages=allow_unresolved_visual_pages,
+    )
 
 
 def build_opendataloader_command(
@@ -549,7 +622,7 @@ def _kill_process_tree(pid: int) -> None:
         pass
 
 
-def _read_rendered_markdown(output_dir: Path) -> str:
+def _read_rendered_markdown(output_dir: Path, *, allow_unresolved_visual_pages: bool = False) -> str:
     markdown_path = _first_file(output_dir, (".md", ".markdown"))
     json_path = _first_file(output_dir, (".json",))
     fallback = _normalize_markdown(markdown_path.read_text(encoding="utf-8")) if markdown_path else ""
@@ -559,6 +632,8 @@ def _read_rendered_markdown(output_dir: Path) -> str:
         with json_path.open(encoding="utf-8") as f:
             doc = json.load(f)
         markdown = render_document_pages_to_markdown(doc, fallback)
+        if allow_unresolved_visual_pages and _has_presentable_markdown(markdown):
+            return markdown
         if _has_meaningful_markdown(markdown):
             if not _has_unresolved_visual_pages(markdown):
                 return markdown
@@ -566,6 +641,9 @@ def _read_rendered_markdown(output_dir: Path) -> str:
 
     if json_requires_ocr_fallback:
         raise ConversionError("OpenDataLoader produced visual pages without OCR text or image description.")
+
+    if allow_unresolved_visual_pages and fallback and _has_presentable_markdown(fallback):
+        return fallback
 
     if (
         fallback
@@ -677,6 +755,16 @@ def _has_meaningful_markdown(markdown: str) -> bool:
         "",
         stripped,
     )
+    stripped = re.sub(r"(?m)^\s*\|(?:\s*\|)+\s*$", "", stripped)
+    stripped = re.sub(r"(?m)^\s*\|(?:\s*:?-+:?\s*\|)+\s*$", "", stripped)
+    return bool(stripped.strip())
+
+
+def _has_presentable_markdown(markdown: str) -> bool:
+    stripped = markdown.strip()
+    if not stripped:
+        return False
+    stripped = re.sub(r"(?m)^\s*--- Page \d+ ---\s*$", "", stripped)
     stripped = re.sub(r"(?m)^\s*\|(?:\s*\|)+\s*$", "", stripped)
     stripped = re.sub(r"(?m)^\s*\|(?:\s*:?-+:?\s*\|)+\s*$", "", stripped)
     return bool(stripped.strip())
