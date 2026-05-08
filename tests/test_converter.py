@@ -78,7 +78,7 @@ class ConverterTest(unittest.TestCase):
             with patch("app.converter._convert_pdf_file") as convert, patch("app.converter._repair_pdf_with_pikepdf") as repair:
                 convert.side_effect = [ConversionError("broken xref"), "markdown"]
 
-                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "broken.pdf")
+                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "broken.pdf", use_ocr=True)
 
         self.assertEqual(result, "markdown")
         self.assertEqual(convert.call_count, 2)
@@ -98,7 +98,7 @@ class ConverterTest(unittest.TestCase):
             with patch("app.converter._convert_pdf_file") as convert, patch("app.converter._repair_pdf") as repair:
                 convert.side_effect = [ConversionError("broken xref"), "markdown"]
 
-                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "broken.pdf")
+                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "broken.pdf", use_ocr=True)
 
         self.assertEqual(result, "markdown")
         self.assertEqual(convert.call_count, 2)
@@ -126,7 +126,7 @@ class ConverterTest(unittest.TestCase):
                     "ocr markdown",
                 ]
 
-                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "broken.pdf")
+                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "broken.pdf", use_ocr=True)
 
         self.assertEqual(result, "ocr markdown")
         self.assertEqual(convert.call_count, 3)
@@ -155,9 +155,68 @@ class ConverterTest(unittest.TestCase):
                     "ocr markdown",
                 ]
 
-                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "scan.pdf")
+                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "scan.pdf", use_ocr=True)
 
         self.assertEqual(result, "ocr markdown")
+        self.assertEqual(convert.call_count, 2)
+        rasterize.assert_called_once()
+        repair.assert_not_called()
+        qpdf_repair.assert_not_called()
+
+    def test_does_not_run_ocr_fallback_unless_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                tmp_root=Path(tmp),
+                qpdf_repair_pdf_on_failure=True,
+                repair_pdf_on_failure=True,
+                rasterize_pdf_on_failure=True,
+                prepare_dify_parent_child_chunks=False,
+            )
+            converter = PdfConverter(settings)
+
+            with (
+                patch("app.converter._convert_pdf_file") as convert,
+                patch("app.converter._rasterize_pdf") as rasterize,
+                patch("app.converter._repair_pdf") as repair,
+                patch("app.converter._repair_pdf_with_pikepdf") as qpdf_repair,
+            ):
+                convert.side_effect = ConversionError(
+                    "OpenDataLoader produced no usable text or image description; OCR fallback required."
+                )
+
+                with self.assertRaisesRegex(ConversionError, "OCR was not selected"):
+                    converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "scan.pdf")
+
+        convert.assert_called_once()
+        rasterize.assert_not_called()
+        repair.assert_not_called()
+        qpdf_repair.assert_not_called()
+
+    def test_attempts_ocr_fallback_only_once_when_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                tmp_root=Path(tmp),
+                qpdf_repair_pdf_on_failure=True,
+                repair_pdf_on_failure=True,
+                rasterize_pdf_on_failure=True,
+                prepare_dify_parent_child_chunks=False,
+            )
+            converter = PdfConverter(settings)
+
+            with (
+                patch("app.converter._convert_pdf_file") as convert,
+                patch("app.converter._rasterize_pdf") as rasterize,
+                patch("app.converter._repair_pdf") as repair,
+                patch("app.converter._repair_pdf_with_pikepdf") as qpdf_repair,
+            ):
+                convert.side_effect = [
+                    ConversionError("OpenDataLoader produced no usable text or image description; OCR fallback required."),
+                    ConversionError("OpenDataLoader produced visual pages without OCR text or image description."),
+                ]
+
+                with self.assertRaisesRegex(ConversionError, "after OCR fallback attempt"):
+                    converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "scan.pdf", use_ocr=True)
+
         self.assertEqual(convert.call_count, 2)
         rasterize.assert_called_once()
         repair.assert_not_called()

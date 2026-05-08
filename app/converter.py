@@ -33,7 +33,7 @@ class PdfConverter:
     def __init__(self, settings: Settings | None = None):
         object.__setattr__(self, "settings", settings or get_settings())
 
-    def convert_pdf_bytes(self, pdf_bytes: bytes, filename: str = "document.pdf") -> str:
+    def convert_pdf_bytes(self, pdf_bytes: bytes, filename: str = "document.pdf", *, use_ocr: bool = False) -> str:
         self._validate_pdf_bytes(pdf_bytes)
         safe_name = sanitize_filename(filename)
         if not safe_name.lower().endswith(".pdf"):
@@ -41,10 +41,10 @@ class PdfConverter:
 
         self.settings.tmp_root.mkdir(parents=True, exist_ok=True)
         with _conversion_lock(self.settings):
-            markdown = self._convert_pdf_bytes_locked(pdf_bytes, safe_name)
+            markdown = self._convert_pdf_bytes_locked(pdf_bytes, safe_name, use_ocr=use_ocr)
         return _prepare_for_dify_chunks(markdown, self.settings)
 
-    def _convert_pdf_bytes_locked(self, pdf_bytes: bytes, safe_name: str) -> str:
+    def _convert_pdf_bytes_locked(self, pdf_bytes: bytes, safe_name: str, *, use_ocr: bool) -> str:
         with tempfile.TemporaryDirectory(prefix="convert-", dir=self.settings.tmp_root) as tmp:
             tmp_dir = Path(tmp)
             input_path = tmp_dir / safe_name
@@ -53,26 +53,45 @@ class PdfConverter:
             errors = []
             repaired_path: Path | None = None
             qpdf_repaired_path: Path | None = None
+            ocr_attempted = False
+
+            def try_ocr_fallback(source_path: Path, label: str) -> str:
+                nonlocal ocr_attempted
+                if not use_ocr:
+                    raise ConversionError("OCR is disabled. Submit ocr=true to convert image-only or scanned PDFs.")
+                if not self.settings.rasterize_pdf_on_failure:
+                    raise ConversionError("OCR fallback is disabled by ODL_RASTERIZE_PDF_ON_FAILURE.")
+                if ocr_attempted:
+                    raise ConversionError("OCR fallback was already attempted.")
+
+                ocr_attempted = True
+                rasterized_ocr_path = tmp_dir / f"{label}-ocr.pdf"
+                _rasterize_pdf(source_path, rasterized_ocr_path, self.settings.rasterize_dpi)
+                return _convert_pdf_file(
+                    rasterized_ocr_path,
+                    tmp_dir / f"output-{label}-ocr",
+                    self.settings,
+                    hybrid_mode="full",
+                    image_output="external",
+                )
+
+            def handle_ocr_required(exc: ConversionError, source_path: Path, label: str) -> str:
+                if not use_ocr:
+                    raise ConversionError("PDF appears to require OCR, but OCR was not selected.") from exc
+                try:
+                    return try_ocr_fallback(source_path, label)
+                except ConversionError as ocr_exc:
+                    errors.append(f"{label}-ocr: {ocr_exc}")
+                    logger.info("OCR fallback failed. label=%s error=%s", label, ocr_exc)
+                    raise ConversionError("PDF conversion failed after OCR fallback attempt: " + "; ".join(errors)) from ocr_exc
 
             try:
                 return _convert_pdf_file(input_path, tmp_dir / "output-original", self.settings)
             except ConversionError as exc:
                 errors.append(f"original: {exc}")
                 logger.info("Original PDF conversion failed; trying fallbacks. error=%s", exc)
-                if _requires_ocr_fallback(exc) and self.settings.rasterize_pdf_on_failure:
-                    try:
-                        rasterized_ocr_path = tmp_dir / "rasterized-ocr.pdf"
-                        _rasterize_pdf(input_path, rasterized_ocr_path, self.settings.rasterize_dpi)
-                        return _convert_pdf_file(
-                            rasterized_ocr_path,
-                            tmp_dir / "output-rasterized-ocr",
-                            self.settings,
-                            hybrid_mode="full",
-                            image_output="external",
-                        )
-                    except ConversionError as ocr_exc:
-                        errors.append(f"rasterized-ocr: {ocr_exc}")
-                        logger.info("Rasterized OCR conversion failed. error=%s", ocr_exc)
+                if _requires_ocr_fallback(exc):
+                    return handle_ocr_required(exc, input_path, "original")
 
             if self.settings.qpdf_repair_pdf_on_failure:
                 qpdf_repaired_path = tmp_dir / "qpdf-repaired.pdf"
@@ -86,6 +105,8 @@ class PdfConverter:
                 except ConversionError as exc:
                     errors.append(f"qpdf-repaired: {exc}")
                     logger.info("qpdf/pikepdf repaired PDF conversion failed. error=%s", exc)
+                    if _requires_ocr_fallback(exc):
+                        return handle_ocr_required(exc, qpdf_repaired_path, "qpdf-repaired")
 
             if self.settings.repair_pdf_on_failure:
                 repaired_path = tmp_dir / "repaired.pdf"
@@ -96,35 +117,16 @@ class PdfConverter:
                 except ConversionError as exc:
                     errors.append(f"repaired: {exc}")
                     logger.info("Repaired PDF conversion failed. error=%s", exc)
+                    if _requires_ocr_fallback(exc):
+                        return handle_ocr_required(exc, repaired_path, "repaired")
 
-                if repaired_path.exists():
-                    try:
-                        return _convert_pdf_file(
-                            repaired_path,
-                            tmp_dir / "output-repaired-ocr",
-                            self.settings,
-                            hybrid_mode="full",
-                            image_output="external",
-                        )
-                    except ConversionError as exc:
-                        errors.append(f"repaired-ocr: {exc}")
-                        logger.info("Repaired PDF OCR conversion failed. error=%s", exc)
-
-            if self.settings.rasterize_pdf_on_failure:
-                rasterized_path = tmp_dir / "rasterized.pdf"
+            if use_ocr and self.settings.rasterize_pdf_on_failure and not ocr_attempted:
                 raster_source = _first_existing_path(repaired_path, qpdf_repaired_path, input_path)
                 try:
-                    _rasterize_pdf(raster_source, rasterized_path, self.settings.rasterize_dpi)
-                    return _convert_pdf_file(
-                        rasterized_path,
-                        tmp_dir / "output-rasterized",
-                        self.settings,
-                        hybrid_mode="full",
-                        image_output="external",
-                    )
+                    return try_ocr_fallback(raster_source, "rasterized")
                 except ConversionError as exc:
-                    errors.append(f"rasterized: {exc}")
-                    logger.info("Rasterized PDF conversion failed. error=%s", exc)
+                    errors.append(f"rasterized-ocr: {exc}")
+                    logger.info("Final OCR fallback failed. error=%s", exc)
 
             raise ConversionError("PDF conversion failed after fallback attempts: " + "; ".join(errors))
 

@@ -25,7 +25,19 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response.success)
         self.assertEqual(response.markdown, "# Converted")
-        converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "policy.pdf")
+        converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "policy.pdf", use_ocr=False)
+
+    async def test_convert_passes_selected_ocr_option(self):
+        content = b"%PDF-1.4\n%%EOF"
+        pdf = UploadFile(file=BytesIO(content), filename="scan.pdf")
+
+        with patch("app.main.PdfConverter") as converter_class:
+            converter_class.return_value.convert_pdf_bytes.return_value = "# Converted"
+
+            response = await convert(pdf, ocr=True)
+
+        self.assertTrue(response.success)
+        converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "scan.pdf", use_ocr=True)
 
 
 if __name__ == "__main__":
