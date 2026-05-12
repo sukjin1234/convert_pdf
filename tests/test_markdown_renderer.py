@@ -47,6 +47,21 @@ class MarkdownRendererTest(unittest.TestCase):
         self.assertNotIn("](images/chart.png)", markdown)
         self.assertIn("**Image summary:** A chart showing quarterly access request volume.", markdown)
 
+    def test_renders_ocr_markdown_in_image_position(self):
+        doc = {
+            "kids": [
+                {"type": "paragraph", "page number": 1, "content": "Before"},
+                {"type": "picture", "page number": 1, "_ocr_markdown": "Text read from image"},
+                {"type": "paragraph", "page number": 1, "content": "After"},
+            ]
+        }
+
+        markdown = render_document_pages_to_markdown(doc)
+
+        self.assertLess(markdown.index("Before"), markdown.index("Text read from image"))
+        self.assertLess(markdown.index("Text read from image"), markdown.index("After"))
+        self.assertNotIn("PDF \ud14d\uc2a4\ud2b8 \ub808\uc774\uc5b4", markdown)
+
     def test_falls_back_to_markdown_when_json_has_no_content(self):
         markdown = render_document_to_markdown({"kids": []}, "# Fallback")
 

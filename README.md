@@ -10,10 +10,10 @@ opendataloader-pdf-hybrid --port 5002 --ocr-lang "ko,en" --enrich-picture-descri
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-스캔 PDF가 많으면 하이브리드 백엔드를 아래처럼 실행합니다. OCR 때문에 1분을 넘길 가능성이 더 큽니다.
+`use_ocr=true`로 요청하면 API가 별도 OCR 전용 hybrid 서버를 임시로 실행합니다. 기본 포트는 `5003`이며, 변환이 끝나면 서버 프로세스를 종료합니다.
 
 ```powershell
-opendataloader-pdf-hybrid --port 5002 --force-ocr --ocr-lang "ko,en" --enrich-picture-description
+opendataloader-pdf-hybrid --port 5003 --force-ocr --ocr-lang "ko,en" --enrich-picture-description
 ```
 
 ## Dify 노드 설정
@@ -25,6 +25,7 @@ opendataloader-pdf-hybrid --port 5002 --force-ocr --ocr-lang "ko,en" --enrich-pi
 - Method: `POST`
 - URL: `http://<converter-host>:8000/convert`
 - Body: Form Data, 파일 필드에 PDF 파일 변수 지정
+- Optional Form Data: `use_ocr` boolean, 이미지 OCR이 필요할 때 `true`
 - Response variables: `body.success`, `body.markdown`
 
 Binary body:
@@ -51,6 +52,7 @@ Dify 노드의 read timeout은 `70~90s`로 설정합니다. API 내부 기본 �
 - 제목/소제목/본문: OpenDataLoader JSON의 `heading`, `paragraph`, `list` 구조를 Markdown으로 재렌더링합니다.
 - 표: OpenDataLoader `--table-method cluster`와 hybrid backend를 사용하고, JSON table rows/cells를 Markdown table로 변환합니다.
 - 이미지/차트: 클라이언트는 `--hybrid-mode full`로 실행됩니다. 백엔드는 `--enrich-picture-description` 옵션으로 시작해야 이미지 설명이 Markdown 흐름에 들어갑니다.
+- OCR: `use_ocr=true`이면 기본 변환 결과의 JSON에서 이미지 요소가 있는 페이지만 OCR 대상으로 삼습니다. OCR 텍스트는 해당 이미지 요소가 있던 Markdown 위치에 삽입됩니다.
 - Hybrid 강제: 변환 명령에 `--hybrid docling-fast`를 항상 넣고 `--hybrid-fallback`은 사용하지 않습니다.
 - 시간 제한: `ODL_CONVERSION_TIMEOUT_SECONDS` 기본값은 `70`, `ODL_HYBRID_TIMEOUT_MS` 기본값은 `60000`입니다.
 
@@ -63,6 +65,14 @@ Dify 노드의 read timeout은 `70~90s`로 설정합니다. API 내부 기본 �
 - `ODL_MAX_PDF_BYTES`: 기본 `83886080`
 - `ODL_TABLE_METHOD`: 기본 `cluster`
 - `ODL_USE_STRUCT_TREE`: 기본 `false`
+- `ODL_OCR_SERVER_CLI`: 기본 `opendataloader-pdf-hybrid`
+- `ODL_OCR_SERVER_HOST`: 기본 `127.0.0.1`
+- `ODL_OCR_SERVER_PORT`: 기본 `5003`
+- `ODL_OCR_HYBRID_URL`: 기본 `http://127.0.0.1:<ODL_OCR_SERVER_PORT>`
+- `ODL_OCR_LANG`: 기본 `ko,en`
+- `ODL_OCR_ENRICH_PICTURE_DESCRIPTION`: 기본 `true`
+- `ODL_OCR_SERVER_START_TIMEOUT_SECONDS`: 기본 `60`
+- `ODL_OCR_SERVER_SHUTDOWN_TIMEOUT_SECONDS`: 기본 `10`
 
 ## 테스트
 

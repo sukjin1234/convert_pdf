@@ -1,18 +1,30 @@
+import json
 import unittest
-import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 from app.config import Settings
 from app.converter import (
     ConversionError,
     PdfConverter,
+    _convert_pdf_file,
     _read_generated_markdown,
     _read_rendered_markdown,
+    build_ocr_server_command,
     build_opendataloader_native_command,
     build_opendataloader_command,
     sanitize_filename,
 )
+
+
+@contextmanager
+def _test_workspace():
+    root = Path(__file__).resolve().parents[1] / ".tmp-tests"
+    path = root / uuid4().hex
+    path.mkdir(parents=True, exist_ok=False)
+    yield str(path)
 
 
 class ConverterTest(unittest.TestCase):
@@ -29,6 +41,26 @@ class ConverterTest(unittest.TestCase):
         self.assertIn("--table-method", command)
         self.assertEqual(command[command.index("--table-method") + 1], "cluster")
         self.assertNotIn("--hybrid-fallback", command)
+
+    def test_command_can_target_dedicated_ocr_hybrid_url(self):
+        settings = Settings(ocr_hybrid_url="http://127.0.0.1:5999")
+        command = build_opendataloader_command(
+            Path("input.pdf"),
+            Path("out"),
+            settings,
+            hybrid_url=settings.ocr_hybrid_url,
+        )
+
+        self.assertEqual(command[command.index("--hybrid-url") + 1], "http://127.0.0.1:5999")
+
+    def test_ocr_server_command_uses_force_ocr(self):
+        settings = Settings(ocr_server_cli="hybrid-server", ocr_server_port=5999, ocr_lang="ko,en")
+        command = build_ocr_server_command(settings)
+
+        self.assertEqual(command[:3], ["hybrid-server", "--port", "5999"])
+        self.assertIn("--force-ocr", command)
+        self.assertIn("--ocr-lang", command)
+        self.assertEqual(command[command.index("--ocr-lang") + 1], "ko,en")
 
     def test_native_command_preserves_page_separators_without_hybrid(self):
         settings = Settings(opendataloader_jar="odl.jar")
@@ -58,7 +90,7 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(sanitize_filename("../bad:name?.pdf"), "bad_name_.pdf")
 
     def test_retries_qpdf_repaired_pdf_after_original_failure(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with _test_workspace() as tmp:
             settings = Settings(
                 tmp_root=Path(tmp),
                 qpdf_repair_pdf_on_failure=True,
@@ -77,7 +109,7 @@ class ConverterTest(unittest.TestCase):
         repair.assert_called_once()
 
     def test_retries_repaired_pdf_after_original_failure(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with _test_workspace() as tmp:
             settings = Settings(
                 tmp_root=Path(tmp),
                 qpdf_repair_pdf_on_failure=False,
@@ -96,7 +128,7 @@ class ConverterTest(unittest.TestCase):
         repair.assert_called_once()
 
     def test_rasterizes_after_repair_conversion_failure(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with _test_workspace() as tmp:
             settings = Settings(
                 tmp_root=Path(tmp),
                 qpdf_repair_pdf_on_failure=False,
@@ -123,8 +155,87 @@ class ConverterTest(unittest.TestCase):
         repair.assert_called_once()
         rasterize.assert_called_once()
 
+    def test_use_ocr_inserts_ocr_markdown_at_image_position(self):
+        with _test_workspace() as tmp:
+            tmp_dir = Path(tmp)
+            input_path = tmp_dir / "input.pdf"
+            input_path.write_bytes(b"%PDF-1.4\n%%EOF")
+            settings = Settings(
+                tmp_root=tmp_dir,
+                native_text_layer_first=False,
+                ocr_hybrid_url="http://127.0.0.1:5999",
+            )
+            events = []
+
+            @contextmanager
+            def fake_ocr_server(_settings):
+                events.append("start")
+                try:
+                    yield
+                finally:
+                    events.append("stop")
+
+            def fake_run_command(command, _timeout):
+                output_dir = Path(command[command.index("--output-dir") + 1])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                if output_dir.name == "output":
+                    doc = {
+                        "kids": [
+                            {"type": "paragraph", "page number": 1, "content": "Before image"},
+                            {
+                                "type": "picture",
+                                "page number": 1,
+                                "bounding box": [0, 0, 100, 100],
+                                "description": "Admissions chart.",
+                            },
+                            {"type": "paragraph", "page number": 1, "content": "After image"},
+                            {"type": "paragraph", "page number": 2, "content": "Text-only page"},
+                        ]
+                    }
+                    (output_dir / "doc.json").write_text(json.dumps(doc), encoding="utf-8")
+                    (output_dir / "doc.md").write_text("fallback", encoding="utf-8")
+                else:
+                    self.assertEqual(command[command.index("--hybrid-url") + 1], "http://127.0.0.1:5999")
+                    (output_dir / "ocr.md").write_text("--- Page 1 ---\n\nOCR text from image", encoding="utf-8")
+
+            with (
+                patch("app.converter._managed_ocr_server", fake_ocr_server),
+                patch("app.converter._extract_pdf_region_to_pdf") as extract_region,
+                patch("app.converter._run_command", side_effect=fake_run_command),
+            ):
+                markdown = _convert_pdf_file(input_path, tmp_dir / "output", settings, use_ocr=True)
+
+        self.assertEqual(events, ["start", "stop"])
+        extract_region.assert_called_once()
+        self.assertLess(markdown.index("Before image"), markdown.index("OCR text from image"))
+        self.assertLess(markdown.index("OCR text from image"), markdown.index("After image"))
+        self.assertIn("Text-only page", markdown)
+
+    def test_use_ocr_does_not_start_server_without_image_targets(self):
+        with _test_workspace() as tmp:
+            tmp_dir = Path(tmp)
+            input_path = tmp_dir / "input.pdf"
+            input_path.write_bytes(b"%PDF-1.4\n%%EOF")
+            settings = Settings(tmp_root=tmp_dir, native_text_layer_first=False)
+
+            def fake_run_command(command, _timeout):
+                output_dir = Path(command[command.index("--output-dir") + 1])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                doc = {"kids": [{"type": "paragraph", "page number": 1, "content": "Only text"}]}
+                (output_dir / "doc.json").write_text(json.dumps(doc), encoding="utf-8")
+                (output_dir / "doc.md").write_text("Only text", encoding="utf-8")
+
+            with (
+                patch("app.converter._managed_ocr_server") as server,
+                patch("app.converter._run_command", side_effect=fake_run_command),
+            ):
+                markdown = _convert_pdf_file(input_path, tmp_dir / "output", settings, use_ocr=True)
+
+        self.assertEqual(markdown, "Only text")
+        server.assert_not_called()
+
     def test_rejects_page_separator_only_markdown(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with _test_workspace() as tmp:
             output_dir = Path(tmp)
             (output_dir / "out.md").write_text("\n\n--- Page 1 ---\n\n--- Page 2 ---\n\n", encoding="utf-8")
 
@@ -132,7 +243,7 @@ class ConverterTest(unittest.TestCase):
                 _read_rendered_markdown(output_dir)
 
     def test_rejects_image_link_only_markdown(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with _test_workspace() as tmp:
             output_dir = Path(tmp)
             (output_dir / "out.md").write_text(
                 "\n\n--- Page 1 ---\n\n![image 1](<images/page1.png>)\n\n",
@@ -144,7 +255,7 @@ class ConverterTest(unittest.TestCase):
 
     def test_reads_native_markdown_with_page_order_and_tables(self):
         markdown = "\n\n--- Page 26 ---\n\n| Category | Unit |\n| --- | --- |\n| Engineering | Free Major |\n"
-        with tempfile.TemporaryDirectory() as tmp:
+        with _test_workspace() as tmp:
             output_dir = Path(tmp)
             (output_dir / "out.md").write_text(markdown, encoding="utf-8")
 
@@ -154,7 +265,7 @@ class ConverterTest(unittest.TestCase):
         self.assertIn("| Category | Unit |", result)
 
     def test_rejects_empty_table_only_markdown(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with _test_workspace() as tmp:
             output_dir = Path(tmp)
             (output_dir / "out.md").write_text(
                 "\n\n--- Page 1 ---\n\n| | |\n| --- | --- |\n| | |\n",
@@ -172,7 +283,7 @@ class ConverterTest(unittest.TestCase):
                 *[f"--- Page {page} ---" for page in range(2, 21)],
             ]
         )
-        with tempfile.TemporaryDirectory() as tmp:
+        with _test_workspace() as tmp:
             output_dir = Path(tmp)
             (output_dir / "out.md").write_text(markdown, encoding="utf-8")
 

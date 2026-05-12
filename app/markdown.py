@@ -181,37 +181,42 @@ def _render_table_cell(cell: dict[str, Any]) -> str:
 
 
 def _render_image(element: dict[str, Any]) -> str:
+    ocr_markdown = _normalize_markdown(str(element.get("_ocr_markdown") or ""))
     description = _clean_text(element.get("description", "") or element.get("content", ""))
+    parts = []
     if description:
-        return f"**Image summary:** {description}"
-    return ""
+        parts.append(f"**Image summary:** {description}")
+    if ocr_markdown:
+        parts.append(ocr_markdown)
+    return "\n\n".join(parts)
 
 
 def _render_page(elements: list[dict[str, Any]]) -> str:
     has_visual_only_content = any(_element_has_image(element) and not _element_has_text(element) for element in elements)
     elements = [element for element in elements if _is_page_content_element(element)]
 
-    timeline = _render_timeline_page(elements)
-    if timeline:
-        return timeline
+    has_ocr_content = any(_element_has_ocr(element) for element in elements)
+    if not has_ocr_content:
+        timeline = _render_timeline_page(elements)
+        if timeline:
+            return timeline
 
-    metric_grid = _render_metric_grid_page(elements)
-    if metric_grid:
-        return metric_grid
+        metric_grid = _render_metric_grid_page(elements)
+        if metric_grid:
+            return metric_grid
 
     blocks = []
     has_image = False
     for element in elements:
         if _element_type(element) in {"image", "picture", "figure"}:
             has_image = True
-            continue
         rendered = _render_element(element)
         if rendered:
             blocks.append(rendered)
 
     if not blocks and has_image:
         return "> Image-only page. No embedded text layer was available."
-    if has_visual_only_content and len(_content_fingerprint("\n".join(blocks))) < 40:
+    if has_visual_only_content and not has_ocr_content and len(_content_fingerprint("\n".join(blocks))) < 40:
         blocks.append("> \uc774\ubbf8\uc9c0/\ub3c4\uc2dd \uc911\uc2ec \ud398\uc774\uc9c0\ub85c, PDF \ud14d\uc2a4\ud2b8 \ub808\uc774\uc5b4\uc5d0\uc11c \ud655\uc778\ub418\ub294 \ubb38\uad6c\ub9cc \ud3ec\ud568\ud588\uc2b5\ub2c8\ub2e4.")
     return "\n\n".join(blocks)
 
@@ -453,6 +458,19 @@ def _element_has_image(element: dict[str, Any]) -> bool:
         if not isinstance(values, list):
             continue
         if any(isinstance(child, dict) and _element_has_image(child) for child in values):
+            return True
+    return False
+
+
+def _element_has_ocr(element: dict[str, Any]) -> bool:
+    if _normalize_markdown(str(element.get("_ocr_markdown") or "")):
+        return True
+    nested_keys = ("kids", "children", "rows", "cells", "list items", "items")
+    for key in nested_keys:
+        values = element.get(key) or []
+        if not isinstance(values, list):
+            continue
+        if any(isinstance(child, dict) and _element_has_ocr(child) for child in values):
             return True
     return False
 
