@@ -25,6 +25,9 @@ MARKER_SYMBOLS = (
     "\u25a3"  # white square containing black small square
 )
 MARKER_SYMBOL_PATTERN = f"[{re.escape(MARKER_SYMBOLS)}]"
+PARENT_OVERLAP_LINE_LIMIT = 2
+PARENT_OVERLAP_CHAR_LIMIT = 280
+CHILD_CONTEXT_CHAR_LIMIT = 240
 
 
 def render_document_to_markdown(doc: dict[str, Any] | None, fallback_markdown: str = "") -> str:
@@ -32,10 +35,13 @@ def render_document_to_markdown(doc: dict[str, Any] | None, fallback_markdown: s
         return _normalize_markdown(fallback_markdown)
 
     blocks = []
+    heading_context: list[str] = []
     for element in _children(doc):
-        rendered = _render_element(element)
+        rendered = _render_element(element, heading_context=heading_context)
         if rendered:
             blocks.append(rendered)
+        if _element_type(element) == "heading":
+            heading_context = _updated_heading_context(heading_context, element)
 
     markdown = "\n\n".join(blocks).strip()
     if not markdown:
@@ -59,20 +65,72 @@ def render_document_pages_to_markdown(doc: dict[str, Any] | None, fallback_markd
     blocks = []
     for page_number in sorted(pages):
         page_markdown = _render_page(pages[page_number])
+        blocks.append((page_number, page_markdown))
+    return _normalize_markdown("\n\n".join(_render_pages_with_parent_overlap(blocks)))
+
+
+def _render_pages_with_parent_overlap(pages: list[tuple[int, str]]) -> list[str]:
+    blocks = []
+    previous_tail = ""
+    for page_number, page_markdown in pages:
+        page_blocks = [f"--- Page {page_number} ---"]
+        if previous_tail:
+            page_blocks.append(f"> 이전 parent overlap: {previous_tail}")
         if page_markdown:
-            blocks.append(f"--- Page {page_number} ---\n\n{page_markdown}")
-        else:
-            blocks.append(f"--- Page {page_number} ---")
-    return _normalize_markdown("\n\n".join(blocks))
+            page_blocks.append(page_markdown)
+        blocks.append("\n\n".join(page_blocks))
+        previous_tail = _parent_overlap_tail(page_markdown)
+    return blocks
 
 
-def _render_element(element: dict[str, Any], list_depth: int = 0, symbol_legends: dict[str, str] | None = None) -> str:
+def _parent_overlap_tail(markdown: str) -> str:
+    lines = []
+    for line in markdown.splitlines():
+        line = _overlap_line_text(line)
+        if line:
+            lines.append(line)
+    if not lines:
+        return ""
+
+    tail = []
+    total = 0
+    for line in reversed(lines):
+        line_length = len(line)
+        if tail and total + line_length > PARENT_OVERLAP_CHAR_LIMIT:
+            break
+        tail.append(line)
+        total += line_length
+        if len(tail) >= PARENT_OVERLAP_LINE_LIMIT:
+            break
+    return " / ".join(reversed(tail))
+
+
+def _overlap_line_text(line: str) -> str:
+    line = line.strip()
+    if not line:
+        return ""
+    if line.startswith("|") or re.fullmatch(r"\|(?:\s*:?-+:?\s*\|)+", line):
+        return ""
+    if line.startswith("**표 행 요약**") or line.startswith("**표 기호 요약**"):
+        return ""
+    line = re.sub(r"^#{1,6}\s+", "", line)
+    line = re.sub(r"^[-*]\s+", "", line)
+    line = re.sub(r"^>\s*", "", line)
+    return _record_cell_text(line)
+
+
+def _render_element(
+    element: dict[str, Any],
+    list_depth: int = 0,
+    symbol_legends: dict[str, str] | None = None,
+    heading_context: list[str] | None = None,
+) -> str:
     element_type = _element_type(element)
 
     if element_type in {"header", "footer"}:
         return ""
     if element_type in {"document", "page", "text block", "block", "section"}:
-        return _render_children(element, symbol_legends)
+        return _render_children(element, symbol_legends, heading_context)
     if element_type == "heading":
         return _render_heading(element)
     if element_type in {"paragraph", "text"}:
@@ -81,16 +139,16 @@ def _render_element(element: dict[str, Any], list_depth: int = 0, symbol_legends
         content = _clean_text(element.get("content", ""))
         return f"*{content}*" if content else ""
     if element_type == "list":
-        return _render_list(element, list_depth, symbol_legends)
+        return _render_list(element, list_depth, symbol_legends, heading_context)
     if element_type == "list item":
-        return _render_list_item(element, list_depth, symbol_legends)
+        return _render_list_item(element, list_depth, symbol_legends, heading_context)
     if element_type == "table":
-        return _render_table(element, symbol_legends)
+        return _render_table(element, symbol_legends, heading_context)
     if element_type in {"image", "picture", "figure"}:
         return _render_image(element)
 
     content = _clean_text(element.get("content", ""))
-    child_content = _render_children(element, symbol_legends)
+    child_content = _render_children(element, symbol_legends, heading_context)
     return "\n\n".join(part for part in (content, child_content) if part)
 
 
@@ -102,16 +160,25 @@ def _render_heading(element: dict[str, Any]) -> str:
     return f"{'#' * level} {content}"
 
 
-def _render_children(element: dict[str, Any], symbol_legends: dict[str, str] | None = None) -> str:
+def _render_children(
+    element: dict[str, Any],
+    symbol_legends: dict[str, str] | None = None,
+    heading_context: list[str] | None = None,
+) -> str:
     blocks = []
     for child in _children(element):
-        rendered = _render_element(child, symbol_legends=symbol_legends)
+        rendered = _render_element(child, symbol_legends=symbol_legends, heading_context=heading_context)
         if rendered:
             blocks.append(rendered)
     return "\n\n".join(blocks)
 
 
-def _render_list(element: dict[str, Any], list_depth: int, symbol_legends: dict[str, str] | None = None) -> str:
+def _render_list(
+    element: dict[str, Any],
+    list_depth: int,
+    symbol_legends: dict[str, str] | None = None,
+    heading_context: list[str] | None = None,
+) -> str:
     items = element.get("list items") or element.get("items") or element.get("kids") or []
     if not isinstance(items, list):
         return ""
@@ -122,7 +189,7 @@ def _render_list(element: dict[str, Any], list_depth: int, symbol_legends: dict[
     for index, item in enumerate(items, start=1):
         if not isinstance(item, dict):
             continue
-        text = _render_list_item(item, list_depth + 1, symbol_legends)
+        text = _render_list_item(item, list_depth + 1, symbol_legends, heading_context)
         if not text:
             continue
         prefix = f"{index}. " if ordered else "- "
@@ -132,17 +199,26 @@ def _render_list(element: dict[str, Any], list_depth: int, symbol_legends: dict[
     return "\n".join(lines)
 
 
-def _render_list_item(element: dict[str, Any], list_depth: int, symbol_legends: dict[str, str] | None = None) -> str:
+def _render_list_item(
+    element: dict[str, Any],
+    list_depth: int,
+    symbol_legends: dict[str, str] | None = None,
+    heading_context: list[str] | None = None,
+) -> str:
     content = _clean_text(element.get("content", ""))
     child_blocks = []
     for child in _children(element):
-        rendered = _render_element(child, list_depth, symbol_legends)
+        rendered = _render_element(child, list_depth, symbol_legends, heading_context)
         if rendered:
             child_blocks.append(rendered)
     return "\n".join(part for part in [content, *child_blocks] if part)
 
 
-def _render_table(element: dict[str, Any], symbol_legends: dict[str, str] | None = None) -> str:
+def _render_table(
+    element: dict[str, Any],
+    symbol_legends: dict[str, str] | None = None,
+    heading_context: list[str] | None = None,
+) -> str:
     rows = element.get("rows") or []
     if not isinstance(rows, list):
         return ""
@@ -170,7 +246,7 @@ def _render_table(element: dict[str, Any], symbol_legends: dict[str, str] | None
     for row in body:
         lines.append("| " + " | ".join(_escape_table_cell(cell) for cell in row) + " |")
 
-    records = _render_table_records(header_rows, body, symbol_legends or {})
+    records = _render_table_records(header_rows, body, symbol_legends or {}, heading_context or [])
     if records:
         lines.extend(["", *records])
     return "\n".join(lines)
@@ -200,11 +276,13 @@ def _render_table_records(
     header_rows: list[list[str]],
     body: list[list[str]],
     symbol_legends: dict[str, str],
+    heading_context: list[str],
 ) -> list[str]:
     if not body:
         return []
 
     labels = _table_column_labels(header_rows)
+    context = _format_child_context(heading_context)
     lines = ["**표 행 요약**"]
     symbol_hits: dict[str, list[str]] = defaultdict(list)
     carried_context: dict[int, str] = {}
@@ -224,11 +302,14 @@ def _render_table_records(
 
         row_text = " ".join(values)
         row_label = _table_row_label(labels, values)
-        parts = [
+        parts = []
+        if context:
+            parts.append(f"문맥: {context}")
+        parts.extend(
             f"{label}: {value}"
             for label, value in zip(labels, values)
             if label and value and not _label_repeats_value(label, value)
-        ]
+        )
         for symbol, legend in symbol_legends.items():
             if symbol in row_text:
                 parts.append(f"{symbol}: {legend}")
@@ -248,6 +329,13 @@ def _render_table_records(
         lines.extend(["", "**표 기호 요약**", *legend_lines])
 
     return lines if len(lines) > 1 else []
+
+
+def _format_child_context(heading_context: list[str]) -> str:
+    context = " > ".join(_unique_preserving_order([item for item in heading_context if item]))
+    if len(context) <= CHILD_CONTEXT_CHAR_LIMIT:
+        return context
+    return context[: CHILD_CONTEXT_CHAR_LIMIT - 1].rstrip() + "…"
 
 
 def _table_column_labels(header_rows: list[list[str]]) -> list[str]:
@@ -403,19 +491,32 @@ def _render_page(elements: list[dict[str, Any]]) -> str:
 
     blocks = []
     has_image = False
+    heading_context: list[str] = []
     for element in elements:
         if _element_type(element) in {"image", "picture", "figure"}:
             has_image = True
             continue
-        rendered = _render_element(element, symbol_legends=symbol_legends)
+        rendered = _render_element(element, symbol_legends=symbol_legends, heading_context=heading_context)
         if rendered:
             blocks.append(rendered)
+        if _element_type(element) == "heading":
+            heading_context = _updated_heading_context(heading_context, element)
 
     if not blocks and has_image:
         return "> Image-only page. No embedded text layer was available."
     if has_visual_only_content and len(_content_fingerprint("\n".join(blocks))) < 40:
         blocks.append("> \uc774\ubbf8\uc9c0/\ub3c4\uc2dd \uc911\uc2ec \ud398\uc774\uc9c0\ub85c, PDF \ud14d\uc2a4\ud2b8 \ub808\uc774\uc5b4\uc5d0\uc11c \ud655\uc778\ub418\ub294 \ubb38\uad6c\ub9cc \ud3ec\ud568\ud588\uc2b5\ub2c8\ub2e4.")
     return "\n\n".join(blocks)
+
+
+def _updated_heading_context(context: list[str], element: dict[str, Any]) -> list[str]:
+    content = _clean_text(element.get("content", ""))
+    if not content:
+        return context
+
+    level = max(_heading_level(element), 1)
+    index = min(level - 1, len(context))
+    return [*context[:index], content][-4:]
 
 
 def _is_page_content_element(element: dict[str, Any]) -> bool:

@@ -129,12 +129,26 @@ class MarkdownRendererTest(unittest.TestCase):
 
         self.assertIn("**\ud45c \ud589 \uc694\uc57d**", markdown)
         self.assertIn(
-            "Item: Cloud Sync \u2605; Term: 3; Capacity: 120; "
+            "\ubb38\ub9e5: Service Capacity; Category: Platform; Item: Cloud Sync \u2605; Term: 3; Capacity: 120; "
             "Round 1 Channel Online: 70; Round 1 Channel Partner: 50",
             markdown,
         )
         self.assertIn("\u2605: long-term support", markdown)
         self.assertIn("\u2605 \ud45c\uc2dc(long-term support): Cloud Sync, Portal, Dashboard", markdown)
+
+    def test_adds_parent_overlap_between_pages(self):
+        doc = {
+            "kids": [
+                {"type": "heading", "page number": 1, "content": "Eligibility"},
+                {"type": "paragraph", "page number": 1, "content": "Applicants must complete the form."},
+                {"type": "heading", "page number": 2, "content": "Schedule"},
+                {"type": "paragraph", "page number": 2, "content": "Applications open in March."},
+            ]
+        }
+
+        markdown = render_document_pages_to_markdown(doc)
+
+        self.assertIn("> \uc774\uc804 parent overlap: Eligibility / Applicants must complete the form.", markdown)
 
 
 if __name__ == "__main__":

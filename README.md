@@ -57,11 +57,14 @@ Dify 노드의 read timeout은 기본 설정 기준 `390~420s`로 설정합니�
 | Parent mode | `Paragraph` |
 | Parent delimiter | `(?m)(?=^--- Page \d+ ---$|^#{1,3}\s+)` |
 | Parent maximum length | `3000~4000` |
-| Parent overlap | `200` |
 | Child delimiter | `\n` |
 | Child maximum length | `700` |
-| Child overlap | `100` |
 | Text preprocessing | 연속 공백/개행 정리 켜기, URL/이메일 제거는 문서 성격에 따라 선택 |
+
+Dify Chunker 노드에 parent/child overlap 입력값이 없으므로, 변환 코드가 Markdown에 overlap을 직접 반영합니다.
+
+- Parent overlap: 각 페이지/parent 시작부에 직전 parent의 마지막 핵심 문장 1~2개를 `이전 parent overlap`으로 반복합니다.
+- Child overlap: 표 행 요약 한 줄마다 현재 heading 경로를 `문맥: ...`으로 붙입니다. Dify가 해당 한 줄만 child로 검색해도 상위 제목 맥락이 같이 들어갑니다.
 
 검수 기준:
 
