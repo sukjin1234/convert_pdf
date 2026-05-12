@@ -28,6 +28,8 @@ MARKER_SYMBOL_PATTERN = f"[{re.escape(MARKER_SYMBOLS)}]"
 PARENT_OVERLAP_LINE_LIMIT = 2
 PARENT_OVERLAP_CHAR_LIMIT = 280
 CHILD_CONTEXT_CHAR_LIMIT = 240
+TABLE_ROW_OVERLAP_CHAR_LIMIT = 180
+SEARCH_FACT_CHAR_LIMIT = 650
 
 
 def render_document_to_markdown(doc: dict[str, Any] | None, fallback_markdown: str = "") -> str:
@@ -283,7 +285,8 @@ def _render_table_records(
 
     labels = _table_column_labels(header_rows)
     context = _format_child_context(heading_context)
-    lines = ["**표 행 요약**"]
+    record_entries = []
+    search_facts = []
     symbol_hits: dict[str, list[str]] = defaultdict(list)
     carried_context: dict[int, str] = {}
 
@@ -317,7 +320,13 @@ def _render_table_records(
                 symbol_hits[symbol].extend(symbol_labels or ([row_label] if row_label else []))
 
         if parts:
-            lines.append("- " + "; ".join(parts))
+            record = "; ".join(parts)
+            record_entries.append(record)
+            search_fact = _render_search_fact(context, labels, values, record)
+            if search_fact:
+                search_facts.append(search_fact)
+
+    lines = ["**표 행 요약**", *_render_table_records_with_overlap(record_entries)]
 
     legend_lines = []
     for symbol, labels_for_symbol in symbol_hits.items():
@@ -327,8 +336,33 @@ def _render_table_records(
 
     if legend_lines:
         lines.extend(["", "**표 기호 요약**", *legend_lines])
+        search_facts.extend(_render_symbol_search_facts(symbol_legends, symbol_hits))
+
+    if search_facts:
+        lines.extend(["", "**검색 보강**", *_unique_preserving_order(search_facts)])
 
     return lines if len(lines) > 1 else []
+
+
+def _render_table_records_with_overlap(records: list[str]) -> list[str]:
+    lines = []
+    for index, record in enumerate(records):
+        overlap_parts = []
+        if index > 0:
+            overlap_parts.append(f"이전 행 overlap: {_table_row_overlap_text(records[index - 1])}")
+        if index + 1 < len(records):
+            overlap_parts.append(f"다음 행 overlap: {_table_row_overlap_text(records[index + 1])}")
+
+        suffix = f"; {'; '.join(overlap_parts)}" if overlap_parts else ""
+        lines.append(f"- {record}{suffix}")
+    return lines
+
+
+def _table_row_overlap_text(record: str) -> str:
+    compact = _record_cell_text(record)
+    if len(compact) <= TABLE_ROW_OVERLAP_CHAR_LIMIT:
+        return compact
+    return compact[: TABLE_ROW_OVERLAP_CHAR_LIMIT - 1].rstrip() + "…"
 
 
 def _format_child_context(heading_context: list[str]) -> str:
@@ -336,6 +370,76 @@ def _format_child_context(heading_context: list[str]) -> str:
     if len(context) <= CHILD_CONTEXT_CHAR_LIMIT:
         return context
     return context[: CHILD_CONTEXT_CHAR_LIMIT - 1].rstrip() + "…"
+
+
+def _render_search_fact(context: str, labels: list[str], values: list[str], record: str) -> str:
+    row_label = _table_row_label(labels, values)
+    keywords = _search_keywords(context, labels, values, row_label)
+    if not keywords:
+        return ""
+    fact = f"- 검색 키워드: {', '.join(keywords)} | 답변 근거: {record}"
+    return _truncate_search_fact(fact)
+
+
+def _render_symbol_search_facts(symbol_legends: dict[str, str], symbol_hits: dict[str, list[str]]) -> list[str]:
+    facts = []
+    for symbol, labels_for_symbol in symbol_hits.items():
+        names = _unique_preserving_order(labels_for_symbol)
+        if not names:
+            continue
+        legend = symbol_legends[symbol]
+        keywords = _unique_preserving_order(
+            [
+                legend,
+                _compact_text(legend),
+                "상세 정보",
+                "자세한 내용",
+                "세부 내용",
+                "관련 정보",
+                "목록",
+                "대상",
+                "표시",
+                *names,
+            ]
+        )
+        evidence = f"{symbol} 표시({legend}): {', '.join(names)}"
+        facts.append(_truncate_search_fact(f"- 검색 키워드: {', '.join(keywords)} | 답변 근거: {evidence}"))
+    return facts
+
+
+def _search_keywords(context: str, labels: list[str], values: list[str], row_label: str) -> list[str]:
+    keywords = [
+        context,
+        _compact_text(context),
+        row_label,
+        _compact_text(row_label),
+        "상세 정보",
+        "자세한 내용",
+        "세부 내용",
+        "관련 정보",
+        "표 상세",
+        "표 내용",
+        "값",
+        "항목",
+        "details",
+    ]
+    for label, value in zip(labels, values):
+        if label:
+            keywords.extend([label, _compact_text(label)])
+        if _looks_like_row_label_value(value):
+            cleaned_value = _strip_marker_symbols(value)
+            keywords.extend([cleaned_value, _compact_text(cleaned_value)])
+    return _unique_preserving_order([keyword for keyword in keywords if keyword])
+
+
+def _truncate_search_fact(fact: str) -> str:
+    if len(fact) <= SEARCH_FACT_CHAR_LIMIT:
+        return fact
+    return fact[: SEARCH_FACT_CHAR_LIMIT - 1].rstrip() + "…"
+
+
+def _compact_text(value: str) -> str:
+    return re.sub(r"\s+", "", value or "")
 
 
 def _table_column_labels(header_rows: list[list[str]]) -> list[str]:

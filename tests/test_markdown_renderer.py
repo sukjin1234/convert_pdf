@@ -133,8 +133,15 @@ class MarkdownRendererTest(unittest.TestCase):
             "Round 1 Channel Online: 70; Round 1 Channel Partner: 50",
             markdown,
         )
+        self.assertIn("\ub2e4\uc74c \ud589 overlap: \ubb38\ub9e5: Service Capacity", markdown)
+        self.assertIn("\uc774\uc804 \ud589 overlap: \ubb38\ub9e5: Service Capacity", markdown)
         self.assertIn("\u2605: long-term support", markdown)
         self.assertIn("\u2605 \ud45c\uc2dc(long-term support): Cloud Sync, Portal, Dashboard", markdown)
+        self.assertIn("**\uac80\uc0c9 \ubcf4\uac15**", markdown)
+        self.assertIn("\uac80\uc0c9 \ud0a4\uc6cc\ub4dc: Service Capacity", markdown)
+        self.assertIn("\uc0c1\uc138 \uc815\ubcf4", markdown)
+        self.assertIn("\ub2f5\ubcc0 \uadfc\uac70: \ubb38\ub9e5: Service Capacity", markdown)
+        self.assertIn("long-term support", markdown)
 
     def test_adds_parent_overlap_between_pages(self):
         doc = {
