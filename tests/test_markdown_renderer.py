@@ -94,6 +94,48 @@ class MarkdownRendererTest(unittest.TestCase):
         self.assertIn("- 1958: School opened", markdown)
         self.assertIn("- 2024: Free major added", markdown)
 
+    def test_renders_table_records_with_symbol_legend(self):
+        def row(values):
+            return {
+                "type": "table row",
+                "cells": [
+                    {"column number": index, "kids": [{"type": "paragraph", "content": value}]}
+                    for index, value in enumerate(values, start=1)
+                ],
+            }
+
+        doc = {
+            "kids": [
+                {"type": "heading", "page number": 1, "content": "Service Capacity"},
+                {
+                    "type": "table",
+                    "page number": 1,
+                    "rows": [
+                        row(["Category", "Item", "Term", "Capacity", "Round 1<br>Channel", ""]),
+                        row(["", "", "", "", "Online", "Partner"]),
+                        row(["Platform", "Cloud Sync \u2605", "3", "120", "70", "50"]),
+                        row(["Platform", "Portal \u2605 Dashboard \u2605", "2 2", "80 90", "40 45", "40 45"]),
+                    ],
+                },
+                {
+                    "type": "paragraph",
+                    "page number": 1,
+                    "content": "\u2605 mark: long-term support",
+                },
+            ]
+        }
+
+        markdown = render_document_pages_to_markdown(doc)
+
+        self.assertIn("**\ud45c \ud589 \uc694\uc57d**", markdown)
+        self.assertIn(
+            "Item: Cloud Sync \u2605; Term: 3; Capacity: 120; "
+            "Round 1 Channel Online: 70; Round 1 Channel Partner: 50",
+            markdown,
+        )
+        self.assertIn("\u2605: long-term support", markdown)
+        self.assertIn("\u2605 \ud45c\uc2dc(long-term support): Cloud Sync, Portal, Dashboard", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

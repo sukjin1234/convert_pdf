@@ -1,8 +1,30 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import defaultdict
 from typing import Any
+
+
+MARKER_SYMBOLS = (
+    "\u2663"  # club suit
+    "\u25c6"  # black diamond
+    "\u25c7"  # white diamond
+    "\u25a0"  # black square
+    "\u25a1"  # white square
+    "\u25b2"  # black up-pointing triangle
+    "\u25b3"  # white up-pointing triangle
+    "\u25cf"  # black circle
+    "\u25cb"  # white circle
+    "\u25ce"  # bullseye
+    "\u25c8"  # white diamond containing black small diamond
+    "\u2605"  # black star
+    "\u2606"  # white star
+    "\u25b6"  # black right-pointing triangle
+    "\u25b7"  # white right-pointing triangle
+    "\u25a3"  # white square containing black small square
+)
+MARKER_SYMBOL_PATTERN = f"[{re.escape(MARKER_SYMBOLS)}]"
 
 
 def render_document_to_markdown(doc: dict[str, Any] | None, fallback_markdown: str = "") -> str:
@@ -44,13 +66,13 @@ def render_document_pages_to_markdown(doc: dict[str, Any] | None, fallback_markd
     return _normalize_markdown("\n\n".join(blocks))
 
 
-def _render_element(element: dict[str, Any], list_depth: int = 0) -> str:
+def _render_element(element: dict[str, Any], list_depth: int = 0, symbol_legends: dict[str, str] | None = None) -> str:
     element_type = _element_type(element)
 
     if element_type in {"header", "footer"}:
         return ""
     if element_type in {"document", "page", "text block", "block", "section"}:
-        return _render_children(element)
+        return _render_children(element, symbol_legends)
     if element_type == "heading":
         return _render_heading(element)
     if element_type in {"paragraph", "text"}:
@@ -59,16 +81,16 @@ def _render_element(element: dict[str, Any], list_depth: int = 0) -> str:
         content = _clean_text(element.get("content", ""))
         return f"*{content}*" if content else ""
     if element_type == "list":
-        return _render_list(element, list_depth)
+        return _render_list(element, list_depth, symbol_legends)
     if element_type == "list item":
-        return _render_list_item(element, list_depth)
+        return _render_list_item(element, list_depth, symbol_legends)
     if element_type == "table":
-        return _render_table(element)
+        return _render_table(element, symbol_legends)
     if element_type in {"image", "picture", "figure"}:
         return _render_image(element)
 
     content = _clean_text(element.get("content", ""))
-    child_content = _render_children(element)
+    child_content = _render_children(element, symbol_legends)
     return "\n\n".join(part for part in (content, child_content) if part)
 
 
@@ -80,16 +102,16 @@ def _render_heading(element: dict[str, Any]) -> str:
     return f"{'#' * level} {content}"
 
 
-def _render_children(element: dict[str, Any]) -> str:
+def _render_children(element: dict[str, Any], symbol_legends: dict[str, str] | None = None) -> str:
     blocks = []
     for child in _children(element):
-        rendered = _render_element(child)
+        rendered = _render_element(child, symbol_legends=symbol_legends)
         if rendered:
             blocks.append(rendered)
     return "\n\n".join(blocks)
 
 
-def _render_list(element: dict[str, Any], list_depth: int) -> str:
+def _render_list(element: dict[str, Any], list_depth: int, symbol_legends: dict[str, str] | None = None) -> str:
     items = element.get("list items") or element.get("items") or element.get("kids") or []
     if not isinstance(items, list):
         return ""
@@ -100,7 +122,7 @@ def _render_list(element: dict[str, Any], list_depth: int) -> str:
     for index, item in enumerate(items, start=1):
         if not isinstance(item, dict):
             continue
-        text = _render_list_item(item, list_depth + 1)
+        text = _render_list_item(item, list_depth + 1, symbol_legends)
         if not text:
             continue
         prefix = f"{index}. " if ordered else "- "
@@ -110,17 +132,17 @@ def _render_list(element: dict[str, Any], list_depth: int) -> str:
     return "\n".join(lines)
 
 
-def _render_list_item(element: dict[str, Any], list_depth: int) -> str:
+def _render_list_item(element: dict[str, Any], list_depth: int, symbol_legends: dict[str, str] | None = None) -> str:
     content = _clean_text(element.get("content", ""))
     child_blocks = []
     for child in _children(element):
-        rendered = _render_element(child, list_depth)
+        rendered = _render_element(child, list_depth, symbol_legends)
         if rendered:
             child_blocks.append(rendered)
     return "\n".join(part for part in [content, *child_blocks] if part)
 
 
-def _render_table(element: dict[str, Any]) -> str:
+def _render_table(element: dict[str, Any], symbol_legends: dict[str, str] | None = None) -> str:
     rows = element.get("rows") or []
     if not isinstance(rows, list):
         return ""
@@ -133,10 +155,12 @@ def _render_table(element: dict[str, Any]) -> str:
     width = max(len(row) for row in matrix)
     matrix = [row + [""] * (width - len(row)) for row in matrix]
 
-    header = matrix[0]
-    body = matrix[1:]
+    header_rows = _table_header_rows(matrix)
+    header = header_rows[0]
+    body = matrix[len(header_rows) :]
     if not any(cell.strip() for cell in header):
         header = [f"Column {index}" for index in range(1, width + 1)]
+        header_rows = [header]
         body = matrix
 
     lines = [
@@ -145,7 +169,184 @@ def _render_table(element: dict[str, Any]) -> str:
     ]
     for row in body:
         lines.append("| " + " | ".join(_escape_table_cell(cell) for cell in row) + " |")
+
+    records = _render_table_records(header_rows, body, symbol_legends or {})
+    if records:
+        lines.extend(["", *records])
     return "\n".join(lines)
+
+
+def _table_header_rows(matrix: list[list[str]]) -> list[list[str]]:
+    header_rows = [matrix[0]]
+    if len(matrix) > 2 and _looks_like_header_continuation(matrix[0], matrix[1]):
+        header_rows.append(matrix[1])
+    return header_rows
+
+
+def _looks_like_header_continuation(header: list[str], row: list[str]) -> bool:
+    values = [_record_cell_text(cell) for cell in row if _record_cell_text(cell)]
+    if len(values) < 2:
+        return False
+
+    short_values = [value for value in values if len(value) <= 24]
+    numeric_values = [value for value in values if re.search(r"\d", value)]
+    has_blank_header_cells = any(not cell.strip() for cell in header)
+    has_leading_blanks = sum(1 for cell in row[: min(4, len(row))] if not cell.strip()) >= 2
+    mostly_short_text = len(short_values) / len(values) >= 0.75 and len(numeric_values) / len(values) <= 0.35
+    return mostly_short_text and (has_blank_header_cells or has_leading_blanks)
+
+
+def _render_table_records(
+    header_rows: list[list[str]],
+    body: list[list[str]],
+    symbol_legends: dict[str, str],
+) -> list[str]:
+    if not body:
+        return []
+
+    labels = _table_column_labels(header_rows)
+    lines = ["**표 행 요약**"]
+    symbol_hits: dict[str, list[str]] = defaultdict(list)
+    carried_context: dict[int, str] = {}
+
+    for row in body:
+        values = []
+        for index, cell in enumerate(row):
+            value = _record_cell_text(cell)
+            if value:
+                carried_context[index] = value
+            elif index == 0 and carried_context.get(index):
+                value = carried_context[index]
+            values.append(value)
+
+        if not any(values):
+            continue
+
+        row_text = " ".join(values)
+        row_label = _table_row_label(labels, values)
+        parts = [
+            f"{label}: {value}"
+            for label, value in zip(labels, values)
+            if label and value and not _label_repeats_value(label, value)
+        ]
+        for symbol, legend in symbol_legends.items():
+            if symbol in row_text:
+                parts.append(f"{symbol}: {legend}")
+                symbol_labels = _symbol_row_labels(values, symbol)
+                symbol_hits[symbol].extend(symbol_labels or ([row_label] if row_label else []))
+
+        if parts:
+            lines.append("- " + "; ".join(parts))
+
+    legend_lines = []
+    for symbol, labels_for_symbol in symbol_hits.items():
+        names = _unique_preserving_order(labels_for_symbol)
+        if names:
+            legend_lines.append(f"- {symbol} 표시({symbol_legends[symbol]}): {', '.join(names)}")
+
+    if legend_lines:
+        lines.extend(["", "**표 기호 요약**", *legend_lines])
+
+    return lines if len(lines) > 1 else []
+
+
+def _table_column_labels(header_rows: list[list[str]]) -> list[str]:
+    width = max(len(row) for row in header_rows)
+    normalized_rows = [row + [""] * (width - len(row)) for row in header_rows]
+    top_labels = _propagate_group_headers(normalized_rows[0], normalized_rows[1:])
+
+    labels = []
+    for index in range(width):
+        parts = []
+        for value in [top_labels[index], *[row[index] for row in normalized_rows[1:]]]:
+            value = _record_cell_text(value)
+            if value and value not in parts:
+                parts.append(value)
+        labels.append(" ".join(parts) if parts else f"Column {index + 1}")
+    return labels
+
+
+def _propagate_group_headers(header: list[str], continuation_rows: list[list[str]]) -> list[str]:
+    propagated = []
+    last = ""
+    for index, cell in enumerate(header):
+        value = _record_cell_text(cell)
+        if value:
+            last = value
+            propagated.append(value)
+            continue
+
+        continuation_has_value = any(index < len(row) and _record_cell_text(row[index]) for row in continuation_rows)
+        propagated.append(last if last and continuation_has_value else "")
+    return propagated
+
+
+def _table_row_label(labels: list[str], values: list[str]) -> str:
+    candidates = [_strip_marker_symbols(value) for value in values if _looks_like_row_label_value(value)]
+    if not candidates:
+        return ""
+    return max(candidates, key=_row_label_score)
+
+
+def _symbol_row_labels(values: list[str], symbol: str) -> list[str]:
+    labels_for_symbol = []
+    for value in values:
+        if symbol not in value:
+            continue
+        labels_for_symbol.extend(_split_symbol_marked_labels(value, symbol))
+    return _unique_preserving_order(labels_for_symbol)
+
+
+def _split_symbol_marked_labels(value: str, symbol: str) -> list[str]:
+    labels = []
+    start = 0
+    for match in re.finditer(re.escape(symbol), value):
+        label = _strip_marker_symbols(value[start : match.start()])
+        if label:
+            labels.append(label)
+        start = match.end()
+    return labels
+
+
+def _record_cell_text(value: str) -> str:
+    value = re.sub(r"<br\s*/?>", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _looks_like_row_label_value(value: str) -> bool:
+    value = _strip_marker_symbols(value)
+    if not value:
+        return False
+    if re.fullmatch(r"[\d\s.,%()·/\-+]+", value):
+        return False
+    return bool(re.search(r"[A-Za-z\uac00-\ud7a3]", value))
+
+
+def _row_label_score(value: str) -> tuple[int, int]:
+    fingerprint = _content_fingerprint(value)
+    return (len(fingerprint), len(value))
+
+
+def _label_repeats_value(label: str, value: str) -> bool:
+    return _content_fingerprint(label) == _content_fingerprint(value)
+
+
+def _strip_marker_symbols(value: str) -> str:
+    value = re.sub(rf"\s*{MARKER_SYMBOL_PATTERN}\s*", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _unique_preserving_order(values: list[str]) -> list[str]:
+    seen = set()
+    unique = []
+    for value in values:
+        key = _content_fingerprint(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(value)
+    return unique
 
 
 def _table_row_to_cells(row: dict[str, Any]) -> list[str]:
@@ -190,6 +391,7 @@ def _render_image(element: dict[str, Any]) -> str:
 def _render_page(elements: list[dict[str, Any]]) -> str:
     has_visual_only_content = any(_element_has_image(element) and not _element_has_text(element) for element in elements)
     elements = [element for element in elements if _is_page_content_element(element)]
+    symbol_legends = _extract_symbol_legends(elements)
 
     timeline = _render_timeline_page(elements)
     if timeline:
@@ -205,7 +407,7 @@ def _render_page(elements: list[dict[str, Any]]) -> str:
         if _element_type(element) in {"image", "picture", "figure"}:
             has_image = True
             continue
-        rendered = _render_element(element)
+        rendered = _render_element(element, symbol_legends=symbol_legends)
         if rendered:
             blocks.append(rendered)
 
@@ -231,13 +433,47 @@ def _looks_like_running_page_label(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text).strip()
     if not normalized:
         return False
-    college_name = "\uc778\ud558\uacf5\uc5c5\uc804\ubb38\ub300\ud559"
-    admission_guide = "\ubaa8\uc9d1\uc694\uac15"
-    if re.fullmatch(rf"\d+\s+{re.escape(college_name)}(?:\s+\d{{4}}\S*\s+{re.escape(admission_guide)}\s+\d+)?", normalized):
-        return True
-    if re.fullmatch(rf"\d{{4}}\S*\s+{re.escape(admission_guide)}\s+\d+", normalized):
+    if (
+        len(normalized) <= 60
+        and re.search(r"(?:19|20)\d{2}", normalized)
+        and re.search(r"\s\d{1,4}$", normalized)
+        and not re.search(r"[.!?;:]", normalized)
+    ):
         return True
     return False
+
+
+def _extract_symbol_legends(elements: list[dict[str, Any]]) -> dict[str, str]:
+    text = "\n".join(_element_text_lines(element) for element in elements)
+    legends = {}
+    marker_words = r"(?:표시|기호|mark|marker|symbol|legend)?"
+    for match in re.finditer(rf"({MARKER_SYMBOL_PATTERN})\s*{marker_words}\s*[:：\-\u2013]\s*([^\n]+)", text, re.IGNORECASE):
+        symbol = match.group(1)
+        legend = _clean_text(match.group(2))
+        if legend:
+            legends[symbol] = legend
+    return legends
+
+
+def _element_text_lines(element: dict[str, Any]) -> str:
+    parts = []
+    content = _clean_text(element.get("content", ""))
+    if content:
+        parts.append(content)
+
+    for child in _children(element):
+        text = _element_text_lines(child)
+        if text:
+            parts.append(text)
+
+    if _element_type(element) == "list":
+        for child in element.get("list items") or element.get("items") or []:
+            if isinstance(child, dict):
+                text = _element_text_lines(child)
+                if text:
+                    parts.append(text)
+
+    return "\n".join(parts)
 
 
 def _render_metric_grid_page(elements: list[dict[str, Any]]) -> str:
@@ -521,7 +757,7 @@ def _safe_float(value: Any, default: float) -> float:
 def _clean_text(value: Any) -> str:
     if value is None:
         return ""
-    text = str(value)
+    text = unicodedata.normalize("NFC", str(value))
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
@@ -539,6 +775,7 @@ def _escape_table_cell(value: str) -> str:
 
 
 def _normalize_markdown(value: str) -> str:
+    value = unicodedata.normalize("NFC", value)
     value = value.replace("\r\n", "\n").replace("\r", "\n")
     lines = [line.rstrip() for line in value.split("\n")]
     value = "\n".join(lines)
