@@ -22,7 +22,7 @@ class ConvertResponse(BaseModel):
 
 
 @app.post("/convert", response_model=ConvertResponse)
-async def convert(pdf: UploadFile | None = File(None), use_ocr: Annotated[bool, Form()] = False) -> ConvertResponse:
+async def convert(pdf: UploadFile | None = File(None), use_ocr: Annotated[bool, Form()] = True) -> ConvertResponse:
     try:
         if pdf is None:
             raise ValueError("PDF file parameter is required.")
