@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -30,6 +31,44 @@ def _env_csv(name: str) -> tuple[str, ...]:
 
 def _env_int_csv(name: str) -> tuple[int, ...]:
     return tuple(int(value) for value in _env_csv(name))
+
+
+def _default_ocr_server_devices() -> tuple[str, ...]:
+    explicit = _env_csv("ODL_OCR_SERVER_DEVICES")
+    if explicit:
+        return explicit
+    if not _env_bool("ODL_OCR_AUTO_DETECT_CUDA", True):
+        return ()
+
+    max_devices = _env_int("ODL_OCR_AUTO_DETECT_MAX_GPUS", 3)
+    if max_devices <= 0:
+        return ()
+    return _detect_cuda_device_ids(max_devices)
+
+
+def _detect_cuda_device_ids(max_devices: int) -> tuple[str, ...]:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if result.returncode != 0:
+        return ()
+
+    devices = []
+    for line in result.stdout.splitlines():
+        value = line.strip()
+        if value:
+            devices.append(value)
+        if len(devices) >= max_devices:
+            break
+    return tuple(devices)
 
 
 def _default_opendataloader_cli() -> str:
@@ -115,7 +154,7 @@ class Settings:
     ocr_server_host: str = os.getenv("ODL_OCR_SERVER_HOST", "127.0.0.1")
     ocr_server_port: int = _env_int("ODL_OCR_SERVER_PORT", 5003)
     ocr_server_ports: tuple[int, ...] = _env_int_csv("ODL_OCR_SERVER_PORTS")
-    ocr_server_devices: tuple[str, ...] = _env_csv("ODL_OCR_SERVER_DEVICES")
+    ocr_server_devices: tuple[str, ...] = _default_ocr_server_devices()
     ocr_server_workers: int = _env_int("ODL_OCR_SERVER_WORKERS", 0)
     ocr_hybrid_urls: tuple[str, ...] = _env_csv("ODL_OCR_HYBRID_URLS")
     ocr_hybrid_url: str = _default_ocr_hybrid_url()

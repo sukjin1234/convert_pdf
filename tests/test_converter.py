@@ -137,7 +137,7 @@ class ConverterTest(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 2)
 
     def test_managed_ocr_server_reports_startup_stderr(self):
-        settings = Settings(ocr_server_cli="hybrid-server")
+        settings = Settings(ocr_server_cli="hybrid-server", ocr_server_workers=1, ocr_server_devices=())
 
         with (
             patch("app.converter.urlopen", side_effect=OSError("not ready")),
@@ -148,7 +148,7 @@ class ConverterTest(unittest.TestCase):
                     pass
 
     def test_managed_ocr_server_reuses_existing_ready_server(self):
-        settings = Settings(ocr_server_cli="hybrid-server")
+        settings = Settings(ocr_server_cli="hybrid-server", ocr_server_workers=1, ocr_server_devices=())
 
         with (
             patch("app.converter.urlopen", return_value=_ReadyResponse()),
@@ -160,7 +160,7 @@ class ConverterTest(unittest.TestCase):
         popen.assert_not_called()
 
     def test_managed_ocr_server_shares_in_process_server(self):
-        settings = Settings(ocr_server_cli="hybrid-server")
+        settings = Settings(ocr_server_cli="hybrid-server", ocr_server_workers=1, ocr_server_devices=())
         probes = [OSError("not ready"), OSError("not ready"), _ReadyResponse(), _ReadyResponse()]
 
         def fake_urlopen(_url, timeout):
