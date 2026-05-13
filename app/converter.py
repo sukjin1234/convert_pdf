@@ -10,6 +10,7 @@ import subprocess
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 from urllib.error import HTTPError, URLError
@@ -379,7 +380,7 @@ def _wait_for_http_server(url: str, process: subprocess.Popen, timeout_seconds: 
                 if exc.code < 500:
                     return
                 last_error = exc
-            except (OSError, URLError) as exc:
+            except (OSError, URLError, HTTPException) as exc:
                 last_error = exc
 
         time.sleep(0.25)

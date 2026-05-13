@@ -1,6 +1,7 @@
 import json
 import unittest
 from contextlib import contextmanager
+from http.client import BadStatusLine
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -12,6 +13,7 @@ from app.converter import (
     _convert_pdf_file,
     _read_generated_markdown,
     _read_rendered_markdown,
+    _wait_for_http_server,
     build_ocr_server_command,
     build_opendataloader_native_command,
     build_opendataloader_command,
@@ -25,6 +27,21 @@ def _test_workspace():
     path = root / uuid4().hex
     path.mkdir(parents=True, exist_ok=False)
     yield str(path)
+
+
+class _RunningProcess:
+    def poll(self):
+        return None
+
+
+class _ReadyResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
 
 
 class ConverterTest(unittest.TestCase):
@@ -61,6 +78,20 @@ class ConverterTest(unittest.TestCase):
         self.assertIn("--force-ocr", command)
         self.assertIn("--ocr-lang", command)
         self.assertEqual(command[command.index("--ocr-lang") + 1], "ko,en")
+
+    def test_wait_for_http_server_treats_bad_status_line_as_transient(self):
+        calls = []
+
+        def fake_urlopen(url, timeout):
+            calls.append((url, timeout))
+            if len(calls) == 1:
+                raise BadStatusLine("handshake failed, invalid handshake message")
+            return _ReadyResponse()
+
+        with patch("app.converter.urlopen", side_effect=fake_urlopen):
+            _wait_for_http_server("http://127.0.0.1:5003", _RunningProcess(), 1)
+
+        self.assertGreaterEqual(len(calls), 2)
 
     def test_native_command_preserves_page_separators_without_hybrid(self):
         settings = Settings(opendataloader_jar="odl.jar")
