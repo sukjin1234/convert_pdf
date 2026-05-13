@@ -40,7 +40,7 @@ class PdfConverter:
     def __init__(self, settings: Settings | None = None):
         object.__setattr__(self, "settings", settings or get_settings())
 
-    def convert_pdf_bytes(self, pdf_bytes: bytes, filename: str = "document.pdf", *, use_ocr: bool = False) -> str:
+    def convert_pdf_bytes(self, pdf_bytes: bytes, filename: str = "document.pdf", *, use_ocr: bool = True) -> str:
         self._validate_pdf_bytes(pdf_bytes)
         safe_name = sanitize_filename(filename)
         if not safe_name.lower().endswith(".pdf"):
