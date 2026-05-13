@@ -11,6 +11,7 @@ from app.converter import (
     ConversionError,
     PdfConverter,
     _convert_pdf_file,
+    _managed_ocr_server,
     _read_generated_markdown,
     _read_rendered_markdown,
     _wait_for_http_server,
@@ -42,6 +43,17 @@ class _ReadyResponse:
 
     def __exit__(self, exc_type, exc, traceback):
         return False
+
+
+class _ExitedOcrServerProcess:
+    pid = 12345
+    returncode = 2
+
+    def __init__(self, _command, **kwargs):
+        kwargs["stderr"].write("address already in use\n")
+
+    def poll(self):
+        return self.returncode
 
 
 class ConverterTest(unittest.TestCase):
@@ -92,6 +104,14 @@ class ConverterTest(unittest.TestCase):
             _wait_for_http_server("http://127.0.0.1:5003", _RunningProcess(), 1)
 
         self.assertGreaterEqual(len(calls), 2)
+
+    def test_managed_ocr_server_reports_startup_stderr(self):
+        settings = Settings(ocr_server_cli="hybrid-server")
+
+        with patch("app.converter.subprocess.Popen", _ExitedOcrServerProcess):
+            with self.assertRaisesRegex(ConversionError, "address already in use"):
+                with _managed_ocr_server(settings):
+                    pass
 
     def test_native_command_preserves_page_separators_without_hybrid(self):
         settings = Settings(opendataloader_jar="odl.jar")
