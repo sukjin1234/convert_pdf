@@ -76,6 +76,14 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await _resolve_use_ocr(None, _Request(form_values={"useOcr": '"false"'})))
         self.assertTrue(await _resolve_use_ocr(None, _Request(query_params={"ocr": "yes"})))
 
+    async def test_resolve_use_ocr_ignores_unresolved_dify_placeholder(self):
+        self.assertFalse(
+            await _resolve_use_ocr(
+                "{{#rag.1774890178410.use_ocr#}}",
+                _Request(query_params={"use_ocr": "false"}),
+            )
+        )
+
     async def test_convert_joins_duplicate_inflight_conversion(self):
         content = b"%PDF-1.4\n%%EOF"
         first_pdf = UploadFile(file=BytesIO(content), filename="scan.pdf")

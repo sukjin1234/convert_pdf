@@ -101,7 +101,11 @@ async def _resolve_use_ocr(form_value: Any, request: Request, default: bool = Tr
         candidates.append((f"header:{key}", request.headers.get(key)))
 
     for source, candidate in candidates:
-        parsed = _parse_bool(candidate)
+        try:
+            parsed = _parse_bool(candidate)
+        except ValueError as exc:
+            logger.warning("Ignoring invalid use_ocr value. source=%s raw=%r error=%s", source, candidate, exc)
+            continue
         if parsed is not None:
             logger.info("Resolved use_ocr=%s source=%s raw=%r", parsed, source, candidate)
             return parsed
@@ -137,4 +141,6 @@ def _parse_bool(value: Any) -> bool | None:
         return True
     if text in {"0", "false", "f", "no", "n", "off"}:
         return False
+    if text.startswith("{{") and text.endswith("}}"):
+        raise ValueError("unresolved template placeholder")
     raise ValueError(f"Invalid boolean value for use_ocr: {value!r}")
