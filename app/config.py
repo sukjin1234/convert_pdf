@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -21,6 +22,55 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _env_csv(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return ()
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _env_int_csv(name: str) -> tuple[int, ...]:
+    return tuple(int(value) for value in _env_csv(name))
+
+
+def _default_ocr_server_devices() -> tuple[str, ...]:
+    explicit = _env_csv("ODL_OCR_SERVER_DEVICES")
+    if explicit:
+        return explicit
+    if not _env_bool("ODL_OCR_AUTO_DETECT_CUDA", True):
+        return ()
+
+    max_devices = _env_int("ODL_OCR_AUTO_DETECT_MAX_GPUS", 3)
+    if max_devices <= 0:
+        return ()
+    return _detect_cuda_device_ids(max_devices)
+
+
+def _detect_cuda_device_ids(max_devices: int) -> tuple[str, ...]:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if result.returncode != 0:
+        return ()
+
+    devices = []
+    for line in result.stdout.splitlines():
+        value = line.strip()
+        if value:
+            devices.append(value)
+        if len(devices) >= max_devices:
+            break
+    return tuple(devices)
+
+
 def _default_opendataloader_cli() -> str:
     explicit = os.getenv("ODL_CLI")
     if explicit:
@@ -36,6 +86,32 @@ def _default_opendataloader_cli() -> str:
         if candidate.exists():
             return str(candidate)
     return "opendataloader-pdf"
+
+
+def _default_ocr_server_cli() -> str:
+    explicit = os.getenv("ODL_OCR_SERVER_CLI")
+    if explicit:
+        return explicit
+
+    executable_dir = Path(sys.executable).resolve().parent
+    candidates = []
+    if os.name == "nt":
+        candidates.append(executable_dir / "Scripts" / "opendataloader-pdf-hybrid.exe")
+    candidates.append(executable_dir / "opendataloader-pdf-hybrid")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return "opendataloader-pdf-hybrid"
+
+
+def _default_ocr_hybrid_url() -> str:
+    explicit = os.getenv("ODL_OCR_HYBRID_URL")
+    if explicit:
+        return explicit
+    host = os.getenv("ODL_OCR_SERVER_HOST", "127.0.0.1")
+    port = _env_int("ODL_OCR_SERVER_PORT", 5003)
+    return f"http://{host}:{port}"
 
 
 def _default_opendataloader_jar() -> str | None:
@@ -74,6 +150,19 @@ class Settings:
     rasterize_pdf_on_failure: bool = _env_bool("ODL_RASTERIZE_PDF_ON_FAILURE", True)
     rasterize_dpi: int = _env_int("ODL_RASTERIZE_DPI", 180)
     native_text_layer_first: bool = _env_bool("ODL_NATIVE_TEXT_LAYER_FIRST", True)
+    ocr_server_cli: str = _default_ocr_server_cli()
+    ocr_server_host: str = os.getenv("ODL_OCR_SERVER_HOST", "127.0.0.1")
+    ocr_server_port: int = _env_int("ODL_OCR_SERVER_PORT", 5003)
+    ocr_server_ports: tuple[int, ...] = _env_int_csv("ODL_OCR_SERVER_PORTS")
+    ocr_server_devices: tuple[str, ...] = _default_ocr_server_devices()
+    ocr_server_workers: int = _env_int("ODL_OCR_SERVER_WORKERS", 0)
+    ocr_hybrid_urls: tuple[str, ...] = _env_csv("ODL_OCR_HYBRID_URLS")
+    ocr_hybrid_url: str = _default_ocr_hybrid_url()
+    ocr_lang: str = os.getenv("ODL_OCR_LANG", "ko,en")
+    ocr_enrich_picture_description: bool = _env_bool("ODL_OCR_ENRICH_PICTURE_DESCRIPTION", True)
+    ocr_filter_decorative_images: bool = _env_bool("ODL_OCR_FILTER_DECORATIVE_IMAGES", True)
+    ocr_server_start_timeout_seconds: int = _env_int("ODL_OCR_SERVER_START_TIMEOUT_SECONDS", 60)
+    ocr_server_shutdown_timeout_seconds: int = _env_int("ODL_OCR_SERVER_SHUTDOWN_TIMEOUT_SECONDS", 10)
 
     def validate(self) -> None:
         if self.hybrid_backend.lower() == "off":
@@ -88,6 +177,16 @@ class Settings:
             raise ValueError("ODL_MAX_PDF_BYTES must be positive.")
         if self.rasterize_dpi <= 0:
             raise ValueError("ODL_RASTERIZE_DPI must be positive.")
+        if self.ocr_server_port <= 0:
+            raise ValueError("ODL_OCR_SERVER_PORT must be positive.")
+        if any(port <= 0 for port in self.ocr_server_ports):
+            raise ValueError("ODL_OCR_SERVER_PORTS values must be positive.")
+        if self.ocr_server_workers < 0:
+            raise ValueError("ODL_OCR_SERVER_WORKERS must not be negative.")
+        if self.ocr_server_start_timeout_seconds <= 0:
+            raise ValueError("ODL_OCR_SERVER_START_TIMEOUT_SECONDS must be positive.")
+        if self.ocr_server_shutdown_timeout_seconds <= 0:
+            raise ValueError("ODL_OCR_SERVER_SHUTDOWN_TIMEOUT_SECONDS must be positive.")
 
 
 def get_settings() -> Settings:

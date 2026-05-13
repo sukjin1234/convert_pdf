@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.tmp-tests/
 .venv/
 uvicorn.log
 uvicorn.err
