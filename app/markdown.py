@@ -181,7 +181,7 @@ def _render_table_cell(cell: dict[str, Any]) -> str:
 
 
 def _render_image(element: dict[str, Any]) -> str:
-    ocr_markdown = _normalize_markdown(str(element.get("_ocr_markdown") or ""))
+    ocr_markdown = _normalize_ocr_markdown(str(element.get("_ocr_markdown") or ""))
     description = _clean_text(element.get("description", "") or element.get("content", ""))
     parts = []
     if description:
@@ -207,7 +207,7 @@ def _render_page(elements: list[dict[str, Any]]) -> str:
 
     blocks = []
     has_image = False
-    for element in elements:
+    for element in _order_page_elements(elements):
         if _element_type(element) in {"image", "picture", "figure"}:
             has_image = True
         rendered = _render_element(element)
@@ -219,6 +219,28 @@ def _render_page(elements: list[dict[str, Any]]) -> str:
     if has_visual_only_content and not has_ocr_content and len(_content_fingerprint("\n".join(blocks))) < 40:
         blocks.append("> \uc774\ubbf8\uc9c0/\ub3c4\uc2dd \uc911\uc2ec \ud398\uc774\uc9c0\ub85c, PDF \ud14d\uc2a4\ud2b8 \ub808\uc774\uc5b4\uc5d0\uc11c \ud655\uc778\ub418\ub294 \ubb38\uad6c\ub9cc \ud3ec\ud568\ud588\uc2b5\ub2c8\ub2e4.")
     return "\n\n".join(blocks)
+
+
+def _order_page_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    first_text_index = next(
+        (index for index, element in enumerate(elements) if _element_has_text(element) and _element_type(element) not in {"image", "picture", "figure"}),
+        None,
+    )
+    if first_text_index is None:
+        return elements
+
+    leading = elements[:first_text_index]
+    leading_visual = [element for element in leading if _element_type(element) in {"image", "picture", "figure"}]
+    if not leading_visual:
+        return elements
+
+    leading_non_visual = [element for element in leading if _element_type(element) not in {"image", "picture", "figure"}]
+    return [
+        *leading_non_visual,
+        elements[first_text_index],
+        *leading_visual,
+        *elements[first_text_index + 1 :],
+    ]
 
 
 def _is_page_content_element(element: dict[str, Any]) -> bool:
@@ -562,3 +584,67 @@ def _normalize_markdown(value: str) -> str:
     value = "\n".join(lines)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
+
+
+def _normalize_ocr_markdown(value: str) -> str:
+    value = _normalize_markdown(value)
+    if not value:
+        return ""
+
+    lines = []
+    in_fence = False
+    for raw_line in value.split("\n"):
+        line = raw_line.strip()
+        if line.startswith("```"):
+            in_fence = not in_fence
+            lines.append(raw_line.rstrip())
+            continue
+        if in_fence:
+            lines.append(raw_line.rstrip())
+            continue
+        if _looks_like_markdown_table_line(line):
+            lines.append(_normalize_table_line(line))
+        elif _looks_like_markdown_heading(line):
+            lines.append(_normalize_heading_line(line))
+        elif _looks_like_markdown_list_item(line):
+            lines.append(_normalize_list_item(line))
+        else:
+            lines.append(_clean_text(line))
+
+    return _normalize_markdown("\n".join(line for line in lines if line))
+
+
+def _looks_like_markdown_heading(line: str) -> bool:
+    return bool(re.match(r"^#{1,6}\s*\S", line))
+
+
+def _normalize_heading_line(line: str) -> str:
+    match = re.match(r"^(#{1,6})\s*(.+)$", line)
+    if not match:
+        return _clean_text(line)
+    return f"{match.group(1)} {_clean_text(match.group(2))}"
+
+
+def _looks_like_markdown_list_item(line: str) -> bool:
+    return bool(re.match(r"^(?:[-*+]\s+|\d+[.)]\s+)\S", line))
+
+
+def _normalize_list_item(line: str) -> str:
+    match = re.match(r"^([-*+])\s+(.+)$", line)
+    if match:
+        return f"- {_clean_text(match.group(2))}"
+    match = re.match(r"^(\d+)[.)]\s+(.+)$", line)
+    if match:
+        return f"{match.group(1)}. {_clean_text(match.group(2))}"
+    return _clean_text(line)
+
+
+def _looks_like_markdown_table_line(line: str) -> bool:
+    return line.startswith("|") and line.endswith("|") and line.count("|") >= 2
+
+
+def _normalize_table_line(line: str) -> str:
+    cells = [cell.strip() for cell in line.strip("|").split("|")]
+    if cells and all(re.fullmatch(r":?-{2,}:?", cell.replace(" ", "")) for cell in cells):
+        return "| " + " | ".join("---" for _ in cells) + " |"
+    return "| " + " | ".join(_escape_table_cell(_clean_text(cell)) for cell in cells) + " |"
