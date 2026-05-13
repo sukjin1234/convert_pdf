@@ -160,6 +160,7 @@ class Settings:
     ocr_hybrid_url: str = _default_ocr_hybrid_url()
     ocr_lang: str = os.getenv("ODL_OCR_LANG", "ko,en")
     ocr_enrich_picture_description: bool = _env_bool("ODL_OCR_ENRICH_PICTURE_DESCRIPTION", True)
+    ocr_filter_decorative_images: bool = _env_bool("ODL_OCR_FILTER_DECORATIVE_IMAGES", True)
     ocr_server_start_timeout_seconds: int = _env_int("ODL_OCR_SERVER_START_TIMEOUT_SECONDS", 60)
     ocr_server_shutdown_timeout_seconds: int = _env_int("ODL_OCR_SERVER_SHUTDOWN_TIMEOUT_SECONDS", 10)
 

@@ -706,7 +706,7 @@ def _read_generated_markdown_with_ocr(input_path: Path, output_dir: Path, settin
 
 
 def _apply_ocr_to_document_images(input_path: Path, doc: dict[str, Any], output_dir: Path, settings: Settings) -> int:
-    targets = _collect_ocr_targets(doc)
+    targets = _collect_ocr_targets(doc, settings)
     logger.info("Collected OCR targets. count=%s", len(targets))
     if not targets:
         return 0
@@ -771,19 +771,51 @@ def _convert_ocr_targets_parallel(
     return results
 
 
-def _collect_ocr_targets(doc: dict[str, Any]) -> list[OcrTarget]:
+def _collect_ocr_targets(doc: dict[str, Any], settings: Settings) -> list[OcrTarget]:
     targets: list[OcrTarget] = []
+    skipped = 0
 
     def visit(element: dict[str, Any], current_page: int) -> None:
+        nonlocal skipped
         page_number = _safe_int_value(element.get("page number"), current_page)
         if _document_element_type(element) in {"image", "picture", "figure"} and page_number > 0:
-            targets.append(OcrTarget(element=element, page_number=page_number, bbox=_extract_bbox(element)))
+            bbox = _extract_bbox(element)
+            if settings.ocr_filter_decorative_images and _is_decorative_ocr_image(element, bbox):
+                skipped += 1
+            else:
+                targets.append(OcrTarget(element=element, page_number=page_number, bbox=bbox))
 
         for child in _document_children(element):
             visit(child, page_number)
 
     visit(doc, 0)
+    if skipped:
+        logger.info("Skipped decorative OCR targets. count=%s", skipped)
     return targets
+
+
+def _is_decorative_ocr_image(element: dict[str, Any], bbox: tuple[float, float, float, float] | None) -> bool:
+    hint = " ".join(
+        str(element.get(key) or "")
+        for key in ("description", "content", "source", "path", "name", "alt")
+    ).lower()
+    if any(token in hint for token in ("logo", "icon", "seal", "emblem", "watermark", "decorative")):
+        return True
+
+    if bbox is None:
+        return False
+
+    x0, y0, x1, y1 = bbox
+    width = abs(x1 - x0)
+    height = abs(y1 - y0)
+    area = width * height
+    if width < 60 and height < 60:
+        return True
+    if area < 3_600:
+        return True
+    if area < 8_000 and (y0 < 80 or y1 < 80 or y0 > 720 or y1 > 720):
+        return True
+    return False
 
 
 def _extract_pdf_region_to_pdf(input_path: Path, output_path: Path, target: OcrTarget) -> None:

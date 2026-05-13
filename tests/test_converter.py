@@ -14,6 +14,7 @@ from app.converter import (
     _convert_pdf_file,
     _managed_ocr_server,
     _managed_ocr_servers,
+    _collect_ocr_targets,
     _ocr_server_specs,
     _read_generated_markdown,
     _read_rendered_markdown,
@@ -353,6 +354,35 @@ class ConverterTest(unittest.TestCase):
 
         self.assertEqual(markdown, "Only text")
         server.assert_not_called()
+
+    def test_collect_ocr_targets_skips_decorative_images(self):
+        doc = {
+            "kids": [
+                {
+                    "type": "picture",
+                    "page number": 1,
+                    "description": "University logo",
+                    "bounding box": [10, 10, 80, 60],
+                },
+                {
+                    "type": "picture",
+                    "page number": 1,
+                    "description": "Admission chart",
+                    "bounding box": [100, 200, 500, 520],
+                },
+                {
+                    "type": "picture",
+                    "page number": 1,
+                    "description": "Small icon",
+                    "bounding box": [300, 300, 330, 330],
+                },
+            ]
+        }
+
+        targets = _collect_ocr_targets(doc, Settings())
+
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].element["description"], "Admission chart")
 
     def test_rejects_page_separator_only_markdown(self):
         with _test_workspace() as tmp:
