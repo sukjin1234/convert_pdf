@@ -25,7 +25,7 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response.success)
         self.assertEqual(response.markdown, "# Converted")
-        converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "policy.pdf", use_ocr=False)
+        converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "policy.pdf", use_ocr=True)
 
     async def test_convert_passes_use_ocr_flag(self):
         content = b"%PDF-1.4\n%%EOF"

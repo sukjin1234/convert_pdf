@@ -351,12 +351,14 @@ def _managed_ocr_server(settings: Settings) -> Iterator[None]:
     else:
         kwargs["start_new_session"] = True
 
+    logger.info("Starting OCR server. url=%s command=%s", settings.ocr_hybrid_url, command)
     process = subprocess.Popen(command, **kwargs)
     try:
         _wait_for_http_server(settings.ocr_hybrid_url, process, settings.ocr_server_start_timeout_seconds)
         yield
     finally:
         _terminate_process_tree(process, settings.ocr_server_shutdown_timeout_seconds)
+        logger.info("Stopped OCR server. url=%s", settings.ocr_hybrid_url)
 
 
 def _wait_for_http_server(url: str, process: subprocess.Popen, timeout_seconds: int) -> None:
@@ -517,6 +519,7 @@ def _read_generated_markdown_with_ocr(input_path: Path, output_dir: Path, settin
 
 def _apply_ocr_to_document_images(input_path: Path, doc: dict[str, Any], output_dir: Path, settings: Settings) -> int:
     targets = _collect_ocr_targets(doc)
+    logger.info("Collected OCR targets. count=%s", len(targets))
     if not targets:
         return 0
 
