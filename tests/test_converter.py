@@ -56,6 +56,17 @@ class _ExitedOcrServerProcess:
         return self.returncode
 
 
+class _RunningOcrServerProcess:
+    pid = 12345
+    returncode = None
+
+    def __init__(self, _command, **_kwargs):
+        pass
+
+    def poll(self):
+        return None
+
+
 class ConverterTest(unittest.TestCase):
     def test_command_forces_hybrid_with_no_fallback(self):
         settings = Settings()
@@ -108,10 +119,48 @@ class ConverterTest(unittest.TestCase):
     def test_managed_ocr_server_reports_startup_stderr(self):
         settings = Settings(ocr_server_cli="hybrid-server")
 
-        with patch("app.converter.subprocess.Popen", _ExitedOcrServerProcess):
+        with (
+            patch("app.converter.urlopen", side_effect=OSError("not ready")),
+            patch("app.converter.subprocess.Popen", _ExitedOcrServerProcess),
+        ):
             with self.assertRaisesRegex(ConversionError, "address already in use"):
                 with _managed_ocr_server(settings):
                     pass
+
+    def test_managed_ocr_server_reuses_existing_ready_server(self):
+        settings = Settings(ocr_server_cli="hybrid-server")
+
+        with (
+            patch("app.converter.urlopen", return_value=_ReadyResponse()),
+            patch("app.converter.subprocess.Popen") as popen,
+        ):
+            with _managed_ocr_server(settings):
+                pass
+
+        popen.assert_not_called()
+
+    def test_managed_ocr_server_shares_in_process_server(self):
+        settings = Settings(ocr_server_cli="hybrid-server")
+        probes = [OSError("not ready"), OSError("not ready"), _ReadyResponse(), _ReadyResponse()]
+
+        def fake_urlopen(_url, timeout):
+            result = probes.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with (
+            patch("app.converter.urlopen", side_effect=fake_urlopen),
+            patch("app.converter.subprocess.Popen", side_effect=_RunningOcrServerProcess) as popen,
+            patch("app.converter._terminate_process_tree") as terminate,
+        ):
+            with _managed_ocr_server(settings):
+                with _managed_ocr_server(settings):
+                    pass
+                terminate.assert_not_called()
+
+        self.assertEqual(popen.call_count, 1)
+        terminate.assert_called_once()
 
     def test_native_command_preserves_page_separators_without_hybrid(self):
         settings = Settings(opendataloader_jar="odl.jar")

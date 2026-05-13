@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,6 +23,13 @@ from .config import Settings, get_settings
 from .markdown import render_document_pages_to_markdown, render_document_to_markdown
 
 logger = logging.getLogger(__name__)
+
+_ocr_server_lock = threading.RLock()
+_ocr_server_process: subprocess.Popen | None = None
+_ocr_server_stdout_file: Any | None = None
+_ocr_server_stderr_file: Any | None = None
+_ocr_server_users = 0
+_ocr_server_url: str | None = None
 
 
 class ConversionError(RuntimeError):
@@ -343,47 +351,106 @@ def _run_command(command: Sequence[str], timeout_seconds: int) -> None:
 @contextmanager
 def _managed_ocr_server(settings: Settings) -> Iterator[None]:
     command = build_ocr_server_command(settings)
-    stdout_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
-    stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
-    ready = False
-    process = None
+    managed = False
     try:
-        kwargs = {
-            "stdout": stdout_file,
-            "stderr": stderr_file,
-            "text": True,
-        }
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            kwargs["start_new_session"] = True
-
-        logger.info("Starting OCR server. url=%s command=%s", settings.ocr_hybrid_url, command)
-        process = subprocess.Popen(command, **kwargs)
-        _wait_for_http_server(settings.ocr_hybrid_url, process, settings.ocr_server_start_timeout_seconds)
-        ready = True
+        managed = _acquire_ocr_server(settings, command)
         yield
-    except ConversionError as exc:
-        if process is not None and process.poll() is not None:
-            stdout = _read_temp_output(stdout_file)
-            stderr = _read_temp_output(stderr_file)
-            logger.warning(
-                "OCR server exited before readiness. returncode=%s stdout=%s stderr=%s",
-                process.returncode,
-                _tail_output(stdout),
-                _tail_output(stderr),
-            )
-            raise ConversionError(f"{exc}{_process_output_detail(stdout, stderr)}") from exc
-        raise
     finally:
+        if managed:
+            _release_ocr_server(settings)
+
+
+def _acquire_ocr_server(settings: Settings, command: list[str]) -> bool:
+    global _ocr_server_process, _ocr_server_stdout_file, _ocr_server_stderr_file, _ocr_server_users, _ocr_server_url
+
+    with _ocr_server_lock:
+        if (
+            _ocr_server_process is not None
+            and _ocr_server_process.poll() is None
+            and _ocr_server_url == settings.ocr_hybrid_url
+        ):
+            _wait_for_http_server(
+                settings.ocr_hybrid_url,
+                _ocr_server_process,
+                settings.ocr_server_start_timeout_seconds,
+            )
+            _ocr_server_users += 1
+            logger.info("Using managed OCR server. url=%s users=%s", settings.ocr_hybrid_url, _ocr_server_users)
+            return True
+
+        if _http_server_ready(settings.ocr_hybrid_url):
+            logger.info("Using existing OCR server. url=%s", settings.ocr_hybrid_url)
+            return False
+
+        stdout_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+        stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+        process = None
+        try:
+            kwargs = {
+                "stdout": stdout_file,
+                "stderr": stderr_file,
+                "text": True,
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+
+            logger.info("Starting OCR server. url=%s command=%s", settings.ocr_hybrid_url, command)
+            process = subprocess.Popen(command, **kwargs)
+            _wait_for_http_server(settings.ocr_hybrid_url, process, settings.ocr_server_start_timeout_seconds)
+            _ocr_server_process = process
+            _ocr_server_stdout_file = stdout_file
+            _ocr_server_stderr_file = stderr_file
+            _ocr_server_users = 1
+            _ocr_server_url = settings.ocr_hybrid_url
+            return True
+        except ConversionError as exc:
+            if process is not None and process.poll() is not None:
+                stdout = _read_temp_output(stdout_file)
+                stderr = _read_temp_output(stderr_file)
+                logger.warning(
+                    "OCR server exited before readiness. returncode=%s stdout=%s stderr=%s",
+                    process.returncode,
+                    _tail_output(stdout),
+                    _tail_output(stderr),
+                )
+                raise ConversionError(f"{exc}{_process_output_detail(stdout, stderr)}") from exc
+            raise
+        finally:
+            if _ocr_server_process is not process:
+                if process is not None:
+                    _terminate_process_tree(process, settings.ocr_server_shutdown_timeout_seconds)
+                    logger.info("Cleaned up OCR server process. url=%s", settings.ocr_hybrid_url)
+                stdout_file.close()
+                stderr_file.close()
+
+
+def _release_ocr_server(settings: Settings) -> None:
+    global _ocr_server_process, _ocr_server_stdout_file, _ocr_server_stderr_file, _ocr_server_users, _ocr_server_url
+
+    with _ocr_server_lock:
+        if _ocr_server_users > 0:
+            _ocr_server_users -= 1
+        if _ocr_server_users > 0:
+            logger.info("OCR server still in use. url=%s users=%s", settings.ocr_hybrid_url, _ocr_server_users)
+            return
+
+        process = _ocr_server_process
+        stdout_file = _ocr_server_stdout_file
+        stderr_file = _ocr_server_stderr_file
+        _ocr_server_process = None
+        _ocr_server_stdout_file = None
+        _ocr_server_stderr_file = None
+        _ocr_server_url = None
+
         if process is not None:
             _terminate_process_tree(process, settings.ocr_server_shutdown_timeout_seconds)
-            if ready:
-                logger.info("Stopped OCR server. url=%s", settings.ocr_hybrid_url)
-            else:
-                logger.info("Cleaned up OCR server process. url=%s", settings.ocr_hybrid_url)
-        stdout_file.close()
-        stderr_file.close()
+            logger.info("Stopped OCR server. url=%s", settings.ocr_hybrid_url)
+        if stdout_file is not None:
+            stdout_file.close()
+        if stderr_file is not None:
+            stderr_file.close()
 
 
 def _read_temp_output(output_file: Any) -> str:
@@ -410,29 +477,42 @@ def _process_output_detail(stdout: str, stderr: str) -> str:
 
 def _wait_for_http_server(url: str, process: subprocess.Popen, timeout_seconds: int) -> None:
     deadline = time.monotonic() + timeout_seconds
-    urls = [f"{url.rstrip('/')}/health", url.rstrip("/")]
     last_error: Exception | None = None
 
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise ConversionError("OCR server exited before it became ready.")
 
-        for candidate in urls:
-            try:
-                with urlopen(candidate, timeout=1) as response:
-                    if response.status < 500:
-                        return
-            except HTTPError as exc:
-                if exc.code < 500:
-                    return
-                last_error = exc
-            except (OSError, URLError, HTTPException) as exc:
-                last_error = exc
+        ready, last_error = _probe_http_server(url)
+        if ready:
+            return
 
         time.sleep(0.25)
 
     detail = f" Last error: {last_error}" if last_error else ""
     raise ConversionError(f"OCR server did not become ready at {url} within {timeout_seconds} seconds.{detail}")
+
+
+def _http_server_ready(url: str) -> bool:
+    ready, _last_error = _probe_http_server(url)
+    return ready
+
+
+def _probe_http_server(url: str) -> tuple[bool, Exception | None]:
+    last_error: Exception | None = None
+    urls = [f"{url.rstrip('/')}/health", url.rstrip("/")]
+    for candidate in urls:
+        try:
+            with urlopen(candidate, timeout=1) as response:
+                if response.status < 500:
+                    return True, None
+        except HTTPError as exc:
+            if exc.code < 500:
+                return True, None
+            last_error = exc
+        except (OSError, URLError, HTTPException) as exc:
+            last_error = exc
+    return False, last_error
 
 
 def _terminate_process_tree(process: subprocess.Popen, timeout_seconds: int) -> None:
