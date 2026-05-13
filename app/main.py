@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Dify OpenDataLoader PDF Converter")
 _inflight_lock = asyncio.Lock()
 _inflight_conversions: dict[str, asyncio.Future[str]] = {}
+_USE_OCR_KEYS = ("use_ocr", "useOcr", "useOCR", "ocr", "enable_ocr", "enableOcr")
 
 
 class ConvertResponse(BaseModel):
@@ -35,7 +36,7 @@ async def convert(
         if pdf is None:
             raise ValueError("PDF file parameter is required.")
         content = await pdf.read()
-        resolved_use_ocr = _resolve_use_ocr(use_ocr, request)
+        resolved_use_ocr = await _resolve_use_ocr(use_ocr, request)
         markdown = await _convert_pdf_once(content, pdf.filename or "document.pdf", use_ocr=resolved_use_ocr)
         return ConvertResponse(success=True, markdown=markdown)
     except Exception:
@@ -88,18 +89,35 @@ def _conversion_key(content: bytes, filename: str, use_ocr: bool) -> str:
     return f"{digest}:{filename}:{int(use_ocr)}"
 
 
-def _resolve_use_ocr(form_value: Any, request: Request, default: bool = True) -> bool:
-    candidates = [
-        form_value,
-        request.query_params.get("use_ocr"),
-        request.headers.get("x-use-ocr"),
-        request.headers.get("use-ocr"),
-    ]
-    for candidate in candidates:
+async def _resolve_use_ocr(form_value: Any, request: Request, default: bool = True) -> bool:
+    candidates: list[tuple[str, Any]] = [("form-param:use_ocr", form_value)]
+
+    form_values = await _request_form_values(request)
+    for key in _USE_OCR_KEYS:
+        candidates.append((f"form:{key}", form_values.get(key)))
+        candidates.append((f"query:{key}", request.query_params.get(key)))
+
+    for key in ("x-use-ocr", "use-ocr", "x-useocr", "x-ocr"):
+        candidates.append((f"header:{key}", request.headers.get(key)))
+
+    for source, candidate in candidates:
         parsed = _parse_bool(candidate)
         if parsed is not None:
+            logger.info("Resolved use_ocr=%s source=%s raw=%r", parsed, source, candidate)
             return parsed
+    logger.info("Resolved use_ocr=%s source=default", default)
     return default
+
+
+async def _request_form_values(request: Request) -> dict[str, Any]:
+    form_method = getattr(request, "form", None)
+    if form_method is None:
+        return {}
+    try:
+        form = await form_method()
+    except Exception:
+        return {}
+    return {str(key): value for key, value in form.multi_items() if not hasattr(value, "filename")}
 
 
 def _parse_bool(value: Any) -> bool | None:
@@ -112,7 +130,7 @@ def _parse_bool(value: Any) -> bool | None:
             return bool(value)
         raise ValueError(f"Invalid boolean value for use_ocr: {value!r}")
 
-    text = str(value).strip().lower()
+    text = str(value).strip().strip("\"'").strip().lower()
     if not text:
         return None
     if text in {"1", "true", "t", "yes", "y", "on"}:

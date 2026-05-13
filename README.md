@@ -34,6 +34,8 @@ opendataloader-pdf-hybrid --port 5003 --force-ocr --ocr-lang "ko,en" --enrich-pi
 - Query: `/convert?use_ocr=false`
 - Header: `X-Use-OCR: false`
 
+호환 필드명으로 `useOcr`, `useOCR`, `ocr`, `enable_ocr`, `enableOcr`도 지원합니다.
+
 Binary body:
 
 - Method: `POST`

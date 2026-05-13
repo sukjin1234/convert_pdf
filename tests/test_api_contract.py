@@ -10,9 +10,18 @@ from app.main import ConvertResponse, _resolve_use_ocr, convert
 
 
 class _Request:
-    def __init__(self, query_params=None, headers=None):
+    def __init__(self, query_params=None, headers=None, form_values=None):
         self.query_params = query_params or {}
         self.headers = headers or {}
+        self._form_values = form_values or {}
+
+    async def form(self):
+        return _Form(self._form_values)
+
+
+class _Form(dict):
+    def multi_items(self):
+        return list(self.items())
 
 
 class ApiContractTest(unittest.IsolatedAsyncioTestCase):
@@ -59,9 +68,13 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.success)
         converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "scan.pdf", use_ocr=False)
 
-    def test_resolve_use_ocr_reads_header_value(self):
-        self.assertFalse(_resolve_use_ocr(None, _Request(headers={"x-use-ocr": "false"})))
-        self.assertTrue(_resolve_use_ocr(None, _Request(headers={"x-use-ocr": "true"})))
+    async def test_resolve_use_ocr_reads_header_value(self):
+        self.assertFalse(await _resolve_use_ocr(None, _Request(headers={"x-use-ocr": "false"})))
+        self.assertTrue(await _resolve_use_ocr(None, _Request(headers={"x-use-ocr": "true"})))
+
+    async def test_resolve_use_ocr_reads_dify_style_aliases(self):
+        self.assertFalse(await _resolve_use_ocr(None, _Request(form_values={"useOcr": '"false"'})))
+        self.assertTrue(await _resolve_use_ocr(None, _Request(query_params={"ocr": "yes"})))
 
     async def test_convert_joins_duplicate_inflight_conversion(self):
         content = b"%PDF-1.4\n%%EOF"
