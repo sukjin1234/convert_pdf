@@ -68,11 +68,22 @@ Dify 노드의 read timeout은 `70~90s`로 설정합니다. API 내부 기본 �
 - `ODL_OCR_SERVER_CLI`: 기본 `opendataloader-pdf-hybrid`
 - `ODL_OCR_SERVER_HOST`: 기본 `127.0.0.1`
 - `ODL_OCR_SERVER_PORT`: 기본 `5003`
+- `ODL_OCR_SERVER_WORKERS`: 기본 `0`, `ODL_OCR_SERVER_DEVICES`/`ODL_OCR_SERVER_PORTS`가 있으면 그 개수, 없으면 1
+- `ODL_OCR_SERVER_PORTS`: 예 `5003,5004,5005`, 지정하지 않으면 `ODL_OCR_SERVER_PORT`부터 연속 포트 사용
+- `ODL_OCR_SERVER_DEVICES`: 예 `0,1,2` 또는 `cuda0,cuda1,cuda2`, 각 OCR 서버 프로세스의 `CUDA_VISIBLE_DEVICES`
 - `ODL_OCR_HYBRID_URL`: 기본 `http://127.0.0.1:<ODL_OCR_SERVER_PORT>`
+- `ODL_OCR_HYBRID_URLS`: 예 `http://127.0.0.1:5003,http://127.0.0.1:5004,http://127.0.0.1:5005`
 - `ODL_OCR_LANG`: 기본 `ko,en`
 - `ODL_OCR_ENRICH_PICTURE_DESCRIPTION`: 기본 `true`
 - `ODL_OCR_SERVER_START_TIMEOUT_SECONDS`: 기본 `60`
 - `ODL_OCR_SERVER_SHUTDOWN_TIMEOUT_SECONDS`: 기본 `10`
+
+3개 GPU로 OCR 영역을 병렬 처리하려면 예를 들어 다음처럼 실행합니다.
+
+```bash
+export ODL_OCR_SERVER_DEVICES=0,1,2
+export ODL_OCR_SERVER_PORTS=5003,5004,5005
+```
 
 ## 테스트
 

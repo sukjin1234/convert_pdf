@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import signal
@@ -10,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.client import HTTPException
@@ -25,11 +27,7 @@ from .markdown import render_document_pages_to_markdown, render_document_to_mark
 logger = logging.getLogger(__name__)
 
 _ocr_server_lock = threading.RLock()
-_ocr_server_process: subprocess.Popen | None = None
-_ocr_server_stdout_file: Any | None = None
-_ocr_server_stderr_file: Any | None = None
-_ocr_server_users = 0
-_ocr_server_url: str | None = None
+_ocr_server_states: dict[str, OcrServerState] = {}
 
 
 class ConversionError(RuntimeError):
@@ -41,6 +39,22 @@ class OcrTarget:
     element: dict[str, Any]
     page_number: int
     bbox: tuple[float, float, float, float] | None
+
+
+@dataclass(frozen=True)
+class OcrServerSpec:
+    index: int
+    port: int
+    hybrid_url: str
+    cuda_visible_devices: str | None = None
+
+
+@dataclass
+class OcrServerState:
+    process: subprocess.Popen
+    stdout_file: Any
+    stderr_file: Any
+    users: int
 
 
 @dataclass(frozen=True)
@@ -271,11 +285,11 @@ def build_opendataloader_command(
     return command
 
 
-def build_ocr_server_command(settings: Settings) -> list[str]:
+def build_ocr_server_command(settings: Settings, port: int | None = None) -> list[str]:
     command = [
         settings.ocr_server_cli,
         "--port",
-        str(settings.ocr_server_port),
+        str(port or settings.ocr_server_port),
         "--force-ocr",
         "--ocr-lang",
         settings.ocr_lang,
@@ -349,61 +363,72 @@ def _run_command(command: Sequence[str], timeout_seconds: int) -> None:
 
 
 @contextmanager
-def _managed_ocr_server(settings: Settings) -> Iterator[None]:
-    command = build_ocr_server_command(settings)
-    managed = False
+def _managed_ocr_server(settings: Settings) -> Iterator[OcrServerSpec | None]:
+    with _managed_ocr_servers(settings) as specs:
+        yield specs[0] if specs else None
+
+
+@contextmanager
+def _managed_ocr_servers(settings: Settings) -> Iterator[list[OcrServerSpec]]:
+    specs = _ocr_server_specs(settings)
+    managed_specs: list[OcrServerSpec] = []
     try:
-        managed = _acquire_ocr_server(settings, command)
-        yield
+        for spec in specs:
+            if _acquire_ocr_server(settings, spec):
+                managed_specs.append(spec)
+        yield specs
     finally:
-        if managed:
-            _release_ocr_server(settings)
+        for spec in reversed(managed_specs):
+            _release_ocr_server(settings, spec)
 
 
-def _acquire_ocr_server(settings: Settings, command: list[str]) -> bool:
-    global _ocr_server_process, _ocr_server_stdout_file, _ocr_server_stderr_file, _ocr_server_users, _ocr_server_url
-
+def _acquire_ocr_server(settings: Settings, spec: OcrServerSpec) -> bool:
     with _ocr_server_lock:
-        if (
-            _ocr_server_process is not None
-            and _ocr_server_process.poll() is None
-            and _ocr_server_url == settings.ocr_hybrid_url
-        ):
-            _wait_for_http_server(
-                settings.ocr_hybrid_url,
-                _ocr_server_process,
-                settings.ocr_server_start_timeout_seconds,
-            )
-            _ocr_server_users += 1
-            logger.info("Using managed OCR server. url=%s users=%s", settings.ocr_hybrid_url, _ocr_server_users)
+        state = _ocr_server_states.get(spec.hybrid_url)
+        if state is not None and state.process.poll() is None:
+            _wait_for_http_server(spec.hybrid_url, state.process, settings.ocr_server_start_timeout_seconds)
+            state.users += 1
+            logger.info("Using managed OCR server. url=%s users=%s", spec.hybrid_url, state.users)
             return True
 
-        if _http_server_ready(settings.ocr_hybrid_url):
-            logger.info("Using existing OCR server. url=%s", settings.ocr_hybrid_url)
+        if _http_server_ready(spec.hybrid_url):
+            logger.info("Using existing OCR server. url=%s", spec.hybrid_url)
             return False
 
         stdout_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
         stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
         process = None
         try:
+            command = build_ocr_server_command(settings, port=spec.port)
+            env = os.environ.copy()
+            if spec.cuda_visible_devices is not None:
+                env["CUDA_VISIBLE_DEVICES"] = spec.cuda_visible_devices
+
             kwargs = {
                 "stdout": stdout_file,
                 "stderr": stderr_file,
                 "text": True,
+                "env": env,
             }
             if os.name == "nt":
                 kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             else:
                 kwargs["start_new_session"] = True
 
-            logger.info("Starting OCR server. url=%s command=%s", settings.ocr_hybrid_url, command)
+            logger.info(
+                "Starting OCR server. url=%s cuda_visible_devices=%s command=%s",
+                spec.hybrid_url,
+                spec.cuda_visible_devices or "inherit",
+                command,
+            )
             process = subprocess.Popen(command, **kwargs)
-            _wait_for_http_server(settings.ocr_hybrid_url, process, settings.ocr_server_start_timeout_seconds)
-            _ocr_server_process = process
-            _ocr_server_stdout_file = stdout_file
-            _ocr_server_stderr_file = stderr_file
-            _ocr_server_users = 1
-            _ocr_server_url = settings.ocr_hybrid_url
+            _wait_for_http_server(spec.hybrid_url, process, settings.ocr_server_start_timeout_seconds)
+            _ocr_server_states[spec.hybrid_url] = OcrServerState(
+                process=process,
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                users=1,
+            )
             return True
         except ConversionError as exc:
             if process is not None and process.poll() is not None:
@@ -418,39 +443,75 @@ def _acquire_ocr_server(settings: Settings, command: list[str]) -> bool:
                 raise ConversionError(f"{exc}{_process_output_detail(stdout, stderr)}") from exc
             raise
         finally:
-            if _ocr_server_process is not process:
+            state = _ocr_server_states.get(spec.hybrid_url)
+            if state is None or state.process is not process:
                 if process is not None:
                     _terminate_process_tree(process, settings.ocr_server_shutdown_timeout_seconds)
-                    logger.info("Cleaned up OCR server process. url=%s", settings.ocr_hybrid_url)
+                    logger.info("Cleaned up OCR server process. url=%s", spec.hybrid_url)
                 stdout_file.close()
                 stderr_file.close()
 
 
-def _release_ocr_server(settings: Settings) -> None:
-    global _ocr_server_process, _ocr_server_stdout_file, _ocr_server_stderr_file, _ocr_server_users, _ocr_server_url
-
+def _release_ocr_server(settings: Settings, spec: OcrServerSpec) -> None:
     with _ocr_server_lock:
-        if _ocr_server_users > 0:
-            _ocr_server_users -= 1
-        if _ocr_server_users > 0:
-            logger.info("OCR server still in use. url=%s users=%s", settings.ocr_hybrid_url, _ocr_server_users)
+        state = _ocr_server_states.get(spec.hybrid_url)
+        if state is None:
             return
 
-        process = _ocr_server_process
-        stdout_file = _ocr_server_stdout_file
-        stderr_file = _ocr_server_stderr_file
-        _ocr_server_process = None
-        _ocr_server_stdout_file = None
-        _ocr_server_stderr_file = None
-        _ocr_server_url = None
+        if state.users > 0:
+            state.users -= 1
+        if state.users > 0:
+            logger.info("OCR server still in use. url=%s users=%s", spec.hybrid_url, state.users)
+            return
 
-        if process is not None:
-            _terminate_process_tree(process, settings.ocr_server_shutdown_timeout_seconds)
-            logger.info("Stopped OCR server. url=%s", settings.ocr_hybrid_url)
-        if stdout_file is not None:
-            stdout_file.close()
-        if stderr_file is not None:
-            stderr_file.close()
+        _ocr_server_states.pop(spec.hybrid_url, None)
+
+        _terminate_process_tree(state.process, settings.ocr_server_shutdown_timeout_seconds)
+        logger.info("Stopped OCR server. url=%s", spec.hybrid_url)
+        state.stdout_file.close()
+        state.stderr_file.close()
+
+
+def _ocr_server_specs(settings: Settings) -> list[OcrServerSpec]:
+    explicit_ports = list(settings.ocr_server_ports)
+    explicit_urls = list(settings.ocr_hybrid_urls)
+    devices = [_normalize_cuda_visible_devices(device) for device in settings.ocr_server_devices]
+    worker_count = settings.ocr_server_workers or max(len(explicit_ports), len(explicit_urls), len(devices), 1)
+
+    if explicit_ports and len(explicit_ports) != worker_count:
+        raise ConversionError("ODL_OCR_SERVER_PORTS count must match OCR worker count.")
+    if explicit_urls and len(explicit_urls) != worker_count:
+        raise ConversionError("ODL_OCR_HYBRID_URLS count must match OCR worker count.")
+    if devices and len(devices) != worker_count:
+        raise ConversionError("ODL_OCR_SERVER_DEVICES count must match OCR worker count.")
+
+    ports = explicit_ports or [settings.ocr_server_port + index for index in range(worker_count)]
+    if explicit_urls:
+        urls = explicit_urls
+    elif worker_count == 1 and not explicit_ports and not devices and not settings.ocr_server_workers:
+        urls = [settings.ocr_hybrid_url]
+    else:
+        urls = [f"http://{settings.ocr_server_host}:{port}" for port in ports]
+
+    return [
+        OcrServerSpec(
+            index=index,
+            port=port,
+            hybrid_url=url,
+            cuda_visible_devices=devices[index - 1] if devices else None,
+        )
+        for index, (port, url) in enumerate(zip(ports, urls), start=1)
+    ]
+
+
+def _normalize_cuda_visible_devices(device: str) -> str:
+    value = device.strip()
+    lowered = value.lower()
+    if lowered.startswith("cuda:"):
+        return value.split(":", 1)[1]
+    if lowered.startswith("cuda") and value[4:].isdigit():
+        return value[4:]
+    return value
 
 
 def _read_temp_output(output_file: Any) -> str:
@@ -652,29 +713,62 @@ def _apply_ocr_to_document_images(input_path: Path, doc: dict[str, Any], output_
 
     ocr_root = output_dir / "ocr"
     ocr_root.mkdir(exist_ok=True)
-    applied = 0
 
-    with _managed_ocr_server(settings):
-        for index, target in enumerate(targets, start=1):
+    with _managed_ocr_servers(settings) as servers:
+        logger.info("Applying OCR targets. count=%s servers=%s", len(targets), len(servers))
+        results = _convert_ocr_targets_parallel(input_path, ocr_root, targets, settings, servers)
+
+    applied = 0
+    for target, ocr_markdown in results:
+        if ocr_markdown:
+            target.element["_ocr_markdown"] = ocr_markdown
+            applied += 1
+    return applied
+
+
+def _convert_ocr_targets_parallel(
+    input_path: Path,
+    ocr_root: Path,
+    targets: list[OcrTarget],
+    settings: Settings,
+    servers: list[OcrServerSpec],
+) -> list[tuple[OcrTarget, str]]:
+    work_queue: queue.Queue[tuple[int, OcrTarget]] = queue.Queue()
+    for index, target in enumerate(targets, start=1):
+        work_queue.put((index, target))
+
+    def worker(server: OcrServerSpec) -> list[tuple[OcrTarget, str]]:
+        converted: list[tuple[OcrTarget, str]] = []
+        while True:
+            try:
+                index, target = work_queue.get_nowait()
+            except queue.Empty:
+                return converted
+
             region_pdf = ocr_root / f"target-{index}.pdf"
             region_output = ocr_root / f"output-{index}"
             try:
                 _extract_pdf_region_to_pdf(input_path, region_pdf, target)
-                ocr_markdown = _convert_ocr_region(region_pdf, region_output, settings)
+                ocr_markdown = _convert_ocr_region(region_pdf, region_output, settings, server.hybrid_url)
             except ConversionError as exc:
                 logger.info(
-                    "Skipping OCR target after conversion failure. page=%s target=%s error=%s",
+                    "Skipping OCR target after conversion failure. page=%s target=%s server=%s error=%s",
                     target.page_number,
                     index,
+                    server.hybrid_url,
                     exc,
                 )
-                continue
+            else:
+                if ocr_markdown:
+                    converted.append((target, ocr_markdown))
+            finally:
+                work_queue.task_done()
 
-            if ocr_markdown:
-                target.element["_ocr_markdown"] = ocr_markdown
-                applied += 1
-
-    return applied
+    results: list[tuple[OcrTarget, str]] = []
+    with ThreadPoolExecutor(max_workers=len(servers)) as executor:
+        for server_results in executor.map(worker, servers):
+            results.extend(server_results)
+    return results
 
 
 def _collect_ocr_targets(doc: dict[str, Any]) -> list[OcrTarget]:
@@ -741,7 +835,7 @@ def _clip_rect_from_bbox(fitz: Any, page_rect: Any, bbox: tuple[float, float, fl
     return None
 
 
-def _convert_ocr_region(input_path: Path, output_dir: Path, settings: Settings) -> str:
+def _convert_ocr_region(input_path: Path, output_dir: Path, settings: Settings, hybrid_url: str) -> str:
     output_dir.mkdir()
     command = build_opendataloader_command(
         input_path,
@@ -749,7 +843,7 @@ def _convert_ocr_region(input_path: Path, output_dir: Path, settings: Settings) 
         settings,
         hybrid_mode="full",
         image_output="off",
-        hybrid_url=settings.ocr_hybrid_url,
+        hybrid_url=hybrid_url,
     )
     _run_command(command, settings.conversion_timeout_seconds)
     try:

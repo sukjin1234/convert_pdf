@@ -21,6 +21,17 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _env_csv(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return ()
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _env_int_csv(name: str) -> tuple[int, ...]:
+    return tuple(int(value) for value in _env_csv(name))
+
+
 def _default_opendataloader_cli() -> str:
     explicit = os.getenv("ODL_CLI")
     if explicit:
@@ -103,6 +114,10 @@ class Settings:
     ocr_server_cli: str = _default_ocr_server_cli()
     ocr_server_host: str = os.getenv("ODL_OCR_SERVER_HOST", "127.0.0.1")
     ocr_server_port: int = _env_int("ODL_OCR_SERVER_PORT", 5003)
+    ocr_server_ports: tuple[int, ...] = _env_int_csv("ODL_OCR_SERVER_PORTS")
+    ocr_server_devices: tuple[str, ...] = _env_csv("ODL_OCR_SERVER_DEVICES")
+    ocr_server_workers: int = _env_int("ODL_OCR_SERVER_WORKERS", 0)
+    ocr_hybrid_urls: tuple[str, ...] = _env_csv("ODL_OCR_HYBRID_URLS")
     ocr_hybrid_url: str = _default_ocr_hybrid_url()
     ocr_lang: str = os.getenv("ODL_OCR_LANG", "ko,en")
     ocr_enrich_picture_description: bool = _env_bool("ODL_OCR_ENRICH_PICTURE_DESCRIPTION", True)
@@ -124,6 +139,10 @@ class Settings:
             raise ValueError("ODL_RASTERIZE_DPI must be positive.")
         if self.ocr_server_port <= 0:
             raise ValueError("ODL_OCR_SERVER_PORT must be positive.")
+        if any(port <= 0 for port in self.ocr_server_ports):
+            raise ValueError("ODL_OCR_SERVER_PORTS values must be positive.")
+        if self.ocr_server_workers < 0:
+            raise ValueError("ODL_OCR_SERVER_WORKERS must not be negative.")
         if self.ocr_server_start_timeout_seconds <= 0:
             raise ValueError("ODL_OCR_SERVER_START_TIMEOUT_SECONDS must be positive.")
         if self.ocr_server_shutdown_timeout_seconds <= 0:

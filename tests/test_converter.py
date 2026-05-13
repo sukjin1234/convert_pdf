@@ -9,9 +9,12 @@ from uuid import uuid4
 from app.config import Settings
 from app.converter import (
     ConversionError,
+    OcrServerSpec,
     PdfConverter,
     _convert_pdf_file,
     _managed_ocr_server,
+    _managed_ocr_servers,
+    _ocr_server_specs,
     _read_generated_markdown,
     _read_rendered_markdown,
     _wait_for_http_server,
@@ -101,6 +104,23 @@ class ConverterTest(unittest.TestCase):
         self.assertIn("--force-ocr", command)
         self.assertIn("--ocr-lang", command)
         self.assertEqual(command[command.index("--ocr-lang") + 1], "ko,en")
+
+    def test_ocr_server_specs_use_ports_and_cuda_devices(self):
+        settings = Settings(
+            ocr_server_port=5003,
+            ocr_server_workers=3,
+            ocr_server_devices=("cuda0", "cuda:1", "2"),
+        )
+
+        specs = _ocr_server_specs(settings)
+
+        self.assertEqual([spec.port for spec in specs], [5003, 5004, 5005])
+        self.assertEqual([spec.hybrid_url for spec in specs], [
+            "http://127.0.0.1:5003",
+            "http://127.0.0.1:5004",
+            "http://127.0.0.1:5005",
+        ])
+        self.assertEqual([spec.cuda_visible_devices for spec in specs], ["0", "1", "2"])
 
     def test_wait_for_http_server_treats_bad_status_line_as_transient(self):
         calls = []
@@ -268,10 +288,10 @@ class ConverterTest(unittest.TestCase):
             events = []
 
             @contextmanager
-            def fake_ocr_server(_settings):
+            def fake_ocr_servers(_settings):
                 events.append("start")
                 try:
-                    yield
+                    yield [OcrServerSpec(index=1, port=5999, hybrid_url="http://127.0.0.1:5999")]
                 finally:
                     events.append("stop")
 
@@ -299,7 +319,7 @@ class ConverterTest(unittest.TestCase):
                     (output_dir / "ocr.md").write_text("--- Page 1 ---\n\nOCR text from image", encoding="utf-8")
 
             with (
-                patch("app.converter._managed_ocr_server", fake_ocr_server),
+                patch("app.converter._managed_ocr_servers", fake_ocr_servers),
                 patch("app.converter._extract_pdf_region_to_pdf") as extract_region,
                 patch("app.converter._run_command", side_effect=fake_run_command),
             ):
@@ -326,7 +346,7 @@ class ConverterTest(unittest.TestCase):
                 (output_dir / "doc.md").write_text("Only text", encoding="utf-8")
 
             with (
-                patch("app.converter._managed_ocr_server") as server,
+                patch("app.converter._managed_ocr_servers") as server,
                 patch("app.converter._run_command", side_effect=fake_run_command),
             ):
                 markdown = _convert_pdf_file(input_path, tmp_dir / "output", settings, use_ocr=True)
