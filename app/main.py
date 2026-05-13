@@ -4,9 +4,9 @@ import asyncio
 import functools
 import hashlib
 import logging
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from pydantic import BaseModel
 
 from .config import get_settings
@@ -26,12 +26,17 @@ class ConvertResponse(BaseModel):
 
 
 @app.post("/convert", response_model=ConvertResponse)
-async def convert(pdf: UploadFile | None = File(None), use_ocr: Annotated[bool, Form()] = True) -> ConvertResponse:
+async def convert(
+    request: Request,
+    pdf: UploadFile | None = File(None),
+    use_ocr: Annotated[str | None, Form()] = None,
+) -> ConvertResponse:
     try:
         if pdf is None:
             raise ValueError("PDF file parameter is required.")
         content = await pdf.read()
-        markdown = await _convert_pdf_once(content, pdf.filename or "document.pdf", use_ocr=use_ocr)
+        resolved_use_ocr = _resolve_use_ocr(use_ocr, request)
+        markdown = await _convert_pdf_once(content, pdf.filename or "document.pdf", use_ocr=resolved_use_ocr)
         return ConvertResponse(success=True, markdown=markdown)
     except Exception:
         logger.exception("PDF conversion failed")
@@ -81,3 +86,37 @@ async def _cleanup_inflight_conversion(key: str, future: asyncio.Future[str]) ->
 def _conversion_key(content: bytes, filename: str, use_ocr: bool) -> str:
     digest = hashlib.sha256(content).hexdigest()
     return f"{digest}:{filename}:{int(use_ocr)}"
+
+
+def _resolve_use_ocr(form_value: Any, request: Request, default: bool = True) -> bool:
+    candidates = [
+        form_value,
+        request.query_params.get("use_ocr"),
+        request.headers.get("x-use-ocr"),
+        request.headers.get("use-ocr"),
+    ]
+    for candidate in candidates:
+        parsed = _parse_bool(candidate)
+        if parsed is not None:
+            return parsed
+    return default
+
+
+def _parse_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in {0, 1}:
+            return bool(value)
+        raise ValueError(f"Invalid boolean value for use_ocr: {value!r}")
+
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value for use_ocr: {value!r}")

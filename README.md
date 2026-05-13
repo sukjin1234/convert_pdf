@@ -25,8 +25,14 @@ opendataloader-pdf-hybrid --port 5003 --force-ocr --ocr-lang "ko,en" --enrich-pi
 - Method: `POST`
 - URL: `http://<converter-host>:8000/convert`
 - Body: Form Data, 파일 필드에 PDF 파일 변수 지정
-- Optional Form Data: `use_ocr` boolean, 이미지 OCR이 필요할 때 `true`
+- Optional Form Data: `use_ocr` boolean/string, 예 `true` 또는 `false`
 - Response variables: `body.success`, `body.markdown`
+
+`use_ocr`는 Dify HTTP Request 노드 설정에 맞춰 다음 위치에서도 받을 수 있습니다. 우선순위는 Form Data, Query, Header 순입니다.
+
+- Form Data: `use_ocr=true`
+- Query: `/convert?use_ocr=false`
+- Header: `X-Use-OCR: false`
 
 Binary body:
 

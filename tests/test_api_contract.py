@@ -6,7 +6,13 @@ from unittest.mock import patch
 
 from fastapi import UploadFile
 
-from app.main import ConvertResponse, convert
+from app.main import ConvertResponse, _resolve_use_ocr, convert
+
+
+class _Request:
+    def __init__(self, query_params=None, headers=None):
+        self.query_params = query_params or {}
+        self.headers = headers or {}
 
 
 class ApiContractTest(unittest.IsolatedAsyncioTestCase):
@@ -23,7 +29,7 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         with patch("app.main.PdfConverter") as converter_class:
             converter_class.return_value.convert_pdf_bytes.return_value = "# Converted"
 
-            response = await convert(pdf)
+            response = await convert(_Request(), pdf)
 
         self.assertTrue(response.success)
         self.assertEqual(response.markdown, "# Converted")
@@ -36,10 +42,26 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         with patch("app.main.PdfConverter") as converter_class:
             converter_class.return_value.convert_pdf_bytes.return_value = "# Converted"
 
-            response = await convert(pdf, use_ocr=True)
+            response = await convert(_Request(), pdf, use_ocr="false")
 
         self.assertTrue(response.success)
-        converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "scan.pdf", use_ocr=True)
+        converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "scan.pdf", use_ocr=False)
+
+    async def test_convert_reads_use_ocr_from_query_string(self):
+        content = b"%PDF-1.4\n%%EOF"
+        pdf = UploadFile(file=BytesIO(content), filename="scan.pdf")
+
+        with patch("app.main.PdfConverter") as converter_class:
+            converter_class.return_value.convert_pdf_bytes.return_value = "# Converted"
+
+            response = await convert(_Request(query_params={"use_ocr": "0"}), pdf)
+
+        self.assertTrue(response.success)
+        converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "scan.pdf", use_ocr=False)
+
+    def test_resolve_use_ocr_reads_header_value(self):
+        self.assertFalse(_resolve_use_ocr(None, _Request(headers={"x-use-ocr": "false"})))
+        self.assertTrue(_resolve_use_ocr(None, _Request(headers={"x-use-ocr": "true"})))
 
     async def test_convert_joins_duplicate_inflight_conversion(self):
         content = b"%PDF-1.4\n%%EOF"
@@ -56,9 +78,9 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         with patch("app.main.PdfConverter") as converter_class:
             converter_class.return_value.convert_pdf_bytes.side_effect = fake_convert
 
-            first_task = asyncio.create_task(convert(first_pdf, use_ocr=True))
+            first_task = asyncio.create_task(convert(_Request(), first_pdf, use_ocr="true"))
             await asyncio.get_running_loop().run_in_executor(None, started.wait, 2)
-            second_task = asyncio.create_task(convert(second_pdf, use_ocr=True))
+            second_task = asyncio.create_task(convert(_Request(), second_pdf, use_ocr="true"))
             await asyncio.sleep(0.05)
             release.set()
 
