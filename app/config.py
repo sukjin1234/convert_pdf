@@ -6,6 +6,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)

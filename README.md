@@ -56,6 +56,11 @@ Dify 노드의 read timeout은 `70~90s`로 설정합니다. API 내부 기본 �
 
 ## 환경 변수
 
+앱 시작 시 프로젝트 루트의 `.env` 파일을 자동으로 읽습니다. 실제 비밀번호가 들어가는 `.env`는 커밋하지 말고, 필요한 값은 `.env.example`을 참고해 작성합니다. 이미 PowerShell이나 Docker 환경변수로 설정된 값이 있으면 그 값이 `.env`보다 우선합니다.
+
+- `NEO4J_URI`: 기본 `bolt://localhost:7687`
+- `NEO4J_USER`: 기본 `neo4j`
+- `NEO4J_PASSWORD`: Neo4j 비밀번호, RAG graph API 사용 시 필수
 - `ODL_HYBRID_URL`: 기본 `http://localhost:5002`
 - `ODL_HYBRID_MODE`: 기본 `full`, 허용값 `full` 또는 `auto`
 - `ODL_CONVERSION_TIMEOUT_SECONDS`: 기본 `70`
