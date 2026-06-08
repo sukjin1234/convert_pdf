@@ -80,6 +80,16 @@ class RagProcessResponse(BaseModel):
     graph_json: dict[str, Any]
 
 
+class RagProcessIngestResponse(BaseModel):
+    status: str
+    document_id: str
+    file_name: str
+    dify_markdown: str
+    sections: int
+    chunks: int
+    relations: int
+
+
 class EntityPayload(BaseModel):
     name: str
     type: str | None = None
@@ -192,19 +202,7 @@ async def graph_health() -> dict[str, str]:
 @app.post("/rag/process", response_model=RagProcessResponse)
 async def rag_process(request: RagProcessRequest) -> RagProcessResponse:
     try:
-        if not request.document_id.strip():
-            raise HTTPException(status_code=400, detail="document_id is required.")
-        if not request.file_name.strip():
-            raise HTTPException(status_code=400, detail="file_name is required.")
-        if not request.markdown.strip():
-            raise HTTPException(status_code=400, detail="markdown is required.")
-
-        graph_json, chunks = build_graph_json(
-            request.document_id,
-            request.file_name,
-            request.markdown,
-        )
-        dify_markdown = enrich_dify_markdown(chunks)
+        graph_json, dify_markdown = build_rag_artifacts(request)
         return RagProcessResponse(
             document_id=request.document_id,
             file_name=request.file_name,
@@ -216,6 +214,30 @@ async def rag_process(request: RagProcessRequest) -> RagProcessResponse:
     except Exception as exc:
         logger.exception("RAG process failed")
         raise HTTPException(status_code=500, detail="RAG processing failed.") from exc
+
+
+@app.post("/rag/process-ingest", response_model=RagProcessIngestResponse)
+async def rag_process_ingest(request: RagProcessRequest) -> RagProcessIngestResponse:
+    try:
+        graph_json, dify_markdown = build_rag_artifacts(request)
+        stats = count_graph_payload(graph_json)
+        driver = get_neo4j_driver()
+        with driver.session() as session:
+            session.execute_write(ingest_graph_tx, graph_json)
+        return RagProcessIngestResponse(
+            status="ok",
+            document_id=request.document_id,
+            file_name=request.file_name,
+            dify_markdown=dify_markdown,
+            sections=stats["sections"],
+            chunks=stats["chunks"],
+            relations=stats["relations"],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("RAG process and Neo4j ingest failed")
+        raise HTTPException(status_code=500, detail="RAG process and Neo4j ingest failed.") from exc
 
 
 @app.post("/graph/ingest", response_model=GraphIngestResponse)
@@ -520,6 +542,22 @@ def build_graph_json(document_id: str, file_name: str, markdown: str) -> tuple[d
         },
         chunks,
     )
+
+
+def build_rag_artifacts(request: RagProcessRequest) -> tuple[dict[str, Any], str]:
+    if not request.document_id.strip():
+        raise HTTPException(status_code=400, detail="document_id is required.")
+    if not request.file_name.strip():
+        raise HTTPException(status_code=400, detail="file_name is required.")
+    if not request.markdown.strip():
+        raise HTTPException(status_code=400, detail="markdown is required.")
+
+    graph_json, chunks = build_graph_json(
+        request.document_id,
+        request.file_name,
+        request.markdown,
+    )
+    return graph_json, enrich_dify_markdown(chunks)
 
 
 def get_neo4j_driver() -> Any:
