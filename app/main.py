@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from .config import get_settings
@@ -37,8 +38,8 @@ EXPLICIT_ENTITY_TERMS = [
     "Parent-Child Chunker",
     "Knowledge Retrieval",
     "Knowledge Pipeline",
-    "OpenDataLoader",
     "Vector DB",
+    "OpenDataLoader",
     "Chatflow",
     "FastAPI",
     "Markdown",
@@ -51,7 +52,73 @@ EXPLICIT_ENTITY_TERMS = [
     "LLM",
     "API",
     "PDF",
+    "CSV",
+    "JSON",
+    "HTML",
+    "OAuth",
+    "SAML",
+    "JWT",
+    "REST API",
+    "GraphQL",
+    "PostgreSQL",
+    "MySQL",
+    "Redis",
+    "Kafka",
+    "Kubernetes",
+    "MinIO",
+    "S3",
+    "GitLab",
+    "GitHub",
+    "CI/CD",
+    "전형별 모집인원",
+    "대학별 모집인원",
+    "모집인원",
+    "모집단위",
+    "수시모집",
+    "정시모집",
+    "학생부교과",
+    "학생부종합",
+    "논술전형",
+    "실기전형",
+    "일반전형",
+    "지역인재",
+    "농어촌학생",
+    "기회균형",
+    "특성화고교",
+    "특성화고",
+    "대학수학능력시험",
+    "원서접수",
+    "전형일정",
+    "서류평가",
+    "수능",
+    "면접",
+    "장애 대응",
+    "운영 기준",
+    "처리 절차",
+    "보안 정책",
+    "접근 권한",
+    "개인정보",
+    "담당자",
+    "연락처",
+    "변경 이력",
+    "품질 지표",
 ]
+DOMAIN_ENTITY_SUFFIX_RE = re.compile(
+    r"[A-Za-z0-9가-힣·ㆍ_-]{2,60}"
+    r"(?:학과|학부|전공|대학|계열|기관|부서|센터|팀|시스템|서비스|플랫폼|모델|데이터베이스|DB|API|"
+    r"워크플로우|파이프라인|프로세스|정책|규정|가이드|매뉴얼|기준|절차|방법|요건|자격|일정|계획|"
+    r"결과|현황|상태|인원|정원|수량|금액|비용|점수|등급|비율|위험|이슈|장애|오류|원인|대응|"
+    r"해결방법|담당자|연락처|주소|지표|목표|성과|항목|목록|내용|설명)"
+)
+KOREAN_KEYPHRASE_RE = re.compile(
+    r"(?:[가-힣][A-Za-z0-9가-힣·ㆍ_-]{1,29}\s+){0,3}"
+    r"[가-힣][A-Za-z0-9가-힣·ㆍ_-]{1,29}\s*"
+    r"(?:기준|절차|방법|요건|자격|일정|계획|결과|현황|상태|인원|정원|수량|금액|비용|점수|등급|"
+    r"비율|위험|이슈|장애|오류|원인|대응|정책|규정|담당자|연락처|주소|지표|목표|성과)"
+)
+ENGLISH_ENTITY_RE = re.compile(
+    r"\b[A-Z][A-Za-z0-9]+(?:[-_/][A-Za-z0-9]+)*(?:\s+[A-Z][A-Za-z0-9]+(?:[-_/][A-Za-z0-9]+)*){0,3}\b"
+)
 PAGE_SEPARATOR_RE = re.compile(r"^\s*---\s*Page\s+(\d+)\s*---\s*$", re.IGNORECASE)
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
@@ -64,6 +131,17 @@ _neo4j_schema_ready = False
 class ConvertResponse(BaseModel):
     success: bool
     markdown: str
+
+
+class ConvertRagResponse(BaseModel):
+    success: bool
+    status: str
+    document_id: str
+    file_name: str
+    dify_markdown: str
+    sections: int
+    chunks: int
+    relations: int
 
 
 class RagProcessRequest(BaseModel):
@@ -137,7 +215,8 @@ class GraphIngestResponse(BaseModel):
 
 
 class GraphSearchRequest(BaseModel):
-    entities: list[str]
+    entities: list[str] | str = Field(default_factory=list)
+    query: str = ""
     depth: int = 2
     limit: int = 30
 
@@ -178,6 +257,56 @@ async def convert(pdf: UploadFile | None = File(None)) -> ConvertResponse:
     except Exception:
         logger.exception("PDF conversion failed")
         return ConvertResponse(success=False, markdown="")
+
+
+@app.post("/convert/rag", response_model=ConvertRagResponse)
+async def convert_rag(
+    pdf: UploadFile | None = File(None),
+    document_id: str | None = Form(None),
+    file_name: str | None = Form(None),
+) -> ConvertRagResponse:
+    try:
+        if pdf is None:
+            raise HTTPException(status_code=400, detail="PDF file parameter is required.")
+
+        content = await pdf.read()
+        resolved_file_name = (file_name or pdf.filename or "document.pdf").strip()
+        resolved_document_id = (document_id or "").strip()
+        if not resolved_document_id:
+            resolved_document_id = f"doc_{hashlib.sha256(content).hexdigest()[:16]}"
+
+        converter = PdfConverter(get_settings())
+        markdown = await asyncio.to_thread(
+            converter.convert_pdf_bytes,
+            content,
+            resolved_file_name,
+        )
+        request = RagProcessRequest(
+            document_id=resolved_document_id,
+            file_name=resolved_file_name,
+            markdown=markdown,
+        )
+        graph_json, dify_markdown = build_rag_artifacts(request)
+        stats = count_graph_payload(graph_json)
+        driver = get_neo4j_driver()
+        with driver.session() as session:
+            session.execute_write(ingest_graph_tx, graph_json)
+
+        return ConvertRagResponse(
+            success=True,
+            status="ok",
+            document_id=resolved_document_id,
+            file_name=resolved_file_name,
+            dify_markdown=dify_markdown,
+            sections=stats["sections"],
+            chunks=stats["chunks"],
+            relations=stats["relations"],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("PDF conversion and RAG ingest failed")
+        raise HTTPException(status_code=500, detail="PDF conversion and RAG ingest failed.") from exc
 
 
 @app.get("/health")
@@ -265,9 +394,11 @@ async def graph_ingest(request: GraphIngestRequest) -> GraphIngestResponse:
 @app.post("/graph/search", response_model=GraphSearchResponse)
 async def graph_search(request: GraphSearchRequest) -> GraphSearchResponse:
     try:
-        entities = [entity.strip() for entity in request.entities if entity.strip()]
+        entities = normalize_graph_search_entities(request.entities)
         if not entities:
-            raise HTTPException(status_code=400, detail="entities must contain at least one value.")
+            entities = extract_entities_from_query(request.query)
+        if not entities:
+            return empty_graph_search_response()
 
         depth = min(max(int(request.depth), 1), 4)
         limit = min(max(int(request.limit), 1), 100)
@@ -295,6 +426,16 @@ async def graph_search(request: GraphSearchRequest) -> GraphSearchResponse:
     except Exception as exc:
         logger.exception("Neo4j graph search failed")
         raise HTTPException(status_code=500, detail="Neo4j graph search failed.") from exc
+
+
+def empty_graph_search_response() -> GraphSearchResponse:
+    return GraphSearchResponse(
+        graph_context=[],
+        expanded_keywords=[],
+        section_paths=[],
+        chunk_ids=[],
+        parent_ids=[],
+    )
 
 
 @app.on_event("shutdown")
@@ -728,24 +869,67 @@ def ingest_chunk_tx(tx: Any, section: dict[str, Any], chunk: dict[str, Any], cre
 
 def search_graph_tx(tx: Any, entities: list[str], depth: int, limit: int) -> list[dict[str, Any]]:
     query = f"""
-    MATCH path = (start:Entity)-[*1..{depth}]-(end:Entity)
-    WHERE start.name IN $entities
-      AND all(relation IN relationships(path) WHERE type(relation) IN $relation_types)
-    UNWIND relationships(path) AS relation
-    WITH DISTINCT relation
-    WITH startNode(relation) AS source, type(relation) AS relation_type, endNode(relation) AS target, relation
-    UNWIND coalesce(relation.chunk_ids, []) AS chunk_id
-    MATCH (chunk:Chunk {{chunk_id: chunk_id}})
+    CALL {{
+        MATCH (chunk:Chunk)-[:MENTIONS]->(entity:Entity)
+        WHERE entity.name IN $entities
+        RETURN
+            entity.name AS source,
+            "MENTIONED_IN" AS relation,
+            chunk.section_path AS target,
+            chunk.chunk_id AS chunk_id,
+            chunk.parent_id AS parent_id,
+            chunk.section_path AS section_path,
+            chunk.page_start AS page_start,
+            chunk.page_end AS page_end,
+            chunk.text_hash AS text_hash
+
+        UNION
+
+        UNWIND $entities AS entity_name
+        MATCH (chunk:Chunk)
+        WHERE chunk.text_preview CONTAINS entity_name
+        RETURN
+            entity_name AS source,
+            "TEXT_MATCH" AS relation,
+            chunk.section_path AS target,
+            chunk.chunk_id AS chunk_id,
+            chunk.parent_id AS parent_id,
+            chunk.section_path AS section_path,
+            chunk.page_start AS page_start,
+            chunk.page_end AS page_end,
+            chunk.text_hash AS text_hash
+
+        UNION
+
+        MATCH path = (start:Entity)-[*1..{depth}]-(end:Entity)
+        WHERE start.name IN $entities
+          AND all(relation IN relationships(path) WHERE type(relation) IN $relation_types)
+        UNWIND relationships(path) AS relation
+        WITH DISTINCT relation
+        WITH startNode(relation) AS source, type(relation) AS relation_type, endNode(relation) AS target, relation
+        UNWIND coalesce(relation.chunk_ids, []) AS chunk_id
+        MATCH (chunk:Chunk {{chunk_id: chunk_id}})
+        RETURN
+            source.name AS source,
+            relation_type AS relation,
+            target.name AS target,
+            chunk.chunk_id AS chunk_id,
+            chunk.parent_id AS parent_id,
+            chunk.section_path AS section_path,
+            chunk.page_start AS page_start,
+            chunk.page_end AS page_end,
+            chunk.text_hash AS text_hash
+    }}
     RETURN DISTINCT
-        source.name AS source,
-        relation_type AS relation,
-        target.name AS target,
-        chunk.chunk_id AS chunk_id,
-        chunk.parent_id AS parent_id,
-        chunk.section_path AS section_path,
-        chunk.page_start AS page_start,
-        chunk.page_end AS page_end,
-        chunk.text_hash AS text_hash
+        source,
+        relation,
+        target,
+        chunk_id,
+        parent_id,
+        section_path,
+        page_start,
+        page_end,
+        text_hash
     LIMIT $limit
     """
     result = tx.run(query, entities=entities, relation_types=sorted(ALLOWED_RELATION_TYPES), limit=limit)
@@ -880,6 +1064,13 @@ def find_entity_matches(text: str) -> list[dict[str, Any]]:
     def overlaps(start: int, end: int) -> bool:
         return any(start < used_end and end > used_start for used_start, used_end in occupied)
 
+    for match in ENGLISH_ENTITY_RE.finditer(text):
+        value = clean_entity_name(match.group(0))
+        if not is_entity_candidate(value) or overlaps(match.start(), match.end()):
+            continue
+        matches.append({"name": value, "start": match.start(), "end": match.end()})
+        occupied.append((match.start(), match.end()))
+
     for term in sorted(EXPLICIT_ENTITY_TERMS, key=len, reverse=True):
         pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", re.IGNORECASE)
         for match in pattern.finditer(text):
@@ -888,11 +1079,19 @@ def find_entity_matches(text: str) -> list[dict[str, Any]]:
             matches.append({"name": canonical_entity_name(term), "start": match.start(), "end": match.end()})
             occupied.append((match.start(), match.end()))
 
+    for pattern in (DOMAIN_ENTITY_SUFFIX_RE, KOREAN_KEYPHRASE_RE):
+        for match in pattern.finditer(text):
+            value = clean_entity_name(match.group(0))
+            if not is_entity_candidate(value) or overlaps(match.start(), match.end()):
+                continue
+            matches.append({"name": value, "start": match.start(), "end": match.end()})
+            occupied.append((match.start(), match.end()))
+
     for pattern in (
         re.compile(r"\b[A-Z]{2,}(?:[-_/][A-Za-z0-9]+)*\b"),
         re.compile(r"\b[A-Z][a-z]+(?:[A-Z][A-Za-z0-9]+)+\b"),
         re.compile(r"\b[A-Z][A-Za-z0-9]+(?:[-_/][A-Za-z0-9]+)+\b"),
-        re.compile(r"(?=[A-Za-z0-9_\-\uac00-\ud7a3]*[A-Za-z])(?=[A-Za-z0-9_\-\uac00-\ud7a3]*[\uac00-\ud7a3])[A-Za-z0-9_\-\uac00-\ud7a3]{2,}"),
+        re.compile(r"(?=[A-Za-z0-9_\-가-힣]*[A-Za-z])(?=[A-Za-z0-9_\-가-힣]*[가-힣])[A-Za-z0-9_\-가-힣]{2,}"),
     ):
         for match in pattern.finditer(text):
             value = clean_entity_name(match.group(0))
@@ -995,10 +1194,30 @@ def infer_entity_type(name: str) -> str:
     normalized = name.lower()
     if normalized in {"pdf", "markdown", "json", "html", "csv"}:
         return "FORMAT"
-    if normalized in {"opendataloader", "dify", "neo4j", "fastapi", "docker", "cypher"}:
+    if normalized in {
+        "opendataloader",
+        "dify",
+        "neo4j",
+        "fastapi",
+        "docker",
+        "cypher",
+        "postgresql",
+        "mysql",
+        "redis",
+        "kafka",
+        "kubernetes",
+        "minio",
+        "s3",
+        "gitlab",
+        "github",
+    } or re.search(r"(시스템|서비스|플랫폼|데이터베이스|db|api|워크플로우|파이프라인|프로세스)$", normalized):
         return "SYSTEM"
     if normalized in {"rag", "llm", "api", "http", "vector db"}:
         return "CONCEPT"
+    if re.search(r"(정책|규정|가이드|매뉴얼|기준|절차|방법|요건|자격)$", normalized):
+        return "POLICY"
+    if re.search(r"(일정|계획|결과|현황|상태|인원|정원|수량|금액|비용|점수|등급|비율|지표|목표|성과)$", normalized):
+        return "METRIC"
     return "TERM"
 
 
@@ -1008,7 +1227,7 @@ def canonical_entity_name(term: str) -> str:
 
 
 def clean_entity_name(value: str) -> str:
-    value = re.sub(r"^[^\w\uac00-\ud7a3]+|[^\w\uac00-\ud7a3]+$", "", value.strip())
+    value = re.sub(r"^[^\w가-힣]+|[^\w가-힣]+$", "", value.strip())
     value = re.sub(r"\s+", " ", value)
     return value[:80]
 
@@ -1016,9 +1235,9 @@ def clean_entity_name(value: str) -> str:
 def is_entity_candidate(value: str) -> bool:
     if len(value) < 2 or len(value) > 80:
         return False
-    if value.lower() in {"the", "and", "for", "with", "from", "this", "that"}:
+    if value.lower() in {"the", "and", "for", "with", "from", "this", "that", "question", "answer", "return", "extract"}:
         return False
-    return bool(re.search(r"[A-Za-z\uac00-\ud7a3]", value))
+    return bool(re.search(r"[A-Za-z가-힣]", value))
 
 
 def stable_id_prefix(document_id: Any) -> str:
@@ -1088,6 +1307,30 @@ def unique_ordered(values: list[str]) -> list[str]:
         seen.add(key)
         result.append(text)
     return result
+
+
+def normalize_graph_search_entities(raw_entities: Any) -> list[str]:
+    if raw_entities is None:
+        return []
+    if isinstance(raw_entities, str):
+        text = raw_entities.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = [part.strip() for part in text.split(",")]
+        raw_entities = parsed
+    if not isinstance(raw_entities, list):
+        return []
+    return unique_ordered([str(entity).strip() for entity in raw_entities if str(entity).strip()])[:20]
+
+
+def extract_entities_from_query(query: Any) -> list[str]:
+    text = str(query or "").strip()
+    if not text:
+        return []
+    return unique_ordered([match["name"] for match in find_entity_matches(text)])[:20]
 
 
 def model_to_dict(value: Any) -> Any:
