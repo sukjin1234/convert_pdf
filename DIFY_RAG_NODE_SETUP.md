@@ -1,6 +1,6 @@
 # Dify RAG 노드 구성 가이드
 
-이 구성은 Dify를 UI, Knowledge Pipeline, Knowledge Retrieval에 쓰고, 정확도를 좌우하는 PDF 정규화, 표 행 확장, 구조화 조회, 답변 검증은 외부 FastAPI가 맡는 방식이다.
+이 구성은 Dify를 UI, Knowledge Pipeline, Knowledge Retrieval에 쓰고, 정확도를 좌우하는 PDF 정규화, 표 행 확장, 구조화 조회, 답변 검증은 외부 FastAPI가 맡는 방식이다
 
 목표 흐름:
 
