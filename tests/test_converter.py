@@ -57,6 +57,40 @@ class ConverterTest(unittest.TestCase):
     def test_sanitizes_filename(self):
         self.assertEqual(sanitize_filename("../bad:name?.pdf"), "bad_name_.pdf")
 
+    def test_falls_back_when_default_tmp_root_is_not_writable(self):
+        original_mkdtemp = tempfile.mkdtemp
+        with tempfile.TemporaryDirectory() as tmp:
+            fallback_root = Path(tmp)
+            blocked_root = fallback_root / "blocked-root"
+            seen_input_paths = []
+            settings = Settings(
+                tmp_root=blocked_root,
+                qpdf_repair_pdf_on_failure=False,
+                repair_pdf_on_failure=False,
+                rasterize_pdf_on_failure=False,
+            )
+            converter = PdfConverter(settings)
+
+            def fake_mkdtemp(prefix: str, dir: str | Path):
+                if Path(dir) == blocked_root:
+                    raise PermissionError("denied")
+                return original_mkdtemp(prefix=prefix, dir=dir)
+
+            def fake_convert(input_path, _output_dir, _settings):
+                seen_input_paths.append(Path(input_path))
+                return "markdown"
+
+            with (
+                patch("app.converter.tempfile.gettempdir", return_value=str(fallback_root)),
+                patch("app.converter.tempfile.mkdtemp", side_effect=fake_mkdtemp),
+                patch("app.converter._convert_pdf_file", side_effect=fake_convert),
+            ):
+                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "fallback.pdf")
+
+        self.assertEqual(result, "markdown")
+        self.assertEqual(len(seen_input_paths), 1)
+        self.assertEqual(seen_input_paths[0].parents[1], fallback_root)
+
     def test_retries_qpdf_repaired_pdf_after_original_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(

@@ -35,9 +35,8 @@ class PdfConverter:
         if not safe_name.lower().endswith(".pdf"):
             safe_name = f"{Path(safe_name).stem or 'document'}.pdf"
 
-        self.settings.tmp_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="convert-", dir=self.settings.tmp_root) as tmp:
-            tmp_dir = Path(tmp)
+        tmp_dir = _create_conversion_tmp_dir(self.settings)
+        try:
             input_path = tmp_dir / safe_name
             input_path.write_bytes(pdf_bytes)
 
@@ -104,6 +103,8 @@ class PdfConverter:
                     logger.info("Rasterized PDF conversion failed. error=%s", exc)
 
             raise ConversionError("PDF conversion failed after fallback attempts: " + "; ".join(errors))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def _validate_pdf_bytes(self, pdf_bytes: bytes) -> None:
         if not pdf_bytes:
@@ -123,6 +124,29 @@ def sanitize_filename(filename: str) -> str:
     name = Path(filename or "document.pdf").name
     name = re.sub(r"[^A-Za-z0-9_ .-]+", "_", name).strip(" .")
     return name or "document.pdf"
+
+
+def _create_conversion_tmp_dir(settings: Settings) -> Path:
+    candidates = [settings.tmp_root]
+    if not os.getenv("ODL_TMP_ROOT"):
+        system_tmp = Path(tempfile.gettempdir())
+        if system_tmp != settings.tmp_root:
+            candidates.append(system_tmp)
+
+    errors = []
+    for root in candidates:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            return Path(tempfile.mkdtemp(prefix="convert-", dir=root))
+        except OSError as exc:
+            errors.append(f"{root}: {exc}")
+            logger.warning("Conversion temp root is not writable. root=%s error=%s", root, exc)
+
+    raise ConversionError(
+        "Could not create a writable conversion temp directory. "
+        "Set ODL_TMP_ROOT to a directory writable by the FastAPI process. "
+        + "; ".join(errors)
+    )
 
 
 def _convert_pdf_file(
