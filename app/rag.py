@@ -77,6 +77,25 @@ IDENTIFIER_RE = re.compile(
     r"|(?<![A-Za-z0-9_])(?:[A-Z]{2,}-)?\d{3,}[A-Z0-9_-]*(?![A-Za-z0-9_])"
 )
 
+CONCEPT_TERMS = {
+    "storage": ["저장공간", "저장 공간", "스토리지", "용량", "storage", "space", "quota"],
+    "compensation": ["연봉", "급여", "임금", "보상", "인상률", "salary", "compensation", "raise"],
+    "backup": ["백업", "backup", "restore", "복구"],
+    "database": ["데이터베이스", "database", "db"],
+    "location": ["장소", "위치", "location", "place", "venue"],
+    "preparation": ["준비물", "지참", "bring", "required item"],
+    "approval": ["승인", "approval", "approve", "manager approval"],
+    "support": ["지원", "제공", "yes", "supported", "available", "included", "support"],
+    "plan": ["요금제", "plan", "basic", "pro", "enterprise"],
+    "price": ["가격", "비용", "요금", "금액", "price", "cost", "$", "monthly price"],
+    "users": ["유저", "사용자", "users", "included users"],
+    "retention": ["보존", "retention", "retain"],
+    "deprecation": ["폐기", "폐기일", "deprecation", "deprecate"],
+    "replacement": ["대체", "replacement", "replace"],
+}
+
+STRICT_ABSENCE_CONCEPTS = {"storage", "compensation", "backup", "database"}
+
 STOPWORDS = {
     "그리고",
     "또는",
@@ -1264,6 +1283,9 @@ def lookup_matches(
         key=lambda item: (-item["score"], -item["coverage"], item["match_type"]),
     )
     combined = select_evidence_matches(ranked, limit)
+    answerability = assess_answerability(query, active_query_type, active_entities, combined)
+    if not answerability["answerable"]:
+        combined = []
     return {
         "query": query,
         "query_type": active_query_type,
@@ -1278,6 +1300,7 @@ def lookup_matches(
             "selected_count": len(combined),
             "top_score": ranked[0]["score"] if ranked else 0,
             "average_coverage": round(sum(match["coverage"] for match in combined) / len(combined), 3) if combined else 0,
+            "answerability": answerability,
         },
     }
 
@@ -1385,6 +1408,82 @@ def build_evidence_items(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for match in matches
     ]
+
+
+def assess_answerability(
+    query: str,
+    query_type: str,
+    entities: list[str],
+    matches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not matches:
+        return {
+            "answerable": False,
+            "confidence": 0.0,
+            "query_concepts": sorted(detect_concepts(query)),
+            "evidence_concepts": [],
+            "missing_strict_concepts": [],
+            "reason": "no evidence selected",
+        }
+
+    evidence_text = "\n".join(
+        " ".join(
+            [
+                str(match.get("answer") or match.get("answer_hint") or ""),
+                str(match.get("evidence") or ""),
+                str(match.get("supporting_context") or ""),
+                " ".join(str(term) for term in match.get("matched_terms", [])),
+            ]
+        )
+        for match in matches
+    )
+    query_concepts = detect_concepts(" ".join([query, *entities]))
+    evidence_concepts = detect_concepts(evidence_text)
+    missing_strict_concepts = sorted((query_concepts & STRICT_ABSENCE_CONCEPTS) - evidence_concepts)
+    average_coverage = sum(float(match.get("coverage") or 0) for match in matches) / len(matches)
+    top_score = max(float(match.get("score") or 0) for match in matches)
+
+    if missing_strict_concepts:
+        return {
+            "answerable": False,
+            "confidence": 0.2,
+            "query_concepts": sorted(query_concepts),
+            "evidence_concepts": sorted(evidence_concepts),
+            "missing_strict_concepts": missing_strict_concepts,
+            "reason": "query asks for a specific concept that is absent from evidence",
+        }
+
+    weak_signal = average_coverage < 0.12 and top_score < 6.0 and query_type in STRUCTURED_LOOKUP_TYPES
+    if weak_signal:
+        return {
+            "answerable": False,
+            "confidence": 0.35,
+            "query_concepts": sorted(query_concepts),
+            "evidence_concepts": sorted(evidence_concepts),
+            "missing_strict_concepts": [],
+            "reason": "evidence has weak query coverage",
+        }
+
+    return {
+        "answerable": True,
+        "confidence": round(min(0.95, 0.55 + min(average_coverage, 1.0) * 0.35 + min(top_score / 40.0, 0.25)), 3),
+        "query_concepts": sorted(query_concepts),
+        "evidence_concepts": sorted(evidence_concepts),
+        "missing_strict_concepts": [],
+        "reason": "evidence passed answerability checks",
+    }
+
+
+def detect_concepts(text: str) -> set[str]:
+    normalized = normalize_for_match(text)
+    concepts = set()
+    for concept, terms in CONCEPT_TERMS.items():
+        for term in terms:
+            term_norm = normalize_for_match(term)
+            if term_norm and term_norm in normalized:
+                concepts.add(concept)
+                break
+    return concepts
 
 
 def score_record(record: StructuredRecord, terms: list[str], query_type: str) -> float:

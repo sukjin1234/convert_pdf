@@ -40,6 +40,12 @@ class QueryPlanRequest(BaseModel):
     document_id: str | None = None
 
 
+class MarkdownIngestRequest(BaseModel):
+    markdown: str
+    document_id: str | None = None
+    file_name: str = "document.md"
+
+
 class QueryPlanResponse(BaseModel):
     query: str
     document_id: str | None = None
@@ -136,6 +142,21 @@ async def convert_rag(
         return ConvertRagResponse(**payload)
     except Exception as exc:
         logger.exception("PDF RAG conversion failed")
+        return ConvertRagResponse(success=False, error=str(exc))
+
+
+@app.post("/rag/ingest-markdown", response_model=ConvertRagResponse)
+async def rag_ingest_markdown(request: MarkdownIngestRequest) -> ConvertRagResponse:
+    try:
+        artifact = build_rag_artifact(
+            request.markdown,
+            request.file_name or "document.md",
+            document_id=request.document_id,
+        )
+        STORE.upsert(artifact)
+        return ConvertRagResponse(**artifact.to_dict())
+    except Exception as exc:
+        logger.exception("Markdown RAG ingestion failed")
         return ConvertRagResponse(success=False, error=str(exc))
 
 

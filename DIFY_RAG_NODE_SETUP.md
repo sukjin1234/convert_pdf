@@ -422,6 +422,7 @@ def main(lookup_body=None, knowledge_result=None, knowledge_context=None, knowle
         "knowledge_context": "\n\n".join(knowledge_blocks),
         "evidence_context": evidence_context,
         "lookup_diagnostics": json.dumps(diagnostics, ensure_ascii=False),
+        "lookup_answerability": json.dumps(diagnostics.get("answerability") or {}, ensure_ascii=False),
     }
 ```
 
@@ -432,6 +433,7 @@ structured_context: string
 knowledge_context: string
 evidence_context: string
 lookup_diagnostics: string
+lookup_answerability: string
 ```
 
 ### 3.7 LLM: Final Answer
@@ -442,7 +444,9 @@ System Prompt:
 You are a precise RAG answer writer.
 Answer only from the provided evidence.
 If the evidence is insufficient, say that the provided document does not contain enough evidence.
-For numeric, date, policy, requirement, procedure, and troubleshooting answers, preserve exact values and conditions from evidence.
+For numeric, date, policy, requirement, procedure, troubleshooting, identifier, contact, and metric answers, preserve exact values and conditions from evidence.
+Prefer evidence lines that include explicit field labels, table headers, key-value pairs, section titles, page numbers, and record metadata.
+Use labels and metadata to understand what each value refers to.
 Do not invent facts.
 Answer in Korean unless the user asks for another language.
 ```
@@ -465,12 +469,18 @@ Entities:
 Sub queries:
 {{Parse Query Plan.sub_query_text}}
 
+Structured lookup answerability:
+{{Merge Evidence.lookup_answerability}}
+
 Evidence:
 {{Merge Evidence.evidence_context}}
 
-Write a concise answer with the exact supporting facts.
-Prefer evidence lines with field labels like "Resolution: ..." or "모집인원: ...".
-When evidence has page, section, or chunk metadata, use it to avoid mixing unrelated rows.
+Write a concise answer with exact supporting facts.
+Use only the provided evidence.
+When evidence contains labels, table headers, page numbers, section names, or record metadata, use them to avoid mixing unrelated values.
+If structured lookup answerability says answerable=false and the remaining evidence does not directly answer the requested attribute, say that the provided document does not contain enough evidence.
+If the evidence is insufficient, say that the provided document does not contain enough evidence.
+Answer in Korean unless the user asks for another language.
 ```
 
 ### 3.8 Code: Build Verify Body
@@ -667,7 +677,23 @@ file_name: optional
 }
 ```
 
-### 4.2 POST /query/plan
+### 4.2 POST /rag/ingest-markdown
+
+PDF 변환을 거치지 않고 이미 정제된 Markdown을 RAG artifact로 저장할 때 사용한다. 자동 평가나 외부 Markdown 변환기를 붙일 때 유용하다.
+
+요청:
+
+```json
+{
+  "document_id": "manual_001",
+  "file_name": "manual.md",
+  "markdown": "# Manual\n\n..."
+}
+```
+
+응답은 `/convert/rag`와 같은 구조다.
+
+### 4.3 POST /query/plan
 
 요청:
 
@@ -678,7 +704,7 @@ file_name: optional
 }
 ```
 
-### 4.3 POST /lookup
+### 4.4 POST /lookup
 
 요청:
 
@@ -694,7 +720,7 @@ file_name: optional
 
 응답에는 기존 `context` 외에 `answer_style`, `sub_queries`, `evidence_items`, `diagnostics`가 포함된다. Dify에서는 일단 `context`만 써도 되고, 디버깅할 때 `diagnostics.average_coverage`, `diagnostics.selected_count`를 보면 검색 품질을 판단하기 쉽다.
 
-### 4.4 POST /answer/verify
+### 4.5 POST /answer/verify
 
 요청:
 
