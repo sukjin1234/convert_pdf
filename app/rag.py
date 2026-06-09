@@ -227,6 +227,10 @@ QUERY_TYPE_TERMS = {
         "가격",
         "예산",
         "매출",
+        "가용성",
+        "응답시간",
+        "처리시간",
+        "지연시간",
         "비율",
         "율",
         "percent",
@@ -244,6 +248,10 @@ QUERY_TYPE_TERMS = {
         "budget",
         "revenue",
         "quota",
+        "availability",
+        "response time",
+        "latency",
+        "throughput",
     ],
     "date_lookup": [
         "언제",
@@ -258,6 +266,11 @@ QUERY_TYPE_TERMS = {
         "기한",
         "마감일",
         "소요",
+        "주기",
+        "보존",
+        "폐기",
+        "폐기일",
+        "개정일",
         "date",
         "deadline",
         "schedule",
@@ -265,6 +278,11 @@ QUERY_TYPE_TERMS = {
         "start",
         "end",
         "duration",
+        "cycle",
+        "retention",
+        "rotation",
+        "deprecation",
+        "expiry",
     ],
     "table_lookup": [
         "표",
@@ -312,6 +330,8 @@ QUERY_TYPE_TERMS = {
         "예외",
         "가능",
         "불가",
+        "지원",
+        "제공",
         "필수",
         "선택",
         "제외",
@@ -330,6 +350,10 @@ QUERY_TYPE_TERMS = {
         "requirement",
         "condition",
         "eligible",
+        "support",
+        "supported",
+        "available",
+        "included",
         "exception",
         "mandatory",
         "optional",
@@ -1392,13 +1416,15 @@ def score_record(record: StructuredRecord, terms: list[str], query_type: str) ->
                     score += 0.8
     if matched_terms >= 2:
         score += 4.0
-    score += term_coverage(haystack, terms) * 6.0
-    if query_type == "number_lookup" and record.record_type in NUMBER_RECORD_TYPES:
+    coverage = term_coverage(haystack, terms)
+    has_term_signal = matched_terms > 0 or coverage > 0
+    score += coverage * 6.0
+    if query_type == "number_lookup" and has_term_signal and record.record_type in NUMBER_RECORD_TYPES:
         if any(NUMBER_RE.search(value) for value in record.fields.values()):
             score += 5.0
-    if query_type == "date_lookup" and (record.record_type == "date" or DATE_RE.search(record.source_text)):
+    if query_type == "date_lookup" and has_term_signal and (record.record_type == "date" or DATE_RE.search(record.source_text)):
         score += 5.0
-    if query_type == "table_lookup" and record.record_type in TABLE_RECORD_TYPES:
+    if query_type == "table_lookup" and has_term_signal and record.record_type in TABLE_RECORD_TYPES:
         score += 3.0
     query_record_bonus = {
         "condition_lookup": {"requirement"},
@@ -1409,7 +1435,7 @@ def score_record(record: StructuredRecord, terms: list[str], query_type: str) ->
         "definition": {"key_value", "table_row", "policy"},
         "comparison": TABLE_RECORD_TYPES,
     }
-    if record.record_type in query_record_bonus.get(query_type, set()):
+    if has_term_signal and record.record_type in query_record_bonus.get(query_type, set()):
         score += 5.0
     return score
 
@@ -1417,22 +1443,26 @@ def score_record(record: StructuredRecord, terms: list[str], query_type: str) ->
 def score_chunk(chunk: RagChunk, terms: list[str], query_type: str) -> float:
     haystack = normalize_for_match(" ".join([chunk.section_path, chunk.text, " ".join(chunk.keywords), " ".join(chunk.record_types)]))
     score = 0.0
+    exact_term_matches = 0
     for term in terms:
         term_norm = normalize_for_match(term)
         if not term_norm:
             continue
         if term_norm in haystack:
+            exact_term_matches += 1
             score += 2.0
-    score += term_coverage(haystack, terms) * 3.0
-    if query_type == "number_lookup" and NUMBER_RE.search(chunk.text):
+    coverage = term_coverage(haystack, terms)
+    has_term_signal = exact_term_matches > 0 or coverage > 0
+    score += coverage * 3.0
+    if query_type == "number_lookup" and has_term_signal and NUMBER_RE.search(chunk.text):
         score += 1.0
-    if query_type == "date_lookup" and DATE_RE.search(chunk.text):
+    if query_type == "date_lookup" and has_term_signal and DATE_RE.search(chunk.text):
         score += 1.0
-    if query_type == "troubleshooting" and re.search(r"오류|에러|장애|실패|원인|해결|error|failure|incident|resolution", chunk.text, re.IGNORECASE):
+    if has_term_signal and query_type == "troubleshooting" and re.search(r"오류|에러|장애|실패|원인|해결|error|failure|incident|resolution", chunk.text, re.IGNORECASE):
         score += 1.0
-    if query_type == "condition_lookup" and re.search(r"조건|요건|예외|권한|requirement|condition|exception|permission", chunk.text, re.IGNORECASE):
+    if has_term_signal and query_type == "condition_lookup" and re.search(r"조건|요건|예외|권한|requirement|condition|exception|permission|지원|제공|support|available|included", chunk.text, re.IGNORECASE):
         score += 1.0
-    if query_type == "procedure" and re.search(r"절차|단계|방법|workflow|procedure|step|runbook", chunk.text, re.IGNORECASE):
+    if has_term_signal and query_type == "procedure" and re.search(r"절차|단계|방법|workflow|procedure|step|runbook", chunk.text, re.IGNORECASE):
         score += 1.0
     return score
 

@@ -90,6 +90,14 @@ RAG_STORE_DIR                   기본 OS temp/dify-rag-store
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+RAG 품질 평가:
+
+```powershell
+python scripts/eval_rag_quality.py --cases evaluation/rag_quality_cases.json --fail-under 0.90
+```
+
+평가셋은 입학, 기술 운영, 정책/보안, 제품/요금 도메인을 포함합니다. 핵심 지표는 `evidence_recall`, `exact_value_match`, `query_type_accuracy`, `unsupported_guard`입니다.
+
 샘플 PDF 통합 테스트:
 
 ```powershell
