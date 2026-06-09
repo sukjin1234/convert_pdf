@@ -360,19 +360,44 @@ lookup_body = {{Structured Lookup.body}}
 knowledge_result = {{Knowledge Retrieval.result}}
 ```
 
+입력 변수명을 이미 `knowledge_context`로 만들어 둔 경우에도 아래 코드는 그대로 동작한다.
+
 Python:
 
 ```python
 import json
 
-def main(lookup_body, knowledge_result) -> dict:
+def parse_json(value):
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+    return value
+
+def main(lookup_body=None, knowledge_result=None, knowledge_context=None, knowledge_body=None) -> dict:
     lookup = json.loads(lookup_body) if isinstance(lookup_body, str) else (lookup_body or {})
     structured_context = lookup.get("context") or ""
     diagnostics = lookup.get("diagnostics") or {}
 
-    knowledge_items = knowledge_result or []
+    knowledge_source = knowledge_result
+    if knowledge_source is None:
+        knowledge_source = knowledge_context
+    if knowledge_source is None:
+        knowledge_source = knowledge_body
+
+    knowledge_items = parse_json(knowledge_source) or []
     if isinstance(knowledge_items, dict):
-        knowledge_items = knowledge_items.get("result") or knowledge_items.get("records") or []
+        knowledge_items = (
+            knowledge_items.get("result")
+            or knowledge_items.get("records")
+            or knowledge_items.get("data")
+            or knowledge_items.get("documents")
+            or []
+        )
 
     knowledge_blocks = []
     for index, item in enumerate(knowledge_items[:12], start=1):
