@@ -21,9 +21,10 @@ class RagQualityEvalTest(unittest.TestCase):
         results = [evaluate_case(case, artifacts, limit=8) for case in payload["cases"]]
         summary = summarize(results)
 
-        self.assertGreaterEqual(summary["pass_rate"], 0.90)
+        self.assertGreaterEqual(summary["pass_rate"], 0.95)
         self.assertGreaterEqual(summary["evidence_recall"], 0.95)
         self.assertGreaterEqual(summary["exact_value_match"], 0.95)
+        self.assertGreaterEqual(summary["answerable_detection"], 0.95)
         self.assertGreaterEqual(summary["unsupported_guard"], 0.95)
 
 

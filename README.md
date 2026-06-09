@@ -7,6 +7,7 @@ OpenDataLoader로 PDF를 Markdown으로 변환하고, Dify RAG에 바로 넣을 
 ```text
 POST /convert      기존 호환용 PDF -> Markdown
 POST /convert/rag  PDF -> Dify 저장용 Markdown + chunks + records
+POST /rag/ingest-markdown Markdown -> RAG artifact 저장
 POST /query/plan   질문 유형/키워드/하위질문/검색어 확장
 POST /lookup       구조화 레코드 exact lookup + evidence packing
 POST /answer/verify 답변 숫자/날짜/식별자 근거 검증
@@ -93,7 +94,13 @@ python -m unittest discover -s tests -p "test_*.py" -v
 RAG 품질 평가:
 
 ```powershell
-python scripts/eval_rag_quality.py --cases evaluation/rag_quality_cases.json --fail-under 0.90
+python scripts/eval_rag_quality.py --cases evaluation/rag_quality_cases.json --fail-under 0.95
+```
+
+실행 중인 FastAPI 서버를 통한 HTTP 품질 평가:
+
+```powershell
+python scripts/eval_rag_http.py --base-url http://127.0.0.1:8000 --cases evaluation/rag_quality_cases.json --fail-under 0.95
 ```
 
 평가셋은 입학, 기술 운영, 정책/보안, 제품/요금 도메인을 포함합니다. 핵심 지표는 `evidence_recall`, `exact_value_match`, `query_type_accuracy`, `unsupported_guard`입니다.

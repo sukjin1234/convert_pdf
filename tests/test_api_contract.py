@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from fastapi import UploadFile
 
-from app.main import ConvertResponse, convert
+from app.main import ConvertResponse, MarkdownIngestRequest, convert, rag_ingest_markdown
 
 
 class ApiContractTest(unittest.IsolatedAsyncioTestCase):
@@ -26,6 +26,29 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.success)
         self.assertEqual(response.markdown, "# Converted")
         converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "policy.pdf")
+
+    async def test_rag_ingest_markdown_builds_artifact(self):
+        response = await rag_ingest_markdown(
+            MarkdownIngestRequest(
+                document_id="doc_markdown_test",
+                file_name="manual.md",
+                markdown="""
+--- Page 1 ---
+
+# Manual
+
+| Item | Value |
+| --- | --- |
+| API Limit | 1000 req/s |
+""",
+            )
+        )
+
+        self.assertTrue(response.success)
+        self.assertEqual(response.document_id, "doc_markdown_test")
+        self.assertGreaterEqual(len(response.chunks), 1)
+        self.assertGreaterEqual(len(response.records), 1)
+        self.assertIn("API Limit", response.dify_markdown)
 
 
 if __name__ == "__main__":

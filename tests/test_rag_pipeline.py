@@ -193,6 +193,14 @@ class RagPipelineTest(unittest.TestCase):
         self.assertIn("Search API 차이 비교해줘", plan["sub_queries"])
         self.assertNotIn("API와", plan["keywords"])
 
+    def test_list_style_question_uses_table_lookup(self):
+        plan = plan_query("전공심화 개설 학과 알려줘")
+
+        self.assertEqual(plan["query_type"], "table_lookup")
+        self.assertEqual(plan["answer_style"], "table_or_bullets")
+        self.assertIn("전공심화", plan["keywords"])
+        self.assertTrue(plan["retrieval_hints"]["prefer_structured_lookup"])
+
     def test_lookup_packs_supporting_context_for_record_matches(self):
         artifact = build_rag_artifact(
             """
@@ -232,6 +240,52 @@ API 키 교체 후에는 감사 로그에서 발급자를 확인해야 한다.
         self.assertFalse(result["valid"])
         self.assertIn("AUTH_999", result["answer_identifiers"])
         self.assertTrue(any(issue["type"] == "unsupported_identifier" for issue in result["issues"]))
+
+    def test_verify_rejects_abstention_when_structured_lookup_has_answer(self):
+        result = verify_answer(
+            "전공심화 개설 학과 알려줘",
+            "제공된 문서에는 충분한 근거가 없습니다.",
+            [
+                "[Structured Lookup - authoritative exact evidence]\n"
+                "[match_type: structured_record]\n"
+                "[section: 전공심화과정 개설 학과]\n"
+                "answer_candidate: 컴퓨터정보공학과, 기계공학과\n"
+                "evidence:\n"
+                "과정: 전공심화\n"
+                "개설 학과: 컴퓨터정보공학과, 기계공학과"
+            ],
+        )
+
+        self.assertFalse(result["valid"])
+        self.assertTrue(any(issue["type"] == "unnecessary_abstention" for issue in result["issues"]))
+
+    def test_lookup_rejects_missing_specific_attribute(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# Product and Pricing Manual
+
+| Plan | Monthly Price | Included Users | Support SLA |
+| --- | --- | --- | --- |
+| Basic | $29 | 5 users | 2 business days |
+| Enterprise | Custom | Unlimited | 2 hours |
+""",
+            "product_manual.pdf",
+            document_id="doc_product",
+        )
+
+        result = lookup_matches(
+            query="Enterprise 저장공간 한도는 얼마야?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=5,
+        )
+
+        self.assertEqual(result["matches"], [])
+        self.assertEqual(result["context"], "")
+        self.assertFalse(result["diagnostics"]["answerability"]["answerable"])
+        self.assertIn("storage", result["diagnostics"]["answerability"]["missing_strict_concepts"])
 
 
 if __name__ == "__main__":

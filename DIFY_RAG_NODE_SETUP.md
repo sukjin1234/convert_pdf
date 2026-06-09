@@ -157,11 +157,14 @@ record_count: number
 권장 설정:
 
 ```text
-Parent chunk size: 1000~1600 tokens
-Child chunk size: 250~450 tokens
-Overlap: 50~100 tokens
-Separator: 기본값 또는 Markdown paragraph 기준
+Parent mode: Paragraph
+Parent delimiter: Markdown heading/paragraph 기준
+Parent maximum chunk length: 1200~1800 characters
+Child delimiter: newline 또는 sentence 기준
+Child maximum chunk length: 250~500 characters
 ```
+
+Dify 공식 문서 기준으로 `Parent-child Chunker`에는 별도 `Chunk Overlap` 설정이 없다. Overlap이 필요한 경우 `General Chunker`에서만 직접 설정할 수 있고, Parent-child에서는 parent chunk를 약간 크게 잡고 child delimiter를 촘촘하게 잡아 문맥 손실을 줄인다.
 
 ### 2.5 Knowledge Base Node
 
@@ -409,18 +412,31 @@ def main(lookup_body=None, knowledge_result=None, knowledge_context=None, knowle
         else:
             knowledge_blocks.append(f"[knowledge {index}]\n{item}")
 
-    evidence_context = "\n\n".join(
-        part for part in [
-            "[Structured Lookup]\n" + structured_context if structured_context else "",
-            "[Knowledge Retrieval]\n" + "\n\n".join(knowledge_blocks) if knowledge_blocks else "",
-        ]
-        if part
+    structured_block = (
+        "[Structured Lookup - authoritative exact evidence]\n"
+        "Use this first for table, list, field, value, number, date, identifier, and policy questions.\n"
+        + structured_context
+        if structured_context
+        else ""
+    )
+    knowledge_block = (
+        "[Knowledge Retrieval - supplementary semantic evidence]\n"
+        + "\n\n".join(knowledge_blocks)
+        if knowledge_blocks
+        else ""
+    )
+    evidence_context = "\n\n".join(part for part in [structured_block, knowledge_block] if part)
+    evidence_priority = (
+        "Use Structured Lookup first. Knowledge Retrieval is supplementary and may be empty or less specific."
+        if structured_context
+        else "Use Knowledge Retrieval only because Structured Lookup is empty."
     )
 
     return {
         "structured_context": structured_context,
         "knowledge_context": "\n\n".join(knowledge_blocks),
         "evidence_context": evidence_context,
+        "evidence_priority": evidence_priority,
         "lookup_diagnostics": json.dumps(diagnostics, ensure_ascii=False),
         "lookup_answerability": json.dumps(diagnostics.get("answerability") or {}, ensure_ascii=False),
     }
@@ -432,6 +448,7 @@ def main(lookup_body=None, knowledge_result=None, knowledge_context=None, knowle
 structured_context: string
 knowledge_context: string
 evidence_context: string
+evidence_priority: string
 lookup_diagnostics: string
 lookup_answerability: string
 ```
@@ -472,11 +489,18 @@ Sub queries:
 Structured lookup answerability:
 {{Merge Evidence.lookup_answerability}}
 
+Evidence priority:
+{{Merge Evidence.evidence_priority}}
+
 Evidence:
 {{Merge Evidence.evidence_context}}
 
 Write a concise answer with exact supporting facts.
 Use only the provided evidence.
+Structured Lookup is authoritative exact evidence from parsed tables, records, and field-value pairs.
+If Structured Lookup contains an answer_candidate or directly relevant evidence, answer from Structured Lookup even when Knowledge Retrieval is empty, broad, or less specific.
+Use Knowledge Retrieval only as supplementary context.
+For table, list, field, value, number, date, identifier, and policy questions, do not ignore Structured Lookup just because Knowledge Retrieval has no exact match.
 When evidence contains labels, table headers, page numbers, section names, or record metadata, use them to avoid mixing unrelated values.
 If structured lookup answerability says answerable=false and the remaining evidence does not directly answer the requested attribute, say that the provided document does not contain enough evidence.
 If the evidence is insufficient, say that the provided document does not contain enough evidence.
@@ -632,10 +656,14 @@ Previous answer:
 Verification issues:
 {{Parse Verify Result.issues_text}}
 
+Evidence priority:
+{{Merge Evidence.evidence_priority}}
+
 Evidence:
 {{Merge Evidence.evidence_context}}
 
 Rewrite the answer using only the evidence.
+If Structured Lookup contains an answer_candidate or directly relevant evidence, answer from Structured Lookup even when Knowledge Retrieval is empty or less specific.
 Fix unsupported numbers, unsupported dates, and claims without evidence.
 If the evidence is insufficient, say that the provided document does not contain enough evidence.
 Answer in Korean.

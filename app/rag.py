@@ -77,6 +77,17 @@ IDENTIFIER_RE = re.compile(
     r"|(?<![A-Za-z0-9_])(?:[A-Z]{2,}-)?\d{3,}[A-Z0-9_-]*(?![A-Za-z0-9_])"
 )
 
+ABSTENTION_RE = re.compile(
+    r"충분한\s*근거|근거가\s*(?:부족|충분하지)|정보가\s*(?:없|부족)|"
+    r"확인할\s*수\s*없|알\s*수\s*없|찾을\s*수\s*없|"
+    r"문서(?:에는|에서)?\s*(?:확인|찾|포함).*없|"
+    r"제공된\s*문서.*(?:없|부족|포함되어\s*있지)|"
+    r"not\s+enough\s+evidence|insufficient\s+evidence|does\s+not\s+contain",
+    re.IGNORECASE,
+)
+
+ANSWER_CANDIDATE_RE = re.compile(r"(?m)^answer_candidate:\s*(.+?)\s*$")
+
 CONCEPT_TERMS = {
     "storage": ["저장공간", "저장 공간", "스토리지", "용량", "storage", "space", "quota"],
     "compensation": ["연봉", "급여", "임금", "보상", "인상률", "salary", "compensation", "raise"],
@@ -221,6 +232,14 @@ IMPORTANT_TERMS = [
     "수시",
     "정시",
     "학생부",
+    "목록",
+    "리스트",
+    "명단",
+    "개설",
+    "학과",
+    "부서",
+    "종류",
+    "카테고리",
 ]
 
 QUERY_TYPE_TERMS = {
@@ -307,14 +326,37 @@ QUERY_TYPE_TERMS = {
         "표",
         "목록",
         "리스트",
+        "명단",
         "행",
         "열",
         "항목",
+        "종류",
+        "분류",
+        "카테고리",
+        "어떤",
+        "어느",
+        "무슨",
+        "개설",
+        "학과",
+        "부서",
+        "팀",
+        "제품",
+        "서비스",
         "전형별",
         "항목별",
         "비교표",
         "table",
         "list",
+        "catalog",
+        "category",
+        "type",
+        "kind",
+        "available",
+        "offered",
+        "department",
+        "team",
+        "service",
+        "product",
         "row",
         "column",
         "matrix",
@@ -1168,7 +1210,7 @@ def classify_answer_style(query: str, query_type: str) -> str:
         return "summarize"
     if query_type == "procedure":
         return "steps"
-    if re.search(r"표|목록|리스트|list|table", lower):
+    if re.search(r"표|목록|리스트|명단|항목|종류|카테고리|어떤|어느|무슨|개설|list|table|catalog|category|available|offered", lower):
         return "table_or_bullets"
     if query_type in {"number_lookup", "date_lookup", "contact_lookup"}:
         return "direct"
@@ -1184,7 +1226,7 @@ def build_query_variants(query: str, keywords: list[str], query_type: str) -> li
     elif query_type == "date_lookup":
         variants.append(" ".join(unique_keep_order([*keywords, "날짜", "일정", "기간", "기한", "시작", "종료", "date", "deadline", "schedule", "duration"])))
     elif query_type == "table_lookup":
-        variants.append(" ".join(unique_keep_order([*keywords, "표", "행", "열", "항목", "table", "row", "column", "record"])))
+        variants.append(" ".join(unique_keep_order([*keywords, "표", "목록", "리스트", "명단", "행", "열", "항목", "종류", "table", "list", "catalog", "row", "column", "record"])))
     elif query_type == "procedure":
         variants.append(" ".join(unique_keep_order([*keywords, "절차", "단계", "방법", "워크플로우", "procedure", "step", "workflow", "runbook"])))
     elif query_type == "condition_lookup":
@@ -1697,6 +1739,14 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
             }
         )
 
+    if is_abstention_answer(answer) and evidence_has_answer_candidate(question, evidence_text, query_type):
+        issues.append(
+            {
+                "type": "unnecessary_abstention",
+                "message": "The answer says evidence is insufficient, but structured evidence contains an answer candidate.",
+            }
+        )
+
     severe_issue_types = {
         "empty_answer",
         "missing_evidence",
@@ -1705,6 +1755,7 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
         "unsupported_number",
         "unsupported_date",
         "unsupported_identifier",
+        "unnecessary_abstention",
     }
     valid = not any(issue["type"] in severe_issue_types for issue in issues)
     if valid and not issues:
@@ -1726,6 +1777,27 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
         "answer_identifiers": answer_identifiers,
         "evidence_identifiers": evidence_identifiers[:20],
     }
+
+
+def is_abstention_answer(answer: str) -> bool:
+    return bool(ABSTENTION_RE.search(answer or ""))
+
+
+def evidence_has_answer_candidate(question: str, evidence_text: str, query_type: str) -> bool:
+    if not evidence_text.strip():
+        return False
+
+    for match in ANSWER_CANDIDATE_RE.finditer(evidence_text):
+        candidate = clean_cell(match.group(1))
+        if candidate and candidate not in {"-", "N/A", "None", "null"}:
+            return True
+
+    if "[Structured Lookup" not in evidence_text:
+        return False
+
+    terms = extract_keywords(question, limit=8)
+    coverage = term_coverage(evidence_text, terms)
+    return query_type in STRUCTURED_LOOKUP_TYPES and coverage >= 0.1
 
 
 def evidence_to_text(evidence: list[Any]) -> str:
