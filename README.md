@@ -1,6 +1,18 @@
-# Dify OpenDataLoader PDF Markdown API
+# Dify OpenDataLoader RAG API
 
-이 프로젝트는 Dify 지식 파이프라인의 API Request/HTTP Request 노드가 호출할 수 있는 PDF -> Markdown 변환 API입니다. 변환은 OpenDataLoader `docling-fast` hybrid를 항상 사용하며, `/convert` 응답 본문은 `success`, `markdown` 두 필드만 반환합니다.
+OpenDataLoader로 PDF를 Markdown으로 변환하고, Dify RAG에 바로 넣을 수 있도록 표 행 확장, chunk metadata, structured records, lookup, answer verification을 제공하는 FastAPI 서버입니다.
+
+핵심 엔드포인트:
+
+```text
+POST /convert      기존 호환용 PDF -> Markdown
+POST /convert/rag  PDF -> Dify 저장용 Markdown + chunks + records
+POST /query/plan   질문 유형/키워드/검색어 확장
+POST /lookup       구조화 레코드 exact lookup
+POST /answer/verify 답변 숫자/날짜 근거 검증
+GET  /rag/documents 저장된 RAG artifact 목록
+GET  /health
+```
 
 ## 실행
 
@@ -10,62 +22,77 @@ opendataloader-pdf-hybrid --port 5002 --ocr-lang "ko,en" --enrich-picture-descri
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-스캔 PDF가 많으면 하이브리드 백엔드를 아래처럼 실행합니다. OCR 때문에 1분을 넘길 가능성이 더 큽니다.
+스캔 PDF가 많으면 OCR을 강제합니다.
 
 ```powershell
 opendataloader-pdf-hybrid --port 5002 --force-ocr --ocr-lang "ko,en" --enrich-picture-description
 ```
 
-## Dify 노드 설정
+## Dify 연결
 
-지식 파이프라인에서 API Request/HTTP Request 노드를 추가하고 다음 중 하나로 호출합니다.
+전체 노드 구성은 [DIFY_RAG_NODE_SETUP.md](DIFY_RAG_NODE_SETUP.md)를 봅니다.
 
-`multipart/form-data`:
+Knowledge Pipeline에서는 `/convert/rag`를 호출하고, 응답의 `dify_markdown`만 Knowledge Base에 저장합니다.
 
-- Method: `POST`
-- URL: `http://<converter-host>:8000/convert`
-- Body: Form Data, 파일 필드에 PDF 파일 변수 지정
-- Response variables: `body.success`, `body.markdown`
+`/convert/rag`는 multipart form-data입니다. 이 노드에서는 `Content-Type` 헤더를 직접 넣지 않습니다.
 
-Binary body:
-
-- Method: `POST`
-- URL: `http://<converter-host>:8000/convert`
-- Headers: `Content-Type: application/pdf`, `X-Filename: {{파일명 변수}}`
-- Body: Binary, PDF 파일 변수 지정
-- Response variables: `body.success`, `body.markdown`
-
-JSON URL:
-
-```json
-{
-  "file_url": "{{PDF URL 변수}}",
-  "filename": "{{파일명 변수}}"
-}
+```text
+Method: POST
+URL: http://<fastapi-host>:8000/convert/rag
+Body Type: form-data
+pdf          File  {{File.file}}
+document_id  Text  {{File.file.related_id}}
+file_name    Text  {{File.file.name}}
 ```
 
-Dify 노드의 read timeout은 `70~90s`로 설정합니다. API 내부 기본 변환 제한은 70초이고, OpenDataLoader hybrid backend 요청 제한은 60초입니다.
+Chatflow의 JSON/Raw HTTP 노드에서는 다음 헤더만 넣습니다.
 
-## RAG 저장 품질 설정
+```text
+Content-Type: application/json
+```
 
-- 제목/소제목/본문: OpenDataLoader JSON의 `heading`, `paragraph`, `list` 구조를 Markdown으로 재렌더링합니다.
-- 표: OpenDataLoader `--table-method cluster`와 hybrid backend를 사용하고, JSON table rows/cells를 Markdown table로 변환합니다.
-- 이미지/차트: 클라이언트는 `--hybrid-mode full`로 실행됩니다. 백엔드는 `--enrich-picture-description` 옵션으로 시작해야 이미지 설명이 Markdown 흐름에 들어갑니다.
-- Hybrid 강제: 변환 명령에 `--hybrid docling-fast`를 항상 넣고 `--hybrid-fallback`은 사용하지 않습니다.
-- 시간 제한: `ODL_CONVERSION_TIMEOUT_SECONDS` 기본값은 `70`, `ODL_HYBRID_TIMEOUT_MS` 기본값은 `60000`입니다.
+## 수동 테스트
+
+```powershell
+curl.exe http://127.0.0.1:8000/health
+
+curl.exe -F "pdf=@2026학년도 입학전형 신입생 모집요강.pdf" -F "document_id=sample_2026" -F "file_name=2026_admission.pdf" http://127.0.0.1:8000/convert/rag
+```
+
+조회 테스트:
+
+```powershell
+curl.exe -H "Content-Type: application/json" -d "{\"query\":\"컴퓨터정보공학과 모집인원 알려줘\"}" http://127.0.0.1:8000/query/plan
+```
 
 ## 환경 변수
 
-- `ODL_HYBRID_URL`: 기본 `http://localhost:5002`
-- `ODL_HYBRID_MODE`: 기본 `full`, 허용값 `full` 또는 `auto`
-- `ODL_CONVERSION_TIMEOUT_SECONDS`: 기본 `70`
-- `ODL_HYBRID_TIMEOUT_MS`: 기본 `60000`
-- `ODL_MAX_PDF_BYTES`: 기본 `83886080`
-- `ODL_TABLE_METHOD`: 기본 `cluster`
-- `ODL_USE_STRUCT_TREE`: 기본 `false`
+```text
+ODL_HYBRID_URL                  기본 http://localhost:5002
+ODL_HYBRID_MODE                 기본 auto, 허용값 auto/full
+ODL_CONVERSION_TIMEOUT_SECONDS  기본 360
+ODL_HYBRID_TIMEOUT_MS           기본 300000
+ODL_MAX_PDF_BYTES               기본 83886080
+ODL_TABLE_METHOD                기본 cluster
+ODL_USE_STRUCT_TREE             기본 false
+RAG_STORE_DIR                   기본 OS temp/dify-rag-store
+```
+
+`RAG_STORE_DIR`에는 `/convert/rag` 결과 artifact가 JSON으로 저장됩니다. API 서버가 재시작되어도 `/lookup`이 이전 records를 다시 로드할 수 있습니다.
 
 ## 테스트
+
+기본 단위 테스트:
 
 ```powershell
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
+
+샘플 PDF 통합 테스트:
+
+```powershell
+$env:RUN_SAMPLE_PDF_TEST="1"
+python -m unittest tests.test_sample_pdf_contract -v
+```
+
+통합 테스트는 `opendataloader-pdf` CLI와 `opendataloader-pdf-hybrid` 백엔드가 실행 가능한 환경에서만 돌립니다.
