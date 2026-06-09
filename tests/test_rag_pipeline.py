@@ -116,6 +116,8 @@ class RagPipelineTest(unittest.TestCase):
         self.assertEqual(artifact.records[0].fields["Error Code"], "AUTH_401")
         self.assertGreaterEqual(len(result["matches"]), 1)
         self.assertIn("AUTH_401", result["context"])
+        self.assertIn("Error Code: AUTH_401", result["context"])
+        self.assertIn("Resolution: Reissue API key", result["context"])
         self.assertIn("Reissue API key", result["context"])
 
     def test_sla_metric_table_lookup(self):
@@ -181,6 +183,55 @@ class RagPipelineTest(unittest.TestCase):
         self.assertEqual(artifact.records[0].record_type, "contact")
         self.assertGreaterEqual(len(result["matches"]), 1)
         self.assertIn("finops@example.com", result["context"])
+
+    def test_plan_exposes_sub_queries_and_answer_style(self):
+        plan = plan_query("Billing API와 Search API 차이 비교해줘")
+
+        self.assertEqual(plan["query_type"], "comparison")
+        self.assertEqual(plan["answer_style"], "compare")
+        self.assertIn("Billing API", plan["sub_queries"])
+        self.assertIn("Search API 차이 비교해줘", plan["sub_queries"])
+        self.assertNotIn("API와", plan["keywords"])
+
+    def test_lookup_packs_supporting_context_for_record_matches(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 3 ---
+
+# 장애 대응
+
+API 키 교체 후에는 감사 로그에서 발급자를 확인해야 한다.
+
+| Error Code | Cause | Resolution |
+| --- | --- | --- |
+| AUTH_401 | Missing token | Reissue API key |
+""",
+            "runbook.pdf",
+            document_id="doc_runbook",
+        )
+
+        result = lookup_matches(
+            query="AUTH_401 해결 후 확인할 것",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=2,
+        )
+
+        self.assertGreaterEqual(len(result["matches"]), 1)
+        self.assertIn("supporting_context", result["context"])
+        self.assertIn("감사 로그", result["context"])
+        self.assertGreater(result["diagnostics"]["average_coverage"], 0)
+
+    def test_verify_rejects_unsupported_identifier(self):
+        result = verify_answer(
+            "AUTH_401 해결 방법 알려줘",
+            "AUTH_999는 API 키를 재발급하면 됩니다.",
+            ["Error Code: AUTH_401\nResolution: Reissue API key"],
+        )
+
+        self.assertFalse(result["valid"])
+        self.assertIn("AUTH_999", result["answer_identifiers"])
+        self.assertTrue(any(issue["type"] == "unsupported_identifier" for issue in result["issues"]))
 
 
 if __name__ == "__main__":

@@ -264,10 +264,13 @@ def main(body) -> dict:
         "query": data.get("query", ""),
         "document_id": data.get("document_id") or "",
         "query_type": data.get("query_type", "semantic"),
+        "answer_style": data.get("answer_style", "grounded_explanation"),
         "entities": entities,
         "keywords": keywords,
+        "sub_queries": data.get("sub_queries") or [],
         "expanded_queries": expanded_queries,
         "entities_text": ", ".join(entities),
+        "sub_query_text": "\n".join(data.get("sub_queries") or []),
         "expanded_query_text": "\n".join(expanded_queries),
     }
 ```
@@ -278,10 +281,13 @@ def main(body) -> dict:
 query: string
 document_id: string
 query_type: string
+answer_style: string
 entities: array[string]
 keywords: array[string]
+sub_queries: array[string]
 expanded_queries: array[string]
 entities_text: string
+sub_query_text: string
 expanded_query_text: string
 ```
 
@@ -362,6 +368,7 @@ import json
 def main(lookup_body, knowledge_result) -> dict:
     lookup = json.loads(lookup_body) if isinstance(lookup_body, str) else (lookup_body or {})
     structured_context = lookup.get("context") or ""
+    diagnostics = lookup.get("diagnostics") or {}
 
     knowledge_items = knowledge_result or []
     if isinstance(knowledge_items, dict):
@@ -389,6 +396,7 @@ def main(lookup_body, knowledge_result) -> dict:
         "structured_context": structured_context,
         "knowledge_context": "\n\n".join(knowledge_blocks),
         "evidence_context": evidence_context,
+        "lookup_diagnostics": json.dumps(diagnostics, ensure_ascii=False),
     }
 ```
 
@@ -398,6 +406,7 @@ def main(lookup_body, knowledge_result) -> dict:
 structured_context: string
 knowledge_context: string
 evidence_context: string
+lookup_diagnostics: string
 ```
 
 ### 3.7 LLM: Final Answer
@@ -422,13 +431,21 @@ Question:
 Query type:
 {{Parse Query Plan.query_type}}
 
+Answer style:
+{{Parse Query Plan.answer_style}}
+
 Entities:
 {{Parse Query Plan.entities_text}}
+
+Sub queries:
+{{Parse Query Plan.sub_query_text}}
 
 Evidence:
 {{Merge Evidence.evidence_context}}
 
 Write a concise answer with the exact supporting facts.
+Prefer evidence lines with field labels like "Resolution: ..." or "모집인원: ...".
+When evidence has page, section, or chunk metadata, use it to avoid mixing unrelated rows.
 ```
 
 ### 3.8 Code: Build Verify Body
@@ -649,6 +666,8 @@ file_name: optional
   "limit": 8
 }
 ```
+
+응답에는 기존 `context` 외에 `answer_style`, `sub_queries`, `evidence_items`, `diagnostics`가 포함된다. Dify에서는 일단 `context`만 써도 되고, 디버깅할 때 `diagnostics.average_coverage`, `diagnostics.selected_count`를 보면 검색 품질을 판단하기 쉽다.
 
 ### 4.4 POST /answer/verify
 

@@ -7,9 +7,9 @@ OpenDataLoader로 PDF를 Markdown으로 변환하고, Dify RAG에 바로 넣을 
 ```text
 POST /convert      기존 호환용 PDF -> Markdown
 POST /convert/rag  PDF -> Dify 저장용 Markdown + chunks + records
-POST /query/plan   질문 유형/키워드/검색어 확장
-POST /lookup       구조화 레코드 exact lookup
-POST /answer/verify 답변 숫자/날짜 근거 검증
+POST /query/plan   질문 유형/키워드/하위질문/검색어 확장
+POST /lookup       구조화 레코드 exact lookup + evidence packing
+POST /answer/verify 답변 숫자/날짜/식별자 근거 검증
 GET  /rag/documents 저장된 RAG artifact 목록
 GET  /health
 ```
@@ -50,6 +50,8 @@ Chatflow의 JSON/Raw HTTP 노드에서는 다음 헤더만 넣습니다.
 ```text
 Content-Type: application/json
 ```
+
+`/lookup` 응답의 `context`는 Dify LLM에 바로 넣는 evidence 본문입니다. 추가로 `evidence_items`, `diagnostics`, `answer_style`, `sub_queries`가 들어오므로 디버깅과 프롬프트 분기에 사용할 수 있습니다.
 
 ## 수동 테스트
 

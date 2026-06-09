@@ -39,6 +39,10 @@ STRUCTURED_LOOKUP_TYPES = {
     "dependency_lookup",
 }
 
+CONTEXT_CHAR_BUDGET = 12_000
+MATCH_EVIDENCE_CHAR_LIMIT = 1_800
+SUPPORTING_CONTEXT_CHAR_LIMIT = 1_400
+
 NUMBER_RECORD_TYPES = {"quantity", "quota", "money", "metric", "table_row", "key_value"}
 TABLE_RECORD_TYPES = {
     "quantity",
@@ -54,6 +58,7 @@ TABLE_RECORD_TYPES = {
     "status",
     "identifier",
     "version",
+    "policy",
     "table_row",
     "key_value",
 }
@@ -64,6 +69,12 @@ VALUE_FIELD_RE = re.compile(
     r"count|quantity|capacity|limit|threshold|amount|cost|price|budget|revenue|score|grade|rate|ratio|"
     r"percent|date|time|deadline|duration|status|version|code|id|identifier|email|phone|contact",
     re.IGNORECASE,
+)
+
+IDENTIFIER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]{1,}(?:[_-][A-Z0-9]+)+(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9._%+-])"
+    r"|(?<![A-Za-z0-9_])(?:[A-Z]{2,}-)?\d{3,}[A-Z0-9_-]*(?![A-Za-z0-9_])"
 )
 
 STOPWORDS = {
@@ -308,6 +319,14 @@ QUERY_TYPE_TERMS = {
         "허용",
         "의무",
         "권한",
+        "정책",
+        "규정",
+        "계약",
+        "조항",
+        "약관",
+        "준수",
+        "승인",
+        "감사",
         "requirement",
         "condition",
         "eligible",
@@ -318,6 +337,14 @@ QUERY_TYPE_TERMS = {
         "allowed",
         "forbidden",
         "permission",
+        "policy",
+        "rule",
+        "contract",
+        "clause",
+        "terms",
+        "compliance",
+        "approval",
+        "audit",
     ],
     "troubleshooting": [
         "오류",
@@ -973,6 +1000,8 @@ def classify_record(fields: dict[str, str], source_text: str) -> str:
         return "status"
     if re.search(r"버전|릴리스|개정|revision|version|release|build", haystack):
         return "version"
+    if re.search(r"정책|규정|계약|조항|약관|준수|승인|감사|보존|policy|rule|contract|clause|terms|compliance|approval|audit|retention", haystack):
+        return "policy"
     if re.search(r"코드|식별자|번호|id|identifier|code|key", haystack):
         return "identifier"
     if re.search(r"조건|자격|요건|대상|예외|필수|선택|제외|금지|허용|의무|권한|requirement|condition|eligible|exception|mandatory|optional|forbidden|allowed|permission", haystack):
@@ -1039,18 +1068,25 @@ def plan_query(query: str, document_id: str | None = None) -> dict[str, Any]:
     normalized_query = clean_cell(query)
     keywords = extract_keywords(normalized_query, limit=16)
     query_type = classify_query_type(normalized_query)
+    sub_queries = split_sub_queries(normalized_query, keywords)
     expanded_queries = build_query_variants(normalized_query, keywords, query_type)
+    expanded_queries = unique_keep_order([*expanded_queries, *sub_queries])
+    answer_style = classify_answer_style(normalized_query, query_type)
     return {
         "query": normalized_query,
         "document_id": document_id,
         "query_type": query_type,
         "entities": keywords,
         "keywords": keywords,
+        "sub_queries": sub_queries,
         "expanded_queries": expanded_queries,
+        "answer_style": answer_style,
         "retrieval_hints": {
             "prefer_structured_lookup": query_type in STRUCTURED_LOOKUP_TYPES,
             "prefer_exact_terms": keywords[:8],
             "answer_must_include_evidence": True,
+            "answer_style": answer_style,
+            "min_evidence_count": 2 if query_type in {"comparison", "summary"} else 1,
         },
     }
 
@@ -1067,6 +1103,33 @@ def classify_query_type(query: str) -> str:
         scores["date_lookup"] += 2
     best_type, best_score = max(scores.items(), key=lambda item: item[1])
     return best_type if best_score > 0 else "semantic"
+
+
+def split_sub_queries(query: str, keywords: list[str]) -> list[str]:
+    parts = [
+        clean_cell(part)
+        for part in re.split(r"\s+(?:그리고|또한|및|\band\b|\bor\b)\s+|(?<=[A-Za-z0-9가-힣])(?:와|과)\s+|[,;/]\s*", query)
+        if clean_cell(part)
+    ]
+    useful_parts = [part for part in parts if len(part) >= 4]
+    if 1 < len(useful_parts) <= 5:
+        return unique_keep_order([query, *useful_parts, *keywords[:5]])
+    return unique_keep_order([query, *keywords[:5]])
+
+
+def classify_answer_style(query: str, query_type: str) -> str:
+    lower = query.lower()
+    if query_type == "comparison":
+        return "compare"
+    if query_type == "summary":
+        return "summarize"
+    if query_type == "procedure":
+        return "steps"
+    if re.search(r"표|목록|리스트|list|table", lower):
+        return "table_or_bullets"
+    if query_type in {"number_lookup", "date_lookup", "contact_lookup"}:
+        return "direct"
+    return "grounded_explanation"
 
 
 def build_query_variants(query: str, keywords: list[str], query_type: str) -> list[str]:
@@ -1110,6 +1173,7 @@ def lookup_matches(
     active_query_type = query_type or plan["query_type"]
     terms = normalize_terms([query, *active_entities])
     chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+    chunk_order = {chunk.chunk_id: index for index, chunk in enumerate(chunks)}
 
     record_matches = []
     for record in records:
@@ -1117,6 +1181,9 @@ def lookup_matches(
         if score <= 0:
             continue
         chunk = chunk_by_id.get(record.chunk_id)
+        evidence = format_record_evidence(record)
+        supporting_context = format_supporting_context(chunk, chunks, chunk_order) if chunk else ""
+        coverage_text = " ".join([record.section_path, evidence, supporting_context])
         record_matches.append(
             {
                 "match_type": "structured_record",
@@ -1130,9 +1197,13 @@ def lookup_matches(
                 "section_path": record.section_path,
                 "chunk_id": record.chunk_id,
                 "fields": record.fields,
-                "evidence": record.source_text,
+                "evidence": evidence,
+                "supporting_context": supporting_context,
                 "answer_hint": record.answer_text,
                 "chunk_text": chunk.text if chunk else "",
+                "coverage": term_coverage(coverage_text, terms),
+                "matched_terms": matched_terms(coverage_text, terms),
+                "reason": explain_match(record.record_type, active_query_type, coverage_text, terms),
             }
         )
 
@@ -1154,20 +1225,142 @@ def lookup_matches(
                 "section_path": chunk.section_path,
                 "chunk_id": chunk.chunk_id,
                 "fields": {},
-                "evidence": chunk.text[:1200],
+                "evidence": trim_text(chunk.text, MATCH_EVIDENCE_CHAR_LIMIT),
+                "supporting_context": "",
                 "answer_hint": "",
                 "chunk_text": chunk.text,
+                "coverage": term_coverage(chunk.text, terms),
+                "matched_terms": matched_terms(chunk.text, terms),
+                "reason": explain_match(",".join(chunk.record_types) or "text", active_query_type, chunk.text, terms),
             }
         )
 
-    combined = sorted([*record_matches, *chunk_matches], key=lambda item: (-item["score"], item["match_type"]))[:limit]
+    ranked = sorted(
+        [*record_matches, *chunk_matches],
+        key=lambda item: (-item["score"], -item["coverage"], item["match_type"]),
+    )
+    combined = select_evidence_matches(ranked, limit)
     return {
         "query": query,
         "query_type": active_query_type,
         "entities": active_entities,
+        "sub_queries": plan.get("sub_queries", []),
+        "answer_style": plan.get("answer_style", "grounded_explanation"),
         "matches": combined,
         "context": format_lookup_context(combined),
+        "evidence_items": build_evidence_items(combined),
+        "diagnostics": {
+            "candidate_count": len(ranked),
+            "selected_count": len(combined),
+            "top_score": ranked[0]["score"] if ranked else 0,
+            "average_coverage": round(sum(match["coverage"] for match in combined) / len(combined), 3) if combined else 0,
+        },
     }
+
+
+def format_record_evidence(record: StructuredRecord) -> str:
+    field_lines = [f"{key}: {value}" for key, value in record.fields.items() if value]
+    return "\n".join(
+        [
+            f"record_type: {record.record_type}",
+            f"answer_hint: {record.answer_text}",
+            *field_lines,
+        ]
+    )
+
+
+def format_supporting_context(chunk: RagChunk, chunks: list[RagChunk], chunk_order: dict[str, int]) -> str:
+    index = chunk_order.get(chunk.chunk_id)
+    if index is None:
+        return trim_text(chunk.text, SUPPORTING_CONTEXT_CHAR_LIMIT)
+
+    neighbors = []
+    for neighbor_index in range(max(0, index - 1), min(len(chunks), index + 2)):
+        neighbor = chunks[neighbor_index]
+        if neighbor.document_id != chunk.document_id:
+            continue
+        if neighbor_index != index and neighbor.section_path != chunk.section_path and neighbor.page_start != chunk.page_start:
+            continue
+        label = "current" if neighbor_index == index else "neighbor"
+        neighbors.append(f"[{label} chunk {neighbor.chunk_id} page={neighbor.page_start}]\n{neighbor.text}")
+    return trim_text("\n\n".join(neighbors), SUPPORTING_CONTEXT_CHAR_LIMIT)
+
+
+def matched_terms(text: str, terms: list[str]) -> list[str]:
+    haystack = normalize_for_match(text)
+    matches = []
+    for term in terms:
+        term_norm = normalize_for_match(term)
+        if not term_norm:
+            continue
+        if term_norm in haystack:
+            matches.append(term)
+            continue
+        tokens = [token for token in term_norm.split() if len(token) >= 2]
+        if tokens and all(token in haystack for token in tokens):
+            matches.append(term)
+    return unique_keep_order(matches)[:16]
+
+
+def term_coverage(text: str, terms: list[str]) -> float:
+    important_terms = [term for term in unique_keep_order(terms) if len(normalize_for_match(term)) >= 2]
+    if not important_terms:
+        return 0.0
+    return len(matched_terms(text, important_terms)) / len(important_terms)
+
+
+def explain_match(record_type: str, query_type: str, text: str, terms: list[str]) -> str:
+    reasons = []
+    matches = matched_terms(text, terms)
+    if matches:
+        reasons.append("matched_terms=" + ", ".join(matches[:8]))
+    if query_type in STRUCTURED_LOOKUP_TYPES:
+        reasons.append(f"query_type={query_type}")
+    if record_type:
+        reasons.append(f"record_type={record_type}")
+    return "; ".join(reasons)
+
+
+def select_evidence_matches(ranked: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    selected_chunk_ids: set[str] = set()
+    selected_record_ids: set[str] = set()
+
+    for match in ranked:
+        if len(selected) >= limit:
+            break
+        record_id = match.get("record_id") or ""
+        chunk_id = match.get("chunk_id") or ""
+
+        if record_id and record_id in selected_record_ids:
+            continue
+        if match.get("match_type") == "chunk" and chunk_id in selected_chunk_ids:
+            continue
+
+        selected.append(match)
+        if record_id:
+            selected_record_ids.add(record_id)
+        if chunk_id:
+            selected_chunk_ids.add(chunk_id)
+
+    return selected
+
+
+def build_evidence_items(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "match_type": match.get("match_type", ""),
+            "score": match.get("score", 0),
+            "coverage": match.get("coverage", 0),
+            "file_name": match.get("file_name", ""),
+            "page": match.get("page"),
+            "section_path": match.get("section_path", ""),
+            "chunk_id": match.get("chunk_id", ""),
+            "answer": match.get("answer") or match.get("answer_hint") or "",
+            "matched_terms": match.get("matched_terms", []),
+        }
+        for match in matches
+    ]
 
 
 def score_record(record: StructuredRecord, terms: list[str], query_type: str) -> float:
@@ -1199,6 +1392,7 @@ def score_record(record: StructuredRecord, terms: list[str], query_type: str) ->
                     score += 0.8
     if matched_terms >= 2:
         score += 4.0
+    score += term_coverage(haystack, terms) * 6.0
     if query_type == "number_lookup" and record.record_type in NUMBER_RECORD_TYPES:
         if any(NUMBER_RE.search(value) for value in record.fields.values()):
             score += 5.0
@@ -1212,7 +1406,8 @@ def score_record(record: StructuredRecord, terms: list[str], query_type: str) ->
         "troubleshooting": {"troubleshooting"},
         "contact_lookup": {"contact"},
         "dependency_lookup": {"dependency"},
-        "definition": {"key_value", "table_row"},
+        "definition": {"key_value", "table_row", "policy"},
+        "comparison": TABLE_RECORD_TYPES,
     }
     if record.record_type in query_record_bonus.get(query_type, set()):
         score += 5.0
@@ -1228,6 +1423,7 @@ def score_chunk(chunk: RagChunk, terms: list[str], query_type: str) -> float:
             continue
         if term_norm in haystack:
             score += 2.0
+    score += term_coverage(haystack, terms) * 3.0
     if query_type == "number_lookup" and NUMBER_RE.search(chunk.text):
         score += 1.0
     if query_type == "date_lookup" and DATE_RE.search(chunk.text):
@@ -1269,22 +1465,44 @@ def choose_answer_candidate(record: StructuredRecord, query_type: str, terms: li
 
 def format_lookup_context(matches: list[dict[str, Any]]) -> str:
     blocks = []
+    used_chars = 0
     for match in matches:
-        blocks.append(
-            "\n".join(
-                [
-                    f"[match_type: {match['match_type']}]",
-                    f"[score: {match['score']:.2f}]",
-                    f"[file_name: {match['file_name']}]",
-                    f"[page: {match['page']}]",
-                    f"[section: {match['section_path']}]",
-                    f"[chunk_id: {match['chunk_id']}]",
-                    f"answer_candidate: {match['answer'] or match['answer_hint']}",
-                    f"evidence: {match['evidence']}",
-                ]
-            )
-        )
+        evidence = trim_text(str(match.get("evidence", "")), MATCH_EVIDENCE_CHAR_LIMIT)
+        supporting_context = trim_text(str(match.get("supporting_context", "")), SUPPORTING_CONTEXT_CHAR_LIMIT)
+        block = "\n".join(
+            [
+                f"[match_type: {match['match_type']}]",
+                f"[score: {match['score']:.2f}]",
+                f"[coverage: {match.get('coverage', 0):.2f}]",
+                f"[file_name: {match['file_name']}]",
+                f"[page: {match['page']}]",
+                f"[section: {match['section_path']}]",
+                f"[chunk_id: {match['chunk_id']}]",
+                f"[matched_terms: {', '.join(match.get('matched_terms', []))}]",
+                f"[reason: {match.get('reason', '')}]",
+                f"answer_candidate: {match['answer'] or match['answer_hint']}",
+                f"evidence:\n{evidence}",
+                f"supporting_context:\n{supporting_context}" if supporting_context else "",
+            ]
+        ).strip()
+        if used_chars and used_chars + len(block) > CONTEXT_CHAR_BUDGET:
+            remaining = CONTEXT_CHAR_BUDGET - used_chars
+            if remaining <= 400:
+                break
+            block = trim_text(block, remaining)
+        blocks.append(block)
+        used_chars += len(block) + 2
+        if used_chars >= CONTEXT_CHAR_BUDGET:
+            break
     return "\n\n".join(blocks)
+
+
+def trim_text(text: str, limit: int) -> str:
+    text = normalize_markdown(text)
+    if len(text) <= limit:
+        return text
+    head_limit = max(0, limit - 80)
+    return text[:head_limit].rstrip() + "\n...[trimmed]"
 
 
 def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, Any]:
@@ -1300,6 +1518,8 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
     evidence_numbers = extract_number_values(evidence_text)
     answer_dates = extract_date_values(answer)
     evidence_dates = extract_date_values(evidence_text)
+    answer_identifiers = extract_identifier_values(answer)
+    evidence_identifiers = extract_identifier_values(evidence_text)
 
     if query_type == "number_lookup" and not answer_numbers:
         issues.append({"type": "missing_number", "message": "The question asks for a numeric answer, but the answer has no number."})
@@ -1323,7 +1543,17 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
                 }
             )
 
+    for identifier in answer_identifiers:
+        if identifier not in evidence_identifiers:
+            issues.append(
+                {
+                    "type": "unsupported_identifier",
+                    "message": f"The answer contains identifier '{identifier}' that is not present in evidence.",
+                }
+            )
+
     question_terms = extract_keywords(question, limit=8)
+    question_coverage = term_coverage(evidence_text, question_terms)
     missing_terms = [
         term
         for term in question_terms
@@ -1338,18 +1568,34 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
             }
         )
 
-    severe_issue_types = {"empty_answer", "missing_evidence", "missing_number", "missing_date", "unsupported_number", "unsupported_date"}
+    severe_issue_types = {
+        "empty_answer",
+        "missing_evidence",
+        "missing_number",
+        "missing_date",
+        "unsupported_number",
+        "unsupported_date",
+        "unsupported_identifier",
+    }
     valid = not any(issue["type"] in severe_issue_types for issue in issues)
-    confidence = 0.92 if valid and not issues else 0.72 if valid else 0.35
+    if valid and not issues:
+        confidence = 0.92
+    elif valid:
+        confidence = max(0.55, round(0.72 + min(question_coverage, 1.0) * 0.12, 2))
+    else:
+        confidence = 0.35
     return {
         "valid": valid,
         "confidence": confidence,
         "query_type": query_type,
         "issues": issues,
+        "evidence_coverage": round(question_coverage, 3),
         "answer_numbers": answer_numbers,
         "evidence_numbers": evidence_numbers[:20],
         "answer_dates": answer_dates,
         "evidence_dates": evidence_dates[:20],
+        "answer_identifiers": answer_identifiers,
+        "evidence_identifiers": evidence_identifiers[:20],
     }
 
 
@@ -1377,6 +1623,10 @@ def extract_number_values(text: str) -> list[str]:
 
 def extract_date_values(text: str) -> list[str]:
     return unique_keep_order(clean_cell(match.group(0)) for match in DATE_RE.finditer(text))
+
+
+def extract_identifier_values(text: str) -> list[str]:
+    return unique_keep_order(clean_cell(match.group(0)) for match in IDENTIFIER_RE.finditer(text))
 
 
 def extract_keywords(text: str, limit: int = 20) -> list[str]:
@@ -1443,13 +1693,20 @@ def unique_keep_order(values: Iterable[str]) -> list[str]:
     seen = set()
     result = []
     for value in values:
-        item = clean_cell(value)
+        item = strip_trailing_particle(clean_cell(value))
         key = item.lower()
         if not item or key in seen:
             continue
         seen.add(key)
         result.append(item)
     return result
+
+
+def strip_trailing_particle(value: str) -> str:
+    if not re.search(r"[A-Za-z0-9]", value):
+        return value
+    stripped = re.sub(r"(?:은|는|이|가|을|를|와|과|의|에|에서|으로|로)$", "", value)
+    return stripped or value
 
 
 def _safe_id(value: str) -> str:

@@ -46,7 +46,9 @@ class QueryPlanResponse(BaseModel):
     query_type: str
     entities: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
+    sub_queries: list[str] = Field(default_factory=list)
     expanded_queries: list[str] = Field(default_factory=list)
+    answer_style: str = "grounded_explanation"
     retrieval_hints: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -62,8 +64,12 @@ class LookupResponse(BaseModel):
     query: str
     query_type: str
     entities: list[str] = Field(default_factory=list)
+    sub_queries: list[str] = Field(default_factory=list)
+    answer_style: str = "grounded_explanation"
     matches: list[dict[str, Any]] = Field(default_factory=list)
     context: str = ""
+    evidence_items: list[dict[str, Any]] = Field(default_factory=list)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
 
 
 class VerifyRequest(BaseModel):
@@ -77,10 +83,13 @@ class VerifyResponse(BaseModel):
     confidence: float
     query_type: str
     issues: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_coverage: float = 0
     answer_numbers: list[str] = Field(default_factory=list)
     evidence_numbers: list[str] = Field(default_factory=list)
     answer_dates: list[str] = Field(default_factory=list)
     evidence_dates: list[str] = Field(default_factory=list)
+    answer_identifiers: list[str] = Field(default_factory=list)
+    evidence_identifiers: list[str] = Field(default_factory=list)
 
 
 @app.post("/convert", response_model=ConvertResponse)
