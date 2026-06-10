@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from fastapi import UploadFile
 
-from app.main import ConvertResponse, MarkdownIngestRequest, convert, rag_ingest_markdown
+from app.main import ChatflowDebugRequest, ConvertResponse, MarkdownIngestRequest, chatflow_debug, convert, rag_ingest_markdown
 
 
 class ApiContractTest(unittest.IsolatedAsyncioTestCase):
@@ -49,6 +49,42 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(response.chunks), 1)
         self.assertGreaterEqual(len(response.records), 1)
         self.assertIn("API Limit", response.dify_markdown)
+
+    async def test_chatflow_debug_uses_structured_lookup_without_knowledge_retrieval(self):
+        await rag_ingest_markdown(
+            MarkdownIngestRequest(
+                document_id="doc_chatflow_debug",
+                file_name="admission.md",
+                markdown="""
+--- Page 4 ---
+
+# 전공심화 개설 학과
+
+| 과정 | 개설 학과 | 수업 방식 |
+| --- | --- | --- |
+| 전공심화 | 컴퓨터정보공학과 | 야간 |
+| 전공심화 | 기계공학과 | 야간 |
+| 전공심화 | 간호학과 | 주말 |
+""",
+            )
+        )
+
+        response = await chatflow_debug(
+            ChatflowDebugRequest(
+                query="전공심화 개설 학과 알려줘",
+                document_id="doc_chatflow_debug",
+                knowledge_result=[],
+                answer="제공된 문서에는 충분한 근거가 없습니다.",
+            )
+        )
+        payload = response.model_dump() if hasattr(response, "model_dump") else response.dict()
+
+        self.assertEqual(payload["query_plan"]["query_type"], "table_lookup")
+        self.assertTrue(payload["node_status"]["structured_lookup_has_context"])
+        self.assertIn("Structured Lookup - authoritative exact evidence", payload["merge_evidence"]["evidence_context"])
+        self.assertIn("컴퓨터정보공학과", payload["draft_answer"])
+        self.assertTrue(payload["draft_verification"]["valid"])
+        self.assertFalse(payload["supplied_answer_verification"]["valid"])
 
 
 if __name__ == "__main__":

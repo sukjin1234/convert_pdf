@@ -760,6 +760,33 @@ PDF 변환을 거치지 않고 이미 정제된 Markdown을 RAG artifact로 저�
 }
 ```
 
+### 4.6 POST /chatflow/debug
+
+Dify UI에서 답변이 이상할 때 같은 질문으로 API 쪽 흐름을 먼저 확인한다.
+
+요청:
+
+```json
+{
+  "query": "전공심화 개설 학과 알려줘",
+  "document_id": "sample_2026",
+  "knowledge_result": [],
+  "answer": "제공된 문서에는 충분한 근거가 없습니다."
+}
+```
+
+핵심 확인값:
+
+```text
+query_plan.query_type == table_lookup
+node_status.structured_lookup_has_context == true
+merge_evidence.evidence_context contains "Structured Lookup - authoritative exact evidence"
+draft_verification.valid == true
+supplied_answer_verification.valid == false
+```
+
+위 값이 맞으면 FastAPI의 structured lookup, evidence merge, verifier는 정상이다. 그 상태에서 Dify 답변만 실패하면 `Merge Evidence` 코드가 최신인지, `evidence_priority` 출력 변수를 만들었는지, Final Answer LLM User Prompt에 `Evidence priority`와 `Evidence`가 둘 다 연결됐는지 확인한다.
+
 ## 5. 수동 테스트
 
 ```powershell
@@ -770,6 +797,8 @@ curl.exe -F "pdf=@2026학년도 입학전혀
 curl.exe -H "Content-Type: application/json" -d "{\"query\":\"컴퓨터정보공학과 모집인원 알려줘\"}" http://127.0.0.1:8000/query/plan
 
 curl.exe -H "Content-Type: application/json" -d "{\"query\":\"컴퓨터정보공학과 모집인원 알려줘\",\"document_id\":\"sample_2026\",\"entities\":[\"컴퓨터정보공학과\",\"모집인원\"],\"query_type\":\"number_lookup\",\"limit\":8}" http://127.0.0.1:8000/lookup
+
+curl.exe -H "Content-Type: application/json" -d "{\"query\":\"전공심화 개설 학과 알려줘\",\"document_id\":\"sample_2026\",\"knowledge_result\":[],\"answer\":\"제공된 문서에는 충분한 근거가 없습니다.\"}" http://127.0.0.1:8000/chatflow/debug
 ```
 
 ## 6. 중요한 운영 판단

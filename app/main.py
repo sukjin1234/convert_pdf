@@ -9,7 +9,15 @@ from pydantic import BaseModel, Field
 
 from .config import get_settings
 from .converter import PdfConverter
-from .rag import STORE, build_rag_artifact, lookup_matches, plan_query, verify_answer
+from .rag import (
+    STORE,
+    build_grounded_answer_draft,
+    build_rag_artifact,
+    lookup_matches,
+    merge_evidence_context,
+    plan_query,
+    verify_answer,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -98,6 +106,24 @@ class VerifyResponse(BaseModel):
     evidence_identifiers: list[str] = Field(default_factory=list)
 
 
+class ChatflowDebugRequest(BaseModel):
+    query: str
+    document_id: str | None = None
+    limit: int = 8
+    knowledge_result: Any = None
+    answer: str | None = None
+
+
+class ChatflowDebugResponse(BaseModel):
+    query_plan: dict[str, Any]
+    structured_lookup: dict[str, Any]
+    merge_evidence: dict[str, str]
+    draft_answer: str
+    draft_verification: dict[str, Any]
+    supplied_answer_verification: dict[str, Any] | None = None
+    node_status: dict[str, Any] = Field(default_factory=dict)
+
+
 @app.post("/convert", response_model=ConvertResponse)
 async def convert(pdf: UploadFile | None = File(None)) -> ConvertResponse:
     try:
@@ -182,6 +208,41 @@ async def lookup(request: LookupRequest) -> LookupResponse:
 @app.post("/answer/verify", response_model=VerifyResponse)
 async def answer_verify(request: VerifyRequest) -> VerifyResponse:
     return VerifyResponse(**verify_answer(request.question, request.answer, request.evidence))
+
+
+@app.post("/chatflow/debug", response_model=ChatflowDebugResponse)
+async def chatflow_debug(request: ChatflowDebugRequest) -> ChatflowDebugResponse:
+    limit = max(1, min(request.limit, 30))
+    plan = plan_query(request.query, request.document_id)
+    lookup_result = lookup_matches(
+        query=request.query,
+        records=STORE.records(request.document_id),
+        chunks=STORE.chunks(request.document_id),
+        entities=plan["entities"],
+        query_type=plan["query_type"],
+        limit=limit,
+    )
+    merged = merge_evidence_context(lookup_result, request.knowledge_result)
+    draft_answer = build_grounded_answer_draft(request.query, lookup_result)
+    draft_verification = verify_answer(request.query, draft_answer, [merged["evidence_context"]])
+    supplied_verification = None
+    if request.answer is not None:
+        supplied_verification = verify_answer(request.query, request.answer, [merged["evidence_context"]])
+
+    return ChatflowDebugResponse(
+        query_plan=plan,
+        structured_lookup=lookup_result,
+        merge_evidence=merged,
+        draft_answer=draft_answer,
+        draft_verification=draft_verification,
+        supplied_answer_verification=supplied_verification,
+        node_status={
+            "structured_lookup_has_context": bool(lookup_result.get("context")),
+            "knowledge_retrieval_supplied": bool(request.knowledge_result),
+            "evidence_context_has_structured_lookup": "[Structured Lookup" in merged["evidence_context"],
+            "draft_answer_valid": bool(draft_verification.get("valid")),
+        },
+    )
 
 
 @app.get("/rag/documents")

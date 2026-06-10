@@ -11,6 +11,7 @@ POST /rag/ingest-markdown Markdown -> RAG artifact 저장
 POST /query/plan   질문 유형/키워드/하위질문/검색어 확장
 POST /lookup       구조화 레코드 exact lookup + evidence packing
 POST /answer/verify 답변 숫자/날짜/식별자 근거 검증
+POST /chatflow/debug Dify Chatflow 노드 흐름 로컬 재현
 GET  /rag/documents 저장된 RAG artifact 목록
 GET  /health
 ```
@@ -67,6 +68,14 @@ curl.exe -F "pdf=@2026학년도 입학전혀
 ```powershell
 curl.exe -H "Content-Type: application/json" -d "{\"query\":\"컴퓨터정보공학과 모집인원 알려줘\"}" http://127.0.0.1:8000/query/plan
 ```
+
+Dify Chatflow 디버깅:
+
+```powershell
+curl.exe -H "Content-Type: application/json" -d "{\"query\":\"전공심화 개설 학과 알려줘\",\"document_id\":\"sample_2026\",\"knowledge_result\":[],\"answer\":\"제공된 문서에는 충분한 근거가 없습니다.\"}" http://127.0.0.1:8000/chatflow/debug
+```
+
+`/chatflow/debug`는 `Query Plan -> Structured Lookup -> Merge Evidence -> Verify` 흐름을 한 번에 재현한다. `Knowledge Retrieval`이 비어 있어도 `merge_evidence.evidence_context`에 `Structured Lookup - authoritative exact evidence`가 있고 `draft_verification.valid=true`이면 API 쪽 근거 생성은 정상이다. 이때 Dify 최종 답변이 실패하면 `Merge Evidence` 코드, `evidence_priority` 출력 변수, Final Answer LLM 프롬프트 연결을 먼저 확인한다.
 
 ## 환경 변수
 

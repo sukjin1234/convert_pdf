@@ -333,9 +333,6 @@ QUERY_TYPE_TERMS = {
         "종류",
         "분류",
         "카테고리",
-        "어떤",
-        "어느",
-        "무슨",
         "개설",
         "학과",
         "부서",
@@ -1210,7 +1207,7 @@ def classify_answer_style(query: str, query_type: str) -> str:
         return "summarize"
     if query_type == "procedure":
         return "steps"
-    if re.search(r"표|목록|리스트|명단|항목|종류|카테고리|어떤|어느|무슨|개설|list|table|catalog|category|available|offered", lower):
+    if re.search(r"표|목록|리스트|명단|항목|종류|카테고리|개설|list|table|catalog|category|available|offered", lower):
         return "table_or_bullets"
     if query_type in {"number_lookup", "date_lookup", "contact_lookup"}:
         return "direct"
@@ -1666,6 +1663,103 @@ def format_lookup_context(matches: list[dict[str, Any]]) -> str:
         if used_chars >= CONTEXT_CHAR_BUDGET:
             break
     return "\n\n".join(blocks)
+
+
+def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result: Any = None) -> dict[str, str]:
+    lookup_payload = parse_json_like(lookup)
+    if not isinstance(lookup_payload, dict):
+        lookup_payload = {}
+
+    structured_context = str(lookup_payload.get("context") or "")
+    diagnostics = lookup_payload.get("diagnostics") or {}
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+
+    knowledge_items = parse_json_like(knowledge_result) or []
+    if isinstance(knowledge_items, dict):
+        knowledge_items = (
+            knowledge_items.get("result")
+            or knowledge_items.get("records")
+            or knowledge_items.get("data")
+            or knowledge_items.get("documents")
+            or []
+        )
+    if not isinstance(knowledge_items, list):
+        knowledge_items = [knowledge_items]
+
+    knowledge_blocks = []
+    for index, item in enumerate(knowledge_items[:12], start=1):
+        if isinstance(item, dict):
+            segment = item.get("segment") if isinstance(item.get("segment"), dict) else {}
+            content = item.get("content") or item.get("text") or segment.get("content") or ""
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            source = metadata.get("source") or metadata.get("file_name") or item.get("title") or ""
+            knowledge_blocks.append(f"[knowledge {index}] source={source}\n{content}")
+        else:
+            knowledge_blocks.append(f"[knowledge {index}]\n{item}")
+
+    structured_block = (
+        "[Structured Lookup - authoritative exact evidence]\n"
+        "Use this first for table, list, field, value, number, date, identifier, and policy questions.\n"
+        + structured_context
+        if structured_context
+        else ""
+    )
+    knowledge_block = (
+        "[Knowledge Retrieval - supplementary semantic evidence]\n"
+        + "\n\n".join(knowledge_blocks)
+        if knowledge_blocks
+        else ""
+    )
+    evidence_context = "\n\n".join(part for part in [structured_block, knowledge_block] if part)
+    evidence_priority = (
+        "Use Structured Lookup first. Knowledge Retrieval is supplementary and may be empty or less specific."
+        if structured_context
+        else "Use Knowledge Retrieval only because Structured Lookup is empty."
+    )
+
+    return {
+        "structured_context": structured_context,
+        "knowledge_context": "\n\n".join(knowledge_blocks),
+        "evidence_context": evidence_context,
+        "evidence_priority": evidence_priority,
+        "lookup_diagnostics": json.dumps(diagnostics, ensure_ascii=False),
+        "lookup_answerability": json.dumps(diagnostics.get("answerability") or {}, ensure_ascii=False),
+    }
+
+
+def build_grounded_answer_draft(question: str, lookup: dict[str, Any]) -> str:
+    matches = lookup.get("matches") if isinstance(lookup, dict) else []
+    if not isinstance(matches, list) or not matches:
+        return "제공된 문서에는 충분한 근거가 없습니다."
+
+    candidates = []
+    for match in matches[:8]:
+        if not isinstance(match, dict):
+            continue
+        candidate = clean_cell(match.get("answer") or match.get("answer_hint") or "")
+        if candidate:
+            candidates.append(candidate)
+    candidates = unique_keep_order(candidates)
+    if not candidates:
+        return "제공된 문서에는 충분한 근거가 없습니다."
+
+    answer_style = str(lookup.get("answer_style") or classify_answer_style(question, str(lookup.get("query_type") or "")))
+    if answer_style == "table_or_bullets" or len(candidates) > 1:
+        return "근거에서 확인되는 내용은 다음과 같습니다.\n" + "\n".join(f"- {candidate}" for candidate in candidates)
+    return candidates[0]
+
+
+def parse_json_like(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return json.loads(stripped)
+        except Exception:
+            return value
+    return value
 
 
 def trim_text(text: str, limit: int) -> str:
