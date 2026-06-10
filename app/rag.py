@@ -1028,7 +1028,98 @@ def expand_tables_to_records(
             output.append("표 행 설명 및 구조화 레코드:")
             output.extend(row_texts)
 
+    plain_marker_records = extract_plain_marker_records(
+        lines,
+        marker_legends,
+        document_id=document_id,
+        file_name=file_name,
+        page=page,
+        section_path=section_path,
+        table_index=table_index + 1,
+    )
+    if plain_marker_records:
+        records.extend(plain_marker_records)
+        output.append("")
+        output.append("표시/범례 기반 구조화 레코드:")
+        output.extend(build_record_text(record) for record in plain_marker_records)
+
     return normalize_markdown("\n".join(output)), records
+
+
+def extract_plain_marker_records(
+    lines: list[str],
+    marker_legends: dict[str, str],
+    *,
+    document_id: str,
+    file_name: str,
+    page: int | None,
+    section_path: str,
+    table_index: int,
+) -> list[StructuredRecord]:
+    if not marker_legends:
+        return []
+
+    records = []
+    for line_index, line in enumerate(lines, start=1):
+        raw_line = clean_cell(line)
+        if not raw_line or looks_like_table_row(raw_line) or is_marker_legend_line(raw_line):
+            continue
+        for symbol in unique_keep_order(MARKER_SYMBOL_RE.findall(raw_line)):
+            meaning = marker_legends.get(symbol)
+            if not meaning:
+                continue
+            item = extract_marked_line_item(raw_line, symbol)
+            if not item:
+                continue
+            fields = {
+                "항목": item,
+                "표시": symbol,
+                "표시 의미": meaning,
+                "표시 대상 필드": "항목",
+                "원문": remove_marker_symbol(raw_line, symbol),
+            }
+            source_text = " | ".join(fields.values())
+            answer_text = row_to_sentence(fields)
+            record_type = classify_record(fields, source_text)
+            keywords = extract_keywords(" ".join([section_path, source_text, answer_text]), limit=12)
+            records.append(
+                StructuredRecord(
+                    record_id=f"{_safe_id(document_id)}_p{page or 0:03d}_m{table_index:02d}_r{line_index:03d}",
+                    record_type=record_type,
+                    document_id=document_id,
+                    file_name=file_name,
+                    chunk_id="",
+                    page=page,
+                    section_path=section_path,
+                    fields=fields,
+                    source_text=source_text,
+                    answer_text=answer_text,
+                    keywords=keywords,
+                )
+            )
+    return records
+
+
+def is_marker_legend_line(line: str) -> bool:
+    cleaned = clean_legend_line(line)
+    return any(pattern.search(cleaned) for pattern in MARKER_LEGEND_PATTERNS)
+
+
+def extract_marked_line_item(line: str, symbol: str) -> str:
+    before_symbol = line.split(symbol, 1)[0]
+    before_symbol = clean_cell(before_symbol)
+    before_symbol = strip_plain_table_prefix(before_symbol)
+    before_symbol = re.sub(r"^\d+\s+", "", before_symbol)
+    return clean_cell(before_symbol)
+
+
+def strip_plain_table_prefix(value: str) -> str:
+    # OCR/plain-text tables sometimes keep a section/category before the marked item.
+    # Keep the item part when the prefix looks like a short category label.
+    parts = value.split()
+    if len(parts) >= 2 and len(parts[0]) <= 6 and not re.search(r"[A-Za-z0-9가-힣]+과$", parts[0]):
+        return " ".join(parts[1:])
+    return value
 
 
 def extract_marker_legends(lines: list[str]) -> dict[str, str]:
