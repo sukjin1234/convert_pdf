@@ -765,6 +765,8 @@ Instruction: include every value in complete_values; do not omit or add values.
 
 Dify에서는 일단 `context`만 써도 된다. 디버깅할 때는 `direct_answer`가 비어 있는지, `answer_items`에 빠진 행이 없는지, `diagnostics.average_coverage`, `diagnostics.selected_count`를 확인한다.
 
+표 행에 `♣`, `†`, `◈` 같은 표시가 있고 표 아래에 `♣표시 : ...`, `† indicates ...`, `◈ = ...` 형태의 범례가 있으면 `/lookup`이 표시 의미를 행 필드에 자동 주입한다. 예를 들어 `♣표시 : 4년제 학사학위(전공심화)과정 개설 학과`가 있으면 `♣`가 붙은 모집단위만 `전공심화 개설 학과`의 후보로 집계된다.
+
 ### 4.5 POST /answer/verify
 
 요청:

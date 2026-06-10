@@ -87,6 +87,21 @@ ABSTENTION_RE = re.compile(
 )
 
 ANSWER_CANDIDATE_RE = re.compile(r"(?m)^answer_candidate:\s*(.+?)\s*$")
+MARKER_SYMBOL_RE = re.compile(r"[♣★☆◆◇■□▲△●○◎◈◉◯✓✔✕×†‡※]")
+MARKER_LEGEND_PATTERNS = [
+    re.compile(
+        r"(?:^|\s)(?P<symbol>[♣★☆◆◇■□▲△●○◎◈◉◯✓✔✕×†‡※])\s*표시\s*[:：=\-]?\s*(?P<meaning>.+)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:^|\s)(?P<symbol>[♣★☆◆◇■□▲△●○◎◈◉◯✓✔✕×†‡※])\s*(?:indicates|means|denotes)\s*(?P<meaning>.+)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:^|\s)(?P<symbol>[♣★☆◆◇■□▲△●○◎◈◉◯✓✔✕×†‡※])\s*[:：=]\s*(?P<meaning>.+)$",
+        re.IGNORECASE,
+    ),
+]
 
 POSITIVE_CELL_RE = re.compile(r"^(?:yes|true|supported|available|included|enabled|y|o|가능|지원|제공|포함|허용|필수|사용\s*가능)$", re.IGNORECASE)
 NEGATIVE_CELL_RE = re.compile(r"^(?:no|false|none|unsupported|unavailable|disabled|n|x|불가|미지원|없음|제외|금지)$", re.IGNORECASE)
@@ -115,6 +130,7 @@ GENERIC_LIST_TERMS = {
     "available",
     "supported",
 }
+MARKER_METADATA_FIELDS = {"표시", "표시 의미", "표시 대상 필드"}
 
 CONCEPT_TERMS = {
     "storage": ["저장공간", "저장 공간", "스토리지", "용량", "storage", "space", "quota"],
@@ -953,6 +969,7 @@ def expand_tables_to_records(
     section_path: str,
 ) -> tuple[str, list[StructuredRecord]]:
     lines = text.split("\n")
+    marker_legends = extract_marker_legends(lines)
     output: list[str] = []
     records: list[StructuredRecord] = []
     table_index = 0
@@ -978,11 +995,12 @@ def expand_tables_to_records(
         headers, rows = parsed
         row_texts = []
         for row_index, row in enumerate(rows, start=1):
-            fields = {
+            raw_fields = {
                 header: clean_cell(row[column_index]) if column_index < len(row) else ""
                 for column_index, header in enumerate(headers)
             }
-            fields = {key: value for key, value in fields.items() if key and value}
+            raw_fields = {key: value for key, value in raw_fields.items() if key and value}
+            fields = enrich_fields_with_marker_legends(raw_fields, marker_legends)
             if not fields:
                 continue
             answer_text = row_to_sentence(fields)
@@ -1011,6 +1029,72 @@ def expand_tables_to_records(
             output.extend(row_texts)
 
     return normalize_markdown("\n".join(output)), records
+
+
+def extract_marker_legends(lines: list[str]) -> dict[str, str]:
+    legends: dict[str, str] = {}
+    for line in lines:
+        cleaned = clean_legend_line(line)
+        if not cleaned:
+            continue
+        for pattern in MARKER_LEGEND_PATTERNS:
+            match = pattern.search(cleaned)
+            if not match:
+                continue
+            symbol = match.group("symbol")
+            meaning = clean_marker_meaning(match.group("meaning"))
+            if symbol and meaning:
+                legends[symbol] = meaning
+            break
+    return legends
+
+
+def clean_legend_line(line: str) -> str:
+    cleaned = clean_cell(line)
+    cleaned = re.sub(r"^[\-*•\s]+", "", cleaned)
+    cleaned = re.sub(r"^※\s*", "", cleaned)
+    return cleaned.strip()
+
+
+def clean_marker_meaning(value: str) -> str:
+    value = clean_cell(value)
+    value = re.sub(r"※.*$", "", value).strip()
+    return value.rstrip(".。;；")
+
+
+def enrich_fields_with_marker_legends(fields: dict[str, str], marker_legends: dict[str, str]) -> dict[str, str]:
+    if not fields:
+        return {}
+    enriched: dict[str, str] = {}
+    marker_hits: list[tuple[str, str, str]] = []
+
+    for key, value in fields.items():
+        symbols = [
+            symbol
+            for symbol in unique_keep_order(MARKER_SYMBOL_RE.findall(value))
+            if symbol in marker_legends
+        ]
+        cleaned_value = value
+        for symbol in symbols:
+            cleaned_value = remove_marker_symbol(cleaned_value, symbol)
+            marker_hits.append((symbol, marker_legends[symbol], key))
+        enriched[key] = clean_cell(cleaned_value)
+
+    if marker_hits:
+        symbols = unique_keep_order(symbol for symbol, _, _ in marker_hits)
+        meanings = unique_keep_order(meaning for _, meaning, _ in marker_hits)
+        marked_fields = unique_keep_order(field for _, _, field in marker_hits)
+        enriched["표시"] = ", ".join(symbols)
+        enriched["표시 의미"] = "; ".join(meanings)
+        enriched["표시 대상 필드"] = ", ".join(marked_fields)
+
+    return {key: value for key, value in enriched.items() if key and value}
+
+
+def remove_marker_symbol(value: str, symbol: str) -> str:
+    escaped = re.escape(symbol)
+    value = re.sub(rf"\s*{escaped}\s*", " ", value)
+    return clean_cell(value)
 
 
 def looks_like_table_row(line: str) -> bool:
@@ -1579,13 +1663,14 @@ def build_keyed_list_answer(
         }
 
     filter_terms = [term for term in query_terms if not term_matches_key(term, target_key)]
-    filtered_matches = filter_matches_by_row_terms(matches, filter_terms, exclude_keys={target_key})
+    marker_filtered_matches = filter_matches_by_marker_meaning(matches, filter_terms, target_key)
+    filtered_matches = marker_filtered_matches or filter_matches_by_row_terms(matches, filter_terms, exclude_keys={target_key})
     if not filtered_matches:
         filtered_matches = matches
 
     values = []
     answer_items = []
-    for match in filtered_matches:
+    for match in sorted(filtered_matches, key=match_document_order_key):
         fields = match.get("fields") or {}
         value = clean_cell(fields.get(target_key, ""))
         if not value:
@@ -1628,9 +1713,19 @@ def choose_target_field_key(query: str, query_terms: list[str], matches: list[di
     key_by_norm: dict[str, str] = {}
     for match in matches:
         fields = match.get("fields") or {}
+        marker_meaning = fields.get("표시 의미", "")
+        marker_target_fields = split_field_list(fields.get("표시 대상 필드", ""))
+        if marker_meaning and marker_target_fields and any(term_in_text(term, marker_meaning) for term in query_terms):
+            for marker_target_field in marker_target_fields:
+                if marker_target_field in fields:
+                    key_norm = normalize_for_match(marker_target_field)
+                    key_by_norm[key_norm] = marker_target_field
+                    scores[key_norm] += 12
         for key, value in fields.items():
             key = clean_cell(key)
             if not key:
+                continue
+            if key in MARKER_METADATA_FIELDS:
                 continue
             key_norm = normalize_for_match(key)
             key_by_norm[key_norm] = key
@@ -1654,6 +1749,18 @@ def choose_target_field_key(query: str, query_terms: list[str], matches: list[di
     return key_by_norm.get(key_norm, "") if score >= 3 else ""
 
 
+def match_document_order_key(match: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        match.get("page") if match.get("page") is not None else 10**9,
+        str(match.get("chunk_id") or ""),
+        str(match.get("record_id") or ""),
+    )
+
+
+def split_field_list(value: str) -> list[str]:
+    return [clean_cell(part) for part in re.split(r"[,;/]", value or "") if clean_cell(part)]
+
+
 def term_matches_key(term: str, key: str) -> bool:
     term_norm = normalize_for_match(term)
     key_norm = normalize_for_match(key)
@@ -1667,8 +1774,25 @@ def filter_matches_by_row_terms(matches: list[dict[str, Any]], filter_terms: lis
     filtered = []
     for match in matches:
         fields = match.get("fields") or {}
-        row_text = " ".join(str(value) for key, value in fields.items() if key not in exclude_keys)
+        row_text = " ".join(str(value) for key, value in fields.items() if key not in exclude_keys and key != "표시 대상 필드")
         if all(term_in_text(term, row_text) for term in row_terms):
+            filtered.append(match)
+    return filtered
+
+
+def filter_matches_by_marker_meaning(matches: list[dict[str, Any]], filter_terms: list[str], target_key: str) -> list[dict[str, Any]]:
+    marker_terms = [
+        term
+        for term in filter_terms
+        if len(normalize_for_match(term)) >= 2 and not term_matches_key(term, target_key)
+    ]
+    if not marker_terms:
+        return []
+    filtered = []
+    for match in matches:
+        fields = match.get("fields") or {}
+        marker_meaning = fields.get("표시 의미", "")
+        if marker_meaning and term_coverage(marker_meaning, marker_terms) >= 0.5:
             filtered.append(match)
     return filtered
 

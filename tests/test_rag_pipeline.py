@@ -201,6 +201,144 @@ class RagPipelineTest(unittest.TestCase):
         self.assertIn("전공심화", plan["keywords"])
         self.assertTrue(plan["retrieval_hints"]["prefer_structured_lookup"])
 
+    def test_table_list_lookup_builds_complete_direct_answer(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 4 ---
+
+# 전공심화 개설 학과
+
+| 과정 | 개설 학과 | 수업 방식 |
+| --- | --- | --- |
+| 전공심화 | 컴퓨터정보공학과 | 야간 |
+| 전공심화 | 기계공학과 | 야간 |
+| 전공심화 | 간호학과 | 주말 |
+| 일반학위 | 산업디자인학과 | 주간 |
+""",
+            "admission.pdf",
+            document_id="doc_major_intensive",
+        )
+
+        result = lookup_matches(
+            query="전공심화 개설 학과 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+
+        self.assertEqual(result["answer_field"], "개설 학과")
+        self.assertIn("컴퓨터정보공학과", result["direct_answer"])
+        self.assertIn("기계공학과", result["direct_answer"])
+        self.assertIn("간호학과", result["direct_answer"])
+        self.assertNotIn("산업디자인학과", result["direct_answer"])
+        self.assertIn("[Direct Answer - complete structured result]", result["context"])
+        self.assertIn("complete_values:", result["context"])
+
+        incomplete = verify_answer(
+            "전공심화 개설 학과 알려줘",
+            "전공심화 개설 학과는 컴퓨터정보공학과와 기계공학과입니다.",
+            [result["context"]],
+        )
+        self.assertFalse(incomplete["valid"])
+        self.assertTrue(any(issue["type"] == "missing_direct_answer_value" for issue in incomplete["issues"]))
+
+    def test_marker_legend_rows_build_complete_direct_answer(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 26 ---
+
+# 모집인원
+
+| 계열 | 모집단위 | 수업연한 | 모집정원 |
+| --- | --- | --- | --- |
+| 공학 | 로봇자동화공학과 ♣ | 3 | 80 |
+| 공학 | 반도체기계정비학과 | 2 | 60 |
+| 공학 | 자동차공학과 ♣ | 2 | 90 |
+| 공학 | 컴퓨터정보공학과 ♣ | 3 | 93 |
+| 예체능 | 산업디자인학과 | 2 | 75 |
+
+※ ♣표시 : 4년제 학사학위(전공심화)과정 개설 학과
+""",
+            "admission.pdf",
+            document_id="doc_marker_admission",
+        )
+
+        result = lookup_matches(
+            query="전공심화 개설 학과 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=10,
+        )
+
+        self.assertEqual(result["answer_field"], "모집단위")
+        self.assertIn("로봇자동화공학과", result["direct_answer"])
+        self.assertIn("자동차공학과", result["direct_answer"])
+        self.assertIn("컴퓨터정보공학과", result["direct_answer"])
+        self.assertNotIn("반도체기계정비학과", result["direct_answer"])
+        self.assertNotIn("산업디자인학과", result["direct_answer"])
+        self.assertIn("표시 의미", result["context"])
+        self.assertIn("complete_values:", result["context"])
+
+    def test_marker_legend_logic_is_domain_neutral(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 2 ---
+
+# API Catalog
+
+| API | Version | Owner |
+| --- | --- | --- |
+| Legacy Export API † | v1.4 | Data Platform |
+| Bulk Export API | v2 | Data Platform |
+| Classic Dashboard † | v2.1 | Analytics |
+
+† indicates deprecated APIs
+""",
+            "api_catalog.pdf",
+            document_id="doc_marker_api",
+        )
+
+        result = lookup_matches(
+            query="deprecated APIs 목록 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=10,
+        )
+
+        self.assertEqual(result["answer_field"], "API")
+        self.assertIn("Legacy Export API", result["direct_answer"])
+        self.assertIn("Classic Dashboard", result["direct_answer"])
+        self.assertNotIn("Bulk Export API", result["direct_answer"])
+
+    def test_boolean_matrix_lookup_builds_supported_value_list(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 3 ---
+
+# 기능 비교
+
+| Feature | Basic | Pro | Enterprise |
+| --- | --- | --- | --- |
+| Audit Log | No | Yes | Yes |
+| SSO | No | Yes | Yes |
+| Dedicated CSM | No | No | Yes |
+""",
+            "product_manual.pdf",
+            document_id="doc_feature_matrix",
+        )
+
+        result = lookup_matches(
+            query="SSO는 어떤 요금제에서 지원돼?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+
+        self.assertEqual(result["answer_field"], "supported_fields")
+        self.assertIn("Pro", result["direct_answer"])
+        self.assertIn("Enterprise", result["direct_answer"])
+        self.assertNotIn("Basic", result["direct_answer"])
+
     def test_lookup_packs_supporting_context_for_record_matches(self):
         artifact = build_rag_artifact(
             """

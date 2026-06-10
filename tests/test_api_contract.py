@@ -83,6 +83,8 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["node_status"]["structured_lookup_has_context"])
         self.assertIn("Structured Lookup - authoritative exact evidence", payload["merge_evidence"]["evidence_context"])
         self.assertIn("컴퓨터정보공학과", payload["draft_answer"])
+        self.assertIn("기계공학과", payload["draft_answer"])
+        self.assertIn("간호학과", payload["draft_answer"])
         self.assertTrue(payload["draft_verification"]["valid"])
         self.assertFalse(payload["supplied_answer_verification"]["valid"])
 
