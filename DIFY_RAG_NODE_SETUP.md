@@ -499,6 +499,7 @@ Write a concise answer with exact supporting facts.
 Use only the provided evidence.
 Structured Lookup is authoritative exact evidence from parsed tables, records, and field-value pairs.
 If Structured Lookup contains an answer_candidate or directly relevant evidence, answer from Structured Lookup even when Knowledge Retrieval is empty, broad, or less specific.
+If evidence contains "[Direct Answer - complete structured result]" and "complete_values", include every value in complete_values exactly once. Do not omit values from complete_values and do not add values that are not listed there.
 Use Knowledge Retrieval only as supplementary context.
 For table, list, field, value, number, date, identifier, and policy questions, do not ignore Structured Lookup just because Knowledge Retrieval has no exact match.
 When evidence contains labels, table headers, page numbers, section names, or record metadata, use them to avoid mixing unrelated values.
@@ -664,6 +665,7 @@ Evidence:
 
 Rewrite the answer using only the evidence.
 If Structured Lookup contains an answer_candidate or directly relevant evidence, answer from Structured Lookup even when Knowledge Retrieval is empty or less specific.
+If evidence contains complete_values, include every value in complete_values exactly once.
 Fix unsupported numbers, unsupported dates, and claims without evidence.
 If the evidence is insufficient, say that the provided document does not contain enough evidence.
 Answer in Korean.
@@ -746,7 +748,22 @@ PDF 변환을 거치지 않고 이미 정제된 Markdown을 RAG artifact로 저�
 }
 ```
 
-응답에는 기존 `context` 외에 `answer_style`, `sub_queries`, `evidence_items`, `diagnostics`가 포함된다. Dify에서는 일단 `context`만 써도 되고, 디버깅할 때 `diagnostics.average_coverage`, `diagnostics.selected_count`를 보면 검색 품질을 판단하기 쉽다.
+응답에는 기존 `context` 외에 `direct_answer`, `answer_items`, `answer_field`, `filter_terms`, `answer_style`, `sub_queries`, `evidence_items`, `diagnostics`가 포함된다.
+
+목록/표 질문에서는 `context` 맨 위에 다음 블록이 자동으로 붙는다.
+
+```text
+[Direct Answer - complete structured result]
+answer_candidate: ...
+answer_field: ...
+filter_terms: ...
+complete_values:
+- ...
+- ...
+Instruction: include every value in complete_values; do not omit or add values.
+```
+
+Dify에서는 일단 `context`만 써도 된다. 디버깅할 때는 `direct_answer`가 비어 있는지, `answer_items`에 빠진 행이 없는지, `diagnostics.average_coverage`, `diagnostics.selected_count`를 확인한다.
 
 ### 4.5 POST /answer/verify
 

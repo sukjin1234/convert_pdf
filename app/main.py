@@ -80,6 +80,10 @@ class LookupResponse(BaseModel):
     entities: list[str] = Field(default_factory=list)
     sub_queries: list[str] = Field(default_factory=list)
     answer_style: str = "grounded_explanation"
+    direct_answer: str = ""
+    answer_items: list[dict[str, Any]] = Field(default_factory=list)
+    answer_field: str = ""
+    filter_terms: list[str] = Field(default_factory=list)
     matches: list[dict[str, Any]] = Field(default_factory=list)
     context: str = ""
     evidence_items: list[dict[str, Any]] = Field(default_factory=list)

@@ -88,6 +88,34 @@ ABSTENTION_RE = re.compile(
 
 ANSWER_CANDIDATE_RE = re.compile(r"(?m)^answer_candidate:\s*(.+?)\s*$")
 
+POSITIVE_CELL_RE = re.compile(r"^(?:yes|true|supported|available|included|enabled|y|o|가능|지원|제공|포함|허용|필수|사용\s*가능)$", re.IGNORECASE)
+NEGATIVE_CELL_RE = re.compile(r"^(?:no|false|none|unsupported|unavailable|disabled|n|x|불가|미지원|없음|제외|금지)$", re.IGNORECASE)
+GENERIC_LIST_TERMS = {
+    "어떤",
+    "어느",
+    "무슨",
+    "목록",
+    "리스트",
+    "명단",
+    "항목",
+    "종류",
+    "카테고리",
+    "알려줘",
+    "필요해",
+    "지원돼",
+    "지원",
+    "제공",
+    "가능",
+    "what",
+    "which",
+    "list",
+    "type",
+    "kind",
+    "category",
+    "available",
+    "supported",
+}
+
 CONCEPT_TERMS = {
     "storage": ["저장공간", "저장 공간", "스토리지", "용량", "storage", "space", "quota"],
     "compensation": ["연봉", "급여", "임금", "보상", "인상률", "salary", "compensation", "raise"],
@@ -1325,15 +1353,21 @@ def lookup_matches(
     answerability = assess_answerability(query, active_query_type, active_entities, combined)
     if not answerability["answerable"]:
         combined = []
+    direct_answer = build_direct_answer(query, active_query_type, active_entities, combined)
+    context_matches = filter_context_matches_for_direct_answer(combined, direct_answer)
     return {
         "query": query,
         "query_type": active_query_type,
         "entities": active_entities,
         "sub_queries": plan.get("sub_queries", []),
         "answer_style": plan.get("answer_style", "grounded_explanation"),
+        "direct_answer": direct_answer["direct_answer"],
+        "answer_items": direct_answer["answer_items"],
+        "answer_field": direct_answer["answer_field"],
+        "filter_terms": direct_answer["filter_terms"],
         "matches": combined,
-        "context": format_lookup_context(combined),
-        "evidence_items": build_evidence_items(combined),
+        "context": format_lookup_context(context_matches, direct_answer),
+        "evidence_items": build_evidence_items(context_matches),
         "diagnostics": {
             "candidate_count": len(ranked),
             "selected_count": len(combined),
@@ -1447,6 +1481,270 @@ def build_evidence_items(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for match in matches
     ]
+
+
+def filter_context_matches_for_direct_answer(matches: list[dict[str, Any]], direct_answer: dict[str, Any]) -> list[dict[str, Any]]:
+    items = direct_answer.get("answer_items") or []
+    record_ids = {
+        str(item.get("record_id"))
+        for item in items
+        if isinstance(item, dict) and item.get("record_id")
+    }
+    if not record_ids:
+        return matches
+    filtered = [match for match in matches if str(match.get("record_id") or "") in record_ids]
+    return filtered or matches
+
+
+def build_direct_answer(query: str, query_type: str, entities: list[str], matches: list[dict[str, Any]]) -> dict[str, Any]:
+    empty = {
+        "direct_answer": "",
+        "answer_items": [],
+        "answer_field": "",
+        "filter_terms": [],
+        "mode": "",
+    }
+    answer_style = classify_answer_style(query, query_type)
+    should_build_keyed_list = query_type == "table_lookup" or answer_style == "table_or_bullets"
+    should_build_boolean_matrix = query_type in {"condition_lookup", "table_lookup"} or answer_style == "table_or_bullets"
+    if not should_build_keyed_list and not should_build_boolean_matrix:
+        return empty
+
+    structured = [
+        match
+        for match in matches
+        if match.get("match_type") == "structured_record" and isinstance(match.get("fields"), dict) and match.get("fields")
+    ]
+    if not structured:
+        return empty
+
+    top_group = top_structured_group(structured)
+    query_keywords = meaningful_answer_terms([*extract_keywords(query, limit=16), *entities])
+    if not query_keywords:
+        return empty
+
+    if should_build_keyed_list:
+        keyed = build_keyed_list_answer(query, query_type, query_keywords, top_group)
+        if keyed["direct_answer"]:
+            return keyed
+
+    if should_build_boolean_matrix:
+        pivoted = build_boolean_matrix_answer(query, query_keywords, top_group)
+        if pivoted["direct_answer"]:
+            return pivoted
+
+    return empty
+
+
+def top_structured_group(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not matches:
+        return []
+    first = matches[0]
+    first_key = (first.get("document_id"), first.get("chunk_id"), first.get("section_path"))
+    grouped = [
+        match
+        for match in matches
+        if (match.get("document_id"), match.get("chunk_id"), match.get("section_path")) == first_key
+    ]
+    return grouped or matches
+
+
+def meaningful_answer_terms(terms: list[str]) -> list[str]:
+    result = []
+    for term in unique_keep_order(terms):
+        cleaned = clean_cell(term)
+        norm = normalize_for_match(cleaned)
+        if len(norm) < 2:
+            continue
+        if norm in {normalize_for_match(item) for item in GENERIC_LIST_TERMS}:
+            continue
+        result.append(cleaned)
+    return result
+
+
+def build_keyed_list_answer(
+    query: str,
+    query_type: str,
+    query_terms: list[str],
+    matches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    target_key = choose_target_field_key(query, query_terms, matches)
+    if not target_key:
+        return {
+            "direct_answer": "",
+            "answer_items": [],
+            "answer_field": "",
+            "filter_terms": [],
+            "mode": "",
+        }
+
+    filter_terms = [term for term in query_terms if not term_matches_key(term, target_key)]
+    filtered_matches = filter_matches_by_row_terms(matches, filter_terms, exclude_keys={target_key})
+    if not filtered_matches:
+        filtered_matches = matches
+
+    values = []
+    answer_items = []
+    for match in filtered_matches:
+        fields = match.get("fields") or {}
+        value = clean_cell(fields.get(target_key, ""))
+        if not value:
+            continue
+        if normalize_for_match(value) in {normalize_for_match(item) for item in values}:
+            continue
+        values.append(value)
+        answer_items.append(
+            {
+                "value": value,
+                "field": target_key,
+                "record_id": match.get("record_id", ""),
+                "page": match.get("page"),
+                "section_path": match.get("section_path", ""),
+                "fields": fields,
+            }
+        )
+
+    if not values:
+        return {
+            "direct_answer": "",
+            "answer_items": [],
+            "answer_field": "",
+            "filter_terms": [],
+            "mode": "",
+        }
+
+    return {
+        "direct_answer": format_direct_answer_text(target_key, values),
+        "answer_items": answer_items,
+        "answer_field": target_key,
+        "filter_terms": filter_terms,
+        "mode": "target_field",
+    }
+
+
+def choose_target_field_key(query: str, query_terms: list[str], matches: list[dict[str, Any]]) -> str:
+    query_norm = normalize_for_match(query)
+    scores: Counter[str] = Counter()
+    key_by_norm: dict[str, str] = {}
+    for match in matches:
+        fields = match.get("fields") or {}
+        for key, value in fields.items():
+            key = clean_cell(key)
+            if not key:
+                continue
+            key_norm = normalize_for_match(key)
+            key_by_norm[key_norm] = key
+            if key_norm and key_norm in query_norm:
+                scores[key_norm] += 8
+            for term in query_terms:
+                term_norm = normalize_for_match(term)
+                if not term_norm:
+                    continue
+                if term_norm in key_norm or key_norm in term_norm:
+                    scores[key_norm] += 4
+                    continue
+                token_hits = sum(1 for token in term_norm.split() if len(token) >= 2 and token in key_norm)
+                scores[key_norm] += token_hits
+            value_norm = normalize_for_match(value)
+            if value_norm and value_norm in query_norm:
+                scores[key_norm] -= 5
+    if not scores:
+        return ""
+    key_norm, score = scores.most_common(1)[0]
+    return key_by_norm.get(key_norm, "") if score >= 3 else ""
+
+
+def term_matches_key(term: str, key: str) -> bool:
+    term_norm = normalize_for_match(term)
+    key_norm = normalize_for_match(key)
+    return bool(term_norm and key_norm and (term_norm in key_norm or key_norm in term_norm or all(token in key_norm for token in term_norm.split() if len(token) >= 2)))
+
+
+def filter_matches_by_row_terms(matches: list[dict[str, Any]], filter_terms: list[str], *, exclude_keys: set[str]) -> list[dict[str, Any]]:
+    row_terms = [term for term in filter_terms if len(normalize_for_match(term)) >= 2]
+    if not row_terms:
+        return matches
+    filtered = []
+    for match in matches:
+        fields = match.get("fields") or {}
+        row_text = " ".join(str(value) for key, value in fields.items() if key not in exclude_keys)
+        if all(term_in_text(term, row_text) for term in row_terms):
+            filtered.append(match)
+    return filtered
+
+
+def build_boolean_matrix_answer(query: str, query_terms: list[str], matches: list[dict[str, Any]]) -> dict[str, Any]:
+    for match in matches:
+        fields = match.get("fields") or {}
+        if not fields:
+            continue
+        filter_fields = [
+            key
+            for key, value in fields.items()
+            if any(term_in_text(term, value) for term in query_terms)
+        ]
+        if not filter_fields:
+            continue
+        values = []
+        answer_items = []
+        for key, value in fields.items():
+            if key in filter_fields:
+                continue
+            cell = clean_cell(value)
+            if is_positive_cell(cell):
+                values.append(key)
+                answer_items.append(
+                    {
+                        "value": key,
+                        "field": key,
+                        "record_id": match.get("record_id", ""),
+                        "page": match.get("page"),
+                        "section_path": match.get("section_path", ""),
+                        "fields": fields,
+                        "cell_value": cell,
+                    }
+                )
+        if values:
+            return {
+                "direct_answer": format_direct_answer_text("supported_fields", values),
+                "answer_items": answer_items,
+                "answer_field": "supported_fields",
+                "filter_terms": query_terms,
+                "mode": "boolean_matrix",
+            }
+    return {
+        "direct_answer": "",
+        "answer_items": [],
+        "answer_field": "",
+        "filter_terms": [],
+        "mode": "",
+    }
+
+
+def is_positive_cell(value: str) -> bool:
+    cell = clean_cell(value)
+    if not cell or NEGATIVE_CELL_RE.search(cell):
+        return False
+    return bool(POSITIVE_CELL_RE.search(cell))
+
+
+def term_in_text(term: str, text: Any) -> bool:
+    term_norm = normalize_for_match(term)
+    text_norm = normalize_for_match(str(text or ""))
+    if not term_norm or not text_norm:
+        return False
+    if term_norm in text_norm:
+        return True
+    tokens = [token for token in term_norm.split() if len(token) >= 2]
+    return bool(tokens and all(token in text_norm for token in tokens))
+
+
+def format_direct_answer_text(answer_field: str, values: list[str]) -> str:
+    if not values:
+        return ""
+    if len(values) == 1:
+        return f"{answer_field}: {values[0]}"
+    return f"{answer_field}: " + ", ".join(values)
 
 
 def assess_answerability(
@@ -1631,9 +1929,14 @@ def choose_answer_candidate(record: StructuredRecord, query_type: str, terms: li
     return record.answer_text
 
 
-def format_lookup_context(matches: list[dict[str, Any]]) -> str:
+def format_lookup_context(matches: list[dict[str, Any]], direct_answer: dict[str, Any] | None = None) -> str:
     blocks = []
     used_chars = 0
+    direct_block = format_direct_answer_context(direct_answer or {})
+    has_direct_answer = bool(direct_block)
+    if direct_block:
+        blocks.append(direct_block)
+        used_chars += len(direct_block) + 2
     for match in matches:
         evidence = trim_text(str(match.get("evidence", "")), MATCH_EVIDENCE_CHAR_LIMIT)
         supporting_context = trim_text(str(match.get("supporting_context", "")), SUPPORTING_CONTEXT_CHAR_LIMIT)
@@ -1650,7 +1953,7 @@ def format_lookup_context(matches: list[dict[str, Any]]) -> str:
                 f"[reason: {match.get('reason', '')}]",
                 f"answer_candidate: {match['answer'] or match['answer_hint']}",
                 f"evidence:\n{evidence}",
-                f"supporting_context:\n{supporting_context}" if supporting_context else "",
+                f"supporting_context:\n{supporting_context}" if supporting_context and not has_direct_answer else "",
             ]
         ).strip()
         if used_chars and used_chars + len(block) > CONTEXT_CHAR_BUDGET:
@@ -1663,6 +1966,30 @@ def format_lookup_context(matches: list[dict[str, Any]]) -> str:
         if used_chars >= CONTEXT_CHAR_BUDGET:
             break
     return "\n\n".join(blocks)
+
+
+def format_direct_answer_context(direct_answer: dict[str, Any]) -> str:
+    answer_text = clean_cell(direct_answer.get("direct_answer", ""))
+    items = direct_answer.get("answer_items") or []
+    if not answer_text or not isinstance(items, list):
+        return ""
+    values = unique_keep_order(
+        clean_cell(item.get("value", ""))
+        for item in items
+        if isinstance(item, dict) and clean_cell(item.get("value", ""))
+    )
+    if not values:
+        return ""
+    lines = [
+        "[Direct Answer - complete structured result]",
+        f"answer_candidate: {answer_text}",
+        f"answer_field: {direct_answer.get('answer_field', '')}",
+        f"filter_terms: {', '.join(str(term) for term in direct_answer.get('filter_terms', []))}",
+        "complete_values:",
+    ]
+    lines.extend(f"- {value}" for value in values)
+    lines.append("Instruction: include every value in complete_values; do not omit or add values.")
+    return "\n".join(lines)
 
 
 def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result: Any = None) -> dict[str, str]:
@@ -1729,6 +2056,19 @@ def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result
 
 
 def build_grounded_answer_draft(question: str, lookup: dict[str, Any]) -> str:
+    direct_answer = clean_cell(lookup.get("direct_answer", "")) if isinstance(lookup, dict) else ""
+    answer_items = lookup.get("answer_items") if isinstance(lookup, dict) else []
+    if direct_answer and isinstance(answer_items, list) and len(answer_items) > 1:
+        values = unique_keep_order(
+            clean_cell(item.get("value", ""))
+            for item in answer_items
+            if isinstance(item, dict) and clean_cell(item.get("value", ""))
+        )
+        if values:
+            return "근거에서 확인되는 전체 목록은 다음과 같습니다.\n" + "\n".join(f"- {value}" for value in values)
+    if direct_answer:
+        return direct_answer
+
     matches = lookup.get("matches") if isinstance(lookup, dict) else []
     if not isinstance(matches, list) or not matches:
         return "제공된 문서에는 충분한 근거가 없습니다."
@@ -1833,6 +2173,23 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
             }
         )
 
+    direct_values = extract_complete_answer_values(evidence_text)
+    if direct_values:
+        answer_norm = normalize_for_match(answer)
+        missing_direct_values = [
+            value
+            for value in direct_values
+            if normalize_for_match(value) and normalize_for_match(value) not in answer_norm
+        ]
+        if missing_direct_values:
+            issues.append(
+                {
+                    "type": "missing_direct_answer_value",
+                    "message": "The answer omits values from the complete structured result.",
+                    "values": missing_direct_values[:10],
+                }
+            )
+
     if is_abstention_answer(answer) and evidence_has_answer_candidate(question, evidence_text, query_type):
         issues.append(
             {
@@ -1849,6 +2206,7 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
         "unsupported_number",
         "unsupported_date",
         "unsupported_identifier",
+        "missing_direct_answer_value",
         "unnecessary_abstention",
     }
     valid = not any(issue["type"] in severe_issue_types for issue in issues)
@@ -1871,6 +2229,28 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
         "answer_identifiers": answer_identifiers,
         "evidence_identifiers": evidence_identifiers[:20],
     }
+
+
+def extract_complete_answer_values(evidence_text: str) -> list[str]:
+    values = []
+    in_values = False
+    for raw_line in evidence_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if in_values:
+                break
+            continue
+        if line == "complete_values:":
+            in_values = True
+            continue
+        if in_values:
+            if line.startswith("- "):
+                value = clean_cell(line[2:])
+                if value:
+                    values.append(value)
+                continue
+            break
+    return unique_keep_order(values)
 
 
 def is_abstention_answer(answer: str) -> bool:

@@ -129,7 +129,7 @@ def evaluate_case(case: dict[str, Any], artifacts: dict[str, Any], *, limit: int
     missing_terms = missing_needles(context, required_terms)
     missing_values = missing_needles(context, expected_values)
     evidence_recall = not missing_terms if answerable else True
-    exact_value_match = not missing_values if answerable else no_forbidden_values(context, forbidden_values)
+    exact_value_match = (not missing_values and no_forbidden_values(context, forbidden_values)) if answerable else no_forbidden_values(context, forbidden_values)
     answerable_detection = selected_count > 0 and evidence_recall if answerable else no_forbidden_values(context, forbidden_values)
 
     unsupported_guard = None
