@@ -4,11 +4,12 @@ import asyncio
 import logging
 from typing import Any
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from .config import get_settings
 from .converter import PdfConverter
+from .eval_logs import EVAL_LOG_STORE
 from .rag import (
     STORE,
     build_grounded_answer_draft,
@@ -247,6 +248,33 @@ async def chatflow_debug(request: ChatflowDebugRequest) -> ChatflowDebugResponse
             "draft_answer_valid": bool(draft_verification.get("valid")),
         },
     )
+
+
+@app.post("/eval/log")
+async def eval_log(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    try:
+        record = dict(payload)
+        record["_http"] = {
+            "client": request.client.host if request.client else "",
+            "user_agent": request.headers.get("user-agent", ""),
+        }
+        return EVAL_LOG_STORE.append(record)
+    except Exception as exc:
+        logger.exception("Evaluation log write failed")
+        return {"success": False, "error": str(exc)}
+
+
+@app.get("/eval/logs")
+async def eval_logs(limit: int = 50, date: str | None = None) -> dict[str, Any]:
+    return {"success": True, "logs": EVAL_LOG_STORE.list(limit=limit, date=date)}
+
+
+@app.get("/eval/logs/{run_id}")
+async def eval_log_detail(run_id: str) -> dict[str, Any]:
+    record = EVAL_LOG_STORE.get(run_id)
+    if record is None:
+        return {"success": False, "error": "log not found", "run_id": run_id}
+    return {"success": True, "log": record}
 
 
 @app.get("/rag/documents")

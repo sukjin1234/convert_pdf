@@ -12,6 +12,8 @@ POST /query/plan   질문 유형/키워드/하위질문/검색어 확장
 POST /lookup       구조화 레코드 exact lookup + evidence packing
 POST /answer/verify 답변 숫자/날짜/식별자 근거 검증
 POST /chatflow/debug Dify Chatflow 노드 흐름 로컬 재현
+POST /eval/log    Dify 실행 trace JSONL 저장
+GET  /eval/logs   저장된 평가 로그 목록/상세 조회
 GET  /rag/documents 저장된 RAG artifact 목록
 GET  /health
 ```
@@ -77,6 +79,16 @@ curl.exe -H "Content-Type: application/json" -d "{\"query\":\"전공심화 개�
 
 `/chatflow/debug`는 `Query Plan -> Structured Lookup -> Merge Evidence -> Verify` 흐름을 한 번에 재현한다. `Knowledge Retrieval`이 비어 있어도 `merge_evidence.evidence_context`에 `Structured Lookup - authoritative exact evidence`가 있고 `draft_verification.valid=true`이면 API 쪽 근거 생성은 정상이다. 이때 Dify 최종 답변이 실패하면 `Merge Evidence` 코드, `evidence_priority` 출력 변수, Final Answer LLM 프롬프트 연결을 먼저 확인한다.
 
+평가 로그 저장:
+
+```powershell
+curl.exe -H "Content-Type: application/json" -d "{\"query\":\"전공심화 개설 학과 알려줘\",\"document_id\":\"sample_2026\",\"final_answer\":\"...\",\"verify_result\":{\"valid\":true}}" http://127.0.0.1:8000/eval/log
+
+curl.exe http://127.0.0.1:8000/eval/logs?limit=20
+```
+
+`/eval/log`는 Dify HTTP 노드에서 질문, 각 노드 입력/출력, 최종 답변, 검증 결과를 그대로 받아 JSONL과 run_id별 JSON 파일로 저장한다.
+
 ## 환경 변수
 
 ```text
@@ -88,9 +100,11 @@ ODL_MAX_PDF_BYTES               기본 83886080
 ODL_TABLE_METHOD                기본 cluster
 ODL_USE_STRUCT_TREE             기본 false
 RAG_STORE_DIR                   기본 OS temp/dify-rag-store
+EVAL_LOG_DIR                    기본 OS temp/dify-rag-eval-logs
 ```
 
 `RAG_STORE_DIR`에는 `/convert/rag` 결과 artifact가 JSON으로 저장됩니다. API 서버가 재시작되어도 `/lookup`이 이전 records를 다시 로드할 수 있습니다.
+`EVAL_LOG_DIR`에는 `/eval/log` 실행 기록이 날짜별 JSONL과 run_id별 JSON 파일로 저장됩니다.
 
 ## 테스트
 

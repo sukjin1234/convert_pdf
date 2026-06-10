@@ -198,6 +198,8 @@ Start
 -> Build Verify Body
 -> Verify Answer
 -> Parse Verify Result
+-> Build Eval Log Body
+-> Eval Log
 -> Conditional
 ```
 
@@ -568,7 +570,7 @@ Raw Body:
 {{Build Verify Body.verify_body_json}}
 ```
 
-### 3.10 Conditional
+### 3.10 Code: Parse Verify Result
 
 먼저 `Verify Answer.body`를 파싱하는 Code 노드를 하나 둔다.
 
@@ -632,7 +634,178 @@ should_answer: boolean
 should_rewrite: boolean
 ```
 
-Conditional 노드 조건:
+### 3.11 Code: Build Eval Log Body
+
+Dify HTTP Request의 JSON body 편집기에는 boolean 변수나 `Knowledge Retrieval.result` 같은 object/list 변수가 직접 들어가지 않는 경우가 많다. 그래서 로그 payload는 Code 노드에서 JSON 문자열로 만든 뒤, HTTP 노드에는 raw body로 전달한다.
+
+노드 이름:
+
+```text
+Build Eval Log Body
+```
+
+입력 변수:
+
+```text
+query = {{sys.query}}
+document_id = {{Parse Query Plan.document_id}}
+query_plan_body = {{Query Plan.body}}
+structured_lookup_body = {{Structured Lookup.body}}
+knowledge_context = {{Merge Evidence.knowledge_context}}
+evidence_context = {{Merge Evidence.evidence_context}}
+evidence_priority = {{Merge Evidence.evidence_priority}}
+lookup_answerability = {{Merge Evidence.lookup_answerability}}
+final_answer = {{Final Answer.text}}
+verify_answer_body = {{Verify Answer.body}}
+```
+
+중요: `knowledge_context`에는 `Knowledge Retrieval.result`를 직접 넣지 말고, 반드시 `Merge Evidence.knowledge_context`를 넣는다. 이 값은 앞선 Merge Evidence 코드에서 검색 결과를 문자열로 정리한 출력이다.
+
+Python:
+
+```python
+import json
+
+def parse_json(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, (dict, list, bool, int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            return json.loads(text)
+        except Exception:
+            return default
+    return default
+
+def issue_lines(issues):
+    lines = []
+    for issue in issues or []:
+        if isinstance(issue, dict):
+            issue_type = issue.get("type", "unknown")
+            message = issue.get("message", "")
+            terms = issue.get("terms")
+            suffix = f" terms={terms}" if terms else ""
+            lines.append(f"- {issue_type}: {message}{suffix}".strip())
+        else:
+            lines.append(f"- {issue}")
+    return "\n".join(lines)
+
+def main(
+    query="",
+    document_id="",
+    query_plan_body="",
+    structured_lookup_body="",
+    knowledge_context="",
+    evidence_context="",
+    evidence_priority="",
+    lookup_answerability="",
+    final_answer="",
+    verify_answer_body="",
+) -> dict:
+    query_plan = parse_json(query_plan_body, {}) or {}
+    verify = parse_json(verify_answer_body, {}) or {}
+    answerability = parse_json(lookup_answerability, {}) or {}
+    valid = bool(verify.get("valid", False))
+    confidence = float(verify.get("confidence") or 0)
+    issues = verify.get("issues", [])
+
+    payload = {
+        "query": query,
+        "document_id": document_id or query_plan.get("document_id", ""),
+        "query_plan": {
+            "query_type": query_plan.get("query_type", ""),
+            "answer_style": query_plan.get("answer_style", ""),
+            "entities": query_plan.get("entities", []),
+            "sub_queries": query_plan.get("sub_queries", []),
+            "expanded_query": query_plan.get("expanded_query", ""),
+        },
+        "nodes": {
+            "query_plan_body": query_plan_body,
+            "structured_lookup_body": structured_lookup_body,
+            "knowledge_retrieval_text": knowledge_context,
+            "merge_evidence": {
+                "evidence_context": evidence_context,
+                "evidence_priority": evidence_priority,
+                "lookup_answerability": answerability,
+            },
+            "final_answer": final_answer,
+            "verify_answer_body": verify_answer_body,
+            "parse_verify_result": {
+                "valid": valid,
+                "confidence": confidence,
+                "query_type": verify.get("query_type", ""),
+                "issues": issues,
+                "issues_text": issue_lines(issues),
+                "should_answer": valid and confidence >= 0.7,
+                "should_rewrite": (not valid) or confidence < 0.7,
+            },
+        },
+    }
+
+    return {
+        "eval_log_body_json": json.dumps(payload, ensure_ascii=False)
+    }
+```
+
+출력 변수 타입:
+
+```text
+eval_log_body_json: string
+```
+
+### 3.12 HTTP Request: Eval Log
+
+노드 이름:
+
+```text
+Eval Log
+```
+
+설정:
+
+```text
+Method: POST
+URL: http://<fastapi-host>:8000/eval/log
+Authorization: None
+Body Type: raw
+Raw Body Type: JSON
+```
+
+Headers:
+
+```text
+Content-Type: application/json
+```
+
+Raw Body:
+
+```text
+{{Build Eval Log Body.eval_log_body_json}}
+```
+
+`Eval Log` 응답은 답변 판단에 쓰지 않는다. HTTP 노드가 실패해도 운영 답변 흐름을 막지 않게 하려면 Dify에서 실패 시 계속 진행하도록 설정하거나, 최종 Answer 경로와 분리한다.
+
+로그 저장 위치:
+
+```text
+기본: OS temp/dify-rag-eval-logs
+변경: EVAL_LOG_DIR 환경 변수
+```
+
+조회:
+
+```bash
+curl http://<fastapi-host>:8000/eval/logs?limit=20
+curl http://<fastapi-host>:8000/eval/logs/<run_id>
+```
+
+### 3.13 Conditional
+
+조건:
 
 ```text
 IF Parse Verify Result.should_answer == true
@@ -805,6 +978,44 @@ supplied_answer_verification.valid == false
 ```
 
 위 값이 맞으면 FastAPI의 structured lookup, evidence merge, verifier는 정상이다. 그 상태에서 Dify 답변만 실패하면 `Merge Evidence` 코드가 최신인지, `evidence_priority` 출력 변수를 만들었는지, Final Answer LLM User Prompt에 `Evidence priority`와 `Evidence`가 둘 다 연결됐는지 확인한다.
+
+### 4.7 POST /eval/log
+
+Dify 실제 실행 trace를 로컬 JSONL로 저장한다. 요청 body는 자유 형식이며, API가 `run_id`, `created_at`, `_http`, `size`를 추가한다.
+
+요청 예:
+
+```json
+{
+  "query": "전공심화 개설 학과 알려줘",
+  "document_id": "sample_2026",
+  "final_answer": "...",
+  "verify_result": {
+    "valid": true
+  }
+}
+```
+
+응답:
+
+```json
+{
+  "success": true,
+  "run_id": "...",
+  "created_at": "...",
+  "log_path": "...",
+  "jsonl_path": "...",
+  "size": 1234
+}
+```
+
+조회:
+
+```text
+GET /eval/logs?limit=50
+GET /eval/logs?date=2026-06-10
+GET /eval/logs/{run_id}
+```
 
 ## 5. 수동 테스트
 
