@@ -55,7 +55,7 @@ Chatflow의 JSON/Raw HTTP 노드에서는 다음 헤더만 넣습니다.
 Content-Type: application/json
 ```
 
-`/lookup` 응답의 `context`는 Dify LLM에 바로 넣는 evidence 본문입니다. 목록/표 질문에서는 `context` 맨 위에 `[Direct Answer - complete structured result]`와 `complete_values`가 들어가므로, LLM은 이 값을 빠뜨리지 않고 답해야 합니다. 표 행의 `♣`, `†`, `◈` 같은 표시와 `표시/indicates/means` 범례도 자동으로 연결해 행 필드에 반영합니다. 추가로 `direct_answer`, `answer_items`, `answer_field`, `filter_terms`, `evidence_items`, `diagnostics`, `answer_style`, `sub_queries`가 들어오므로 디버깅과 프롬프트 분기에 사용할 수 있습니다.
+`/lookup` 응답의 `context`는 Dify LLM에 바로 넣는 evidence 본문입니다. 목록/표 질문에서는 `context` 맨 위에 `[Direct Answer - complete structured result]`와 `complete_values`가 들어가므로, LLM은 이 값을 빠뜨리지 않고 답해야 합니다. 표 행의 `♣`, `†`, `◈` 같은 표시와 `표시/indicates/means` 범례도 자동으로 연결해 행 필드에 반영합니다. 범례가 표 바로 아래가 아니라 다음 페이지나 다른 섹션에 있어도 문서 안에서 해당 기호의 의미가 하나로 명확하면 연결됩니다. 추가로 `direct_answer`, `answer_items`, `answer_field`, `filter_terms`, `evidence_items`, `diagnostics`, `answer_style`, `sub_queries`가 들어오므로 디버깅과 프롬프트 분기에 사용할 수 있습니다.
 
 ## 수동 테스트
 

@@ -723,6 +723,7 @@ def build_rag_artifact(
     normalized = normalize_markdown(markdown)
     doc_id = document_id or make_document_id(file_name, normalized)
     safe_file_name = file_name or "document.pdf"
+    document_marker_legends = extract_unambiguous_marker_legends(normalized.split("\n"))
 
     chunks: list[RagChunk] = []
     records: list[StructuredRecord] = []
@@ -736,6 +737,7 @@ def build_rag_artifact(
             file_name=safe_file_name,
             page=block["page"],
             section_path=block["section_path"],
+            document_marker_legends=document_marker_legends,
         )
         texts = split_chunk_text(expanded_text, chunk_char_limit)
         if not texts:
@@ -790,6 +792,7 @@ def build_rag_artifact(
         "page_count": len({chunk.page_start for chunk in chunks if chunk.page_start is not None}),
         "section_count": len(document_map),
         "dify_markdown_chars": len(dify_markdown),
+        "marker_legend_count": len(document_marker_legends),
     }
     return RagArtifact(
         success=True,
@@ -967,9 +970,11 @@ def expand_tables_to_records(
     file_name: str,
     page: int | None,
     section_path: str,
+    document_marker_legends: dict[str, str] | None = None,
 ) -> tuple[str, list[StructuredRecord]]:
     lines = text.split("\n")
-    marker_legends = extract_marker_legends(lines)
+    local_marker_legends = extract_marker_legends(lines)
+    marker_legends = {**(document_marker_legends or {}), **local_marker_legends}
     output: list[str] = []
     records: list[StructuredRecord] = []
     table_index = 0
@@ -1101,8 +1106,22 @@ def extract_plain_marker_records(
 
 
 def is_marker_legend_line(line: str) -> bool:
+    return parse_marker_legend_line(line) is not None
+
+
+def parse_marker_legend_line(line: str) -> tuple[str, str] | None:
     cleaned = clean_legend_line(line)
-    return any(pattern.search(cleaned) for pattern in MARKER_LEGEND_PATTERNS)
+    if not cleaned:
+        return None
+    for pattern in MARKER_LEGEND_PATTERNS:
+        match = pattern.search(cleaned)
+        if not match:
+            continue
+        symbol = match.group("symbol")
+        meaning = clean_marker_meaning(match.group("meaning"))
+        if symbol and meaning:
+            return symbol, meaning
+    return None
 
 
 def extract_marked_line_item(line: str, symbol: str) -> str:
@@ -1125,19 +1144,30 @@ def strip_plain_table_prefix(value: str) -> str:
 def extract_marker_legends(lines: list[str]) -> dict[str, str]:
     legends: dict[str, str] = {}
     for line in lines:
-        cleaned = clean_legend_line(line)
-        if not cleaned:
+        parsed = parse_marker_legend_line(line)
+        if not parsed:
             continue
-        for pattern in MARKER_LEGEND_PATTERNS:
-            match = pattern.search(cleaned)
-            if not match:
-                continue
-            symbol = match.group("symbol")
-            meaning = clean_marker_meaning(match.group("meaning"))
-            if symbol and meaning:
-                legends[symbol] = meaning
-            break
+        symbol, meaning = parsed
+        legends[symbol] = meaning
     return legends
+
+
+def extract_unambiguous_marker_legends(lines: list[str]) -> dict[str, str]:
+    meanings_by_symbol: dict[str, list[str]] = {}
+    for line in lines:
+        parsed = parse_marker_legend_line(line)
+        if not parsed:
+            continue
+        symbol, meaning = parsed
+        meanings = meanings_by_symbol.setdefault(symbol, [])
+        if normalize_for_match(meaning) not in {normalize_for_match(item) for item in meanings}:
+            meanings.append(meaning)
+
+    return {
+        symbol: meanings[0]
+        for symbol, meanings in meanings_by_symbol.items()
+        if len(meanings) == 1
+    }
 
 
 def clean_legend_line(line: str) -> str:
@@ -1172,9 +1202,9 @@ def enrich_fields_with_marker_legends(fields: dict[str, str], marker_legends: di
         enriched[key] = clean_cell(cleaned_value)
 
     if marker_hits:
-        symbols = unique_keep_order(symbol for symbol, _, _ in marker_hits)
-        meanings = unique_keep_order(meaning for _, meaning, _ in marker_hits)
-        marked_fields = unique_keep_order(field for _, _, field in marker_hits)
+        symbols = unique_exact_keep_order(symbol for symbol, _, _ in marker_hits)
+        meanings = unique_exact_keep_order(meaning for _, meaning, _ in marker_hits)
+        marked_fields = unique_exact_keep_order(field for _, _, field in marker_hits)
         enriched["표시"] = ", ".join(symbols)
         enriched["표시 의미"] = "; ".join(meanings)
         enriched["표시 대상 필드"] = ", ".join(marked_fields)
@@ -1741,7 +1771,8 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
     should_build_boolean_matrix = query_type in {"condition_lookup", "table_lookup"} or answer_style == "table_or_bullets"
     should_build_field_value = query_type in {"number_lookup", "date_lookup", "contact_lookup"} or answer_style == "direct"
     should_build_inverse_list = should_build_keyed_list or looks_like_inverse_value_question(query)
-    if not should_build_keyed_list and not should_build_boolean_matrix and not should_build_field_value and not should_build_inverse_list:
+    should_build_marker_meaning = looks_like_marker_meaning_question(query)
+    if not should_build_keyed_list and not should_build_boolean_matrix and not should_build_field_value and not should_build_inverse_list and not should_build_marker_meaning:
         return empty
 
     structured = [
@@ -1753,6 +1784,11 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
         return empty
     if stronger_unstructured_evidence_precedes_structured(matches, structured):
         return empty
+
+    if should_build_marker_meaning:
+        marker_meaning = build_marker_meaning_answer(query, structured)
+        if marker_meaning["direct_answer"]:
+            return marker_meaning
 
     top_group = top_structured_group(structured)
     query_keywords = meaningful_answer_terms([*extract_keywords(query, limit=16), *entities])
@@ -1800,6 +1836,58 @@ def looks_like_inverse_value_question(query: str) -> bool:
     if not (extract_number_values(query) or extract_date_values(query)):
         return False
     return bool(re.search(r"\d[\d,.\s]*(?:[A-Za-z가-힣/%$]+(?:\s+[A-Za-z가-힣/%$]+){0,2})?\s*인\s+", query))
+
+
+def looks_like_marker_meaning_question(query: str) -> bool:
+    return bool(MARKER_SYMBOL_RE.search(query)) and bool(
+        re.search(r"표시|뜻|의미|범례|legend|indicates|means|denotes", query, re.IGNORECASE)
+    )
+
+
+def build_marker_meaning_answer(query: str, matches: list[dict[str, Any]]) -> dict[str, Any]:
+    markers = unique_keep_order(MARKER_SYMBOL_RE.findall(query))
+    values = []
+    answer_items = []
+    for match in sorted(matches, key=match_document_order_key):
+        fields = match.get("fields") or {}
+        meaning = clean_cell(fields.get("표시 의미", ""))
+        if not meaning:
+            continue
+        field_symbols = unique_keep_order(MARKER_SYMBOL_RE.findall(fields.get("표시", "")))
+        if markers and not any(marker in field_symbols for marker in markers):
+            continue
+        symbol = next((marker for marker in markers if marker in field_symbols), field_symbols[0] if field_symbols else "")
+        value = f"{symbol}: {meaning}" if symbol else meaning
+        if normalize_for_match(value) in {normalize_for_match(item) for item in values}:
+            continue
+        values.append(value)
+        answer_items.append(
+            {
+                "value": value,
+                "field": "표시 의미",
+                "record_id": match.get("record_id", ""),
+                "page": match.get("page"),
+                "section_path": match.get("section_path", ""),
+                "fields": fields,
+            }
+        )
+
+    if not values:
+        return {
+            "direct_answer": "",
+            "answer_items": [],
+            "answer_field": "",
+            "filter_terms": [],
+            "mode": "",
+        }
+
+    return {
+        "direct_answer": format_direct_answer_text("표시 의미", values),
+        "answer_items": answer_items,
+        "answer_field": "표시 의미",
+        "filter_terms": markers,
+        "mode": "marker_meaning",
+    }
 
 
 def top_structured_group(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2561,7 +2649,7 @@ def format_direct_answer_context(direct_answer: dict[str, Any]) -> str:
     items = direct_answer.get("answer_items") or []
     if not answer_text or not isinstance(items, list):
         return ""
-    values = unique_keep_order(
+    values = unique_exact_keep_order(
         clean_cell(item.get("value", ""))
         for item in items
         if isinstance(item, dict) and clean_cell(item.get("value", ""))
@@ -2647,7 +2735,7 @@ def build_grounded_answer_draft(question: str, lookup: dict[str, Any]) -> str:
     direct_answer = clean_cell(lookup.get("direct_answer", "")) if isinstance(lookup, dict) else ""
     answer_items = lookup.get("answer_items") if isinstance(lookup, dict) else []
     if direct_answer and isinstance(answer_items, list) and len(answer_items) > 1:
-        values = unique_keep_order(
+        values = unique_exact_keep_order(
             clean_cell(item.get("value", ""))
             for item in answer_items
             if isinstance(item, dict) and clean_cell(item.get("value", ""))
@@ -2668,7 +2756,7 @@ def build_grounded_answer_draft(question: str, lookup: dict[str, Any]) -> str:
         candidate = clean_cell(match.get("answer") or match.get("answer_hint") or "")
         if candidate:
             candidates.append(candidate)
-    candidates = unique_keep_order(candidates)
+    candidates = unique_exact_keep_order(candidates)
     if not candidates:
         return "제공된 문서에는 충분한 근거가 없습니다."
 
@@ -3040,6 +3128,19 @@ def unique_keep_order(values: Iterable[str]) -> list[str]:
     for value in values:
         item = strip_trailing_particle(clean_cell(value))
         key = item.lower()
+        if not item or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def unique_exact_keep_order(values: Iterable[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        item = clean_cell(value)
+        key = normalize_for_match(item)
         if not item or key in seen:
             continue
         seen.add(key)
