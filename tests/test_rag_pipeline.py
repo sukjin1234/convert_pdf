@@ -310,6 +310,217 @@ class RagPipelineTest(unittest.TestCase):
         self.assertIn("Classic Dashboard", result["direct_answer"])
         self.assertNotIn("Bulk Export API", result["direct_answer"])
 
+    def test_plain_text_marker_rows_are_structured_without_markdown_table(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 26 ---
+
+# 모집인원
+
+계열 모집단위 수업연한 모집정원
+공학
+자유전공학부 2 30
+로봇자동화공학과 ♣ 3 80
+반도체기계정비학과 2 60
+자동차공학과 ♣ 2 90
+전기공학과 ♣ 2 90
+전자공학과 ♣ 2 90
+정보통신공학과 ♣ 2 120
+컴퓨터정보공학과 ♣ 3 93
+컴퓨터시스템공학과 ♣ 3 93
+디지털마케팅공학과 2 60
+건설환경공학과 ♣ 2 90
+공간정보빅데이터학과 ♣ 3 80
+건축학과 ♣ 3 92
+실내건축학과 ♣ 3 92
+예체능
+산업디자인학과 2 75
+인문사회
+항공운항과 ♣ 2 160
+항공경영학과 ♣ 2 92
+관광경영학과 ♣ 2 87
+경영비서학과 ♣ 2 87
+호텔경영학과 2 87
+
+※ ♣표시 : 4년제 학사학위(전공심화)과정 개설 학과
+""",
+            "admission_plain_text.pdf",
+            document_id="doc_plain_marker_admission",
+        )
+
+        result = lookup_matches(
+            query="전공심화 개설 학과 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=30,
+        )
+
+        expected = [
+            "로봇자동화공학과",
+            "자동차공학과",
+            "전기공학과",
+            "전자공학과",
+            "정보통신공학과",
+            "컴퓨터정보공학과",
+            "컴퓨터시스템공학과",
+            "건설환경공학과",
+            "공간정보빅데이터학과",
+            "건축학과",
+            "실내건축학과",
+            "항공운항과",
+            "항공경영학과",
+            "관광경영학과",
+            "경영비서학과",
+        ]
+        self.assertEqual(result["answer_field"], "항목")
+        for department in expected:
+            self.assertIn(department, result["direct_answer"])
+        self.assertNotIn("자유전공학부", result["direct_answer"])
+        self.assertNotIn("반도체기계정비학과", result["direct_answer"])
+        self.assertNotIn("산업디자인학과", result["direct_answer"])
+        self.assertNotIn("호텔경영학과", result["direct_answer"])
+
+    def test_multilevel_header_table_supports_exact_column_lookup(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 26 ---
+
+# 모집인원
+
+| 계열 | 모집단위 | 수업 연한 | 모집 정원 | 수시1차<br>특기자 |  |  | 수시2차<br>특기자 |  |  | 정시 일반 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|  |  |  |  | 일반고 | 특성화고 | (어학) | 일반고 | 특성화고 | (어학) | (수능) |
+| 공학 | 항공기계공학과 | 3 | 120 | 50 | 21 | 13 | 18 | 8 | 4 | 6 |
+| 공학 | 정보통신공학과 | 2 | 120 | 67 | 17 |  | 24 | 6 |  | 6 |
+| 공학 | 컴퓨터정보공학과 | 3 | 93 | 53 | 13 |  | 19 | 4 |  | 4 |
+| 공학 | 화학생명공학과 | 2 | 120 | 67 | 17 |  | 24 | 6 |  | 6 |
+""",
+            "admission_multilevel.pdf",
+            document_id="doc_multilevel_admission",
+        )
+
+        special = lookup_matches(
+            query="컴퓨터정보공학과 수시1차 특성화고 모집인원은?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        self.assertEqual(special["answer_field"], "수시1차 특기자 특성화고")
+        self.assertIn("13", special["direct_answer"])
+        self.assertNotIn("53", special["direct_answer"])
+
+        inverse = lookup_matches(
+            query="모집정원이 120명인 학과를 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        self.assertEqual(inverse["answer_field"], "모집단위")
+        self.assertIn("항공기계공학과", inverse["direct_answer"])
+        self.assertIn("정보통신공학과", inverse["direct_answer"])
+        self.assertIn("화학생명공학과", inverse["direct_answer"])
+        self.assertNotIn("컴퓨터정보공학과", inverse["direct_answer"])
+
+    def test_verify_rejects_inverse_lookup_answer_that_drops_query_value(self):
+        result = verify_answer(
+            "모집정원이 120명인 학과를 알려줘",
+            "로봇자동화공학과의 모집정원은 80명입니다.",
+            [
+                "[Structured Lookup - authoritative exact evidence]\n"
+                "모집단위: 항공기계공학과\n모집 정원: 120\n"
+                "모집단위: 로봇자동화공학과\n모집 정원: 80"
+            ],
+        )
+
+        self.assertFalse(result["valid"])
+        self.assertTrue(any(issue["type"] == "missing_query_constraint_value" for issue in result["issues"]))
+
+    def test_verify_rejects_answer_for_different_named_entity(self):
+        result = verify_answer(
+            "정보통신공학과 모집정원은 몇 명이야?",
+            "컴퓨터정보공학과의 모집정원은 93명입니다.",
+            [
+                "[Structured Lookup - authoritative exact evidence]\n"
+                "모집단위: 정보통신공학과\n모집 정원: 120\n"
+                "모집단위: 컴퓨터정보공학과\n모집 정원: 93"
+            ],
+        )
+
+        self.assertFalse(result["valid"])
+        self.assertTrue(any(issue["type"] == "missing_question_entity" for issue in result["issues"]))
+
+    def test_inverse_value_lookup_is_domain_neutral(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# Mixed Operations Manual
+
+## Error Catalog
+
+| Error Code | HTTP Status | Cause | Resolution |
+| --- | --- | --- | --- |
+| AUTH_401 | 401 | Missing token | Reissue API key |
+| PAY_503 | 503 | Payment gateway unavailable | Fail over to backup gateway |
+
+## Data Retention
+
+| Data Type | Retention Period | Storage Location |
+| --- | --- | --- |
+| Audit Logs | 3 years | Secure Archive |
+| Session Records | 180 days | Analytics Store |
+
+## Plans
+
+| Plan | Monthly Price | Included Users | Support SLA |
+| --- | --- | --- | --- |
+| Basic | $29 | 5 users | 2 business days |
+| Enterprise | Custom | Unlimited | 2 hours |
+""",
+            "mixed_manual.pdf",
+            document_id="doc_mixed_manual",
+        )
+
+        error = lookup_matches(
+            query="HTTP Status가 503인 Error Code 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        self.assertEqual(error["answer_field"], "Error Code")
+        self.assertIn("PAY_503", error["direct_answer"])
+        self.assertNotIn("AUTH_401", error["direct_answer"])
+
+        retention = lookup_matches(
+            query="Retention Period가 3 years인 Data Type 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        self.assertEqual(retention["answer_field"], "Data Type")
+        self.assertIn("Audit Logs", retention["direct_answer"])
+        self.assertNotIn("Session Records", retention["direct_answer"])
+
+        price = lookup_matches(
+            query="Monthly Price가 $29인 Plan 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        self.assertEqual(price["answer_field"], "Plan")
+        self.assertIn("Basic", price["direct_answer"])
+        self.assertNotIn("Enterprise", price["direct_answer"])
+
+        sla = lookup_matches(
+            query="Support SLA가 2 hours인 Plan 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        self.assertEqual(sla["answer_field"], "Plan")
+        self.assertIn("Enterprise", sla["direct_answer"])
+        self.assertNotIn("Basic", sla["direct_answer"])
+
     def test_boolean_matrix_lookup_builds_supported_value_list(self):
         artifact = build_rag_artifact(
             """

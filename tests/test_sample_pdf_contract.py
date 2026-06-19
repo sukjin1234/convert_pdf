@@ -1,4 +1,5 @@
 import os
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -11,7 +12,11 @@ class SamplePdfContractTest(unittest.TestCase):
     @unittest.skipUnless(os.getenv("RUN_SAMPLE_PDF_TEST") == "1", "Set RUN_SAMPLE_PDF_TEST=1 to run the sample PDF integration test.")
     def test_sample_pdf_can_build_rag_artifact(self):
         root = Path(__file__).resolve().parents[1]
-        candidates = sorted(root.glob("*모집요강.pdf"))
+        candidates = sorted(
+            path
+            for path in root.glob("*.pdf")
+            if "모집요강" in unicodedata.normalize("NFC", path.name)
+        )
         self.assertTrue(candidates, "Sample admission PDF was not found.")
 
         pdf_path = candidates[0]

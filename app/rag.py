@@ -1210,10 +1210,50 @@ def parse_markdown_table(lines: list[str]) -> tuple[list[str], list[list[str]]] 
     width = max([len(headers), *(len(row) for row in rows)] or [0])
     headers = [clean_cell(header) or f"Column {index}" for index, header in enumerate(headers + [""] * width, start=1)][:width]
     rows = [(row + [""] * width)[:width] for row in rows]
+    if rows and looks_like_secondary_header_row(rows[0]):
+        headers = merge_multilevel_headers(headers, rows[0])
+        rows = rows[1:]
     rows = [row for row in rows if any(clean_cell(cell) for cell in row)]
     if not rows:
         return None
     return headers, rows
+
+
+def looks_like_secondary_header_row(row: list[str]) -> bool:
+    cells = [clean_cell(cell) for cell in row]
+    non_empty = [cell for cell in cells if cell]
+    if len(non_empty) < 2:
+        return False
+    label_cells = [
+        cell
+        for cell in non_empty
+        if not NUMBER_RE.fullmatch(cell) and not DATE_RE.search(cell) and len(cell) <= 30
+    ]
+    leading_blanks = 0
+    for cell in cells:
+        if cell:
+            break
+        leading_blanks += 1
+    return leading_blanks >= 1 and len(label_cells) / len(non_empty) >= 0.75
+
+
+def merge_multilevel_headers(headers: list[str], subheaders: list[str]) -> list[str]:
+    merged = []
+    current_parent = ""
+    for index, header in enumerate(headers):
+        header = clean_cell(header)
+        subheader = clean_cell(subheaders[index]) if index < len(subheaders) else ""
+        if header and not re.fullmatch(r"Column\s+\d+", header, re.IGNORECASE):
+            current_parent = header
+        parent = current_parent or header
+        if subheader:
+            if parent and normalize_for_match(subheader) not in normalize_for_match(parent):
+                merged.append(clean_cell(f"{parent} {subheader}"))
+            else:
+                merged.append(parent or subheader)
+        else:
+            merged.append(parent or header or f"Column {index + 1}")
+    return [clean_cell(header) or f"Column {index}" for index, header in enumerate(merged, start=1)]
 
 
 def split_table_row(line: str) -> list[str]:
@@ -1528,8 +1568,10 @@ def lookup_matches(
     answerability = assess_answerability(query, active_query_type, active_entities, combined)
     if not answerability["answerable"]:
         combined = []
-    direct_answer = build_direct_answer(query, active_query_type, active_entities, combined)
-    context_matches = filter_context_matches_for_direct_answer(combined, direct_answer)
+    direct_candidates = select_evidence_matches(ranked, max(limit * 6, 40)) if answerability["answerable"] else []
+    direct_answer = build_direct_answer(query, active_query_type, active_entities, direct_candidates)
+    context_source_matches = merge_match_lists(direct_candidates, combined)
+    context_matches = filter_context_matches_for_direct_answer(context_source_matches, direct_answer)
     return {
         "query": query,
         "query_type": active_query_type,
@@ -1550,7 +1592,20 @@ def lookup_matches(
             "average_coverage": round(sum(match["coverage"] for match in combined) / len(combined), 3) if combined else 0,
             "answerability": answerability,
         },
-    }
+}
+
+
+def merge_match_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged = []
+    seen = set()
+    for group in groups:
+        for match in group:
+            key = (match.get("record_id") or "", match.get("chunk_id") or "", match.get("match_type") or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(match)
+    return merged
 
 
 def format_record_evidence(record: StructuredRecord) -> str:
@@ -1583,12 +1638,14 @@ def format_supporting_context(chunk: RagChunk, chunks: list[RagChunk], chunk_ord
 
 def matched_terms(text: str, terms: list[str]) -> list[str]:
     haystack = normalize_for_match(text)
+    haystack_compact = haystack.replace(" ", "")
     matches = []
     for term in terms:
         term_norm = normalize_for_match(term)
         if not term_norm:
             continue
-        if term_norm in haystack:
+        term_compact = term_norm.replace(" ", "")
+        if term_norm in haystack or (term_compact and term_compact in haystack_compact):
             matches.append(term)
             continue
         tokens = [token for token in term_norm.split() if len(token) >= 2]
@@ -1682,7 +1739,9 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
     answer_style = classify_answer_style(query, query_type)
     should_build_keyed_list = query_type == "table_lookup" or answer_style == "table_or_bullets"
     should_build_boolean_matrix = query_type in {"condition_lookup", "table_lookup"} or answer_style == "table_or_bullets"
-    if not should_build_keyed_list and not should_build_boolean_matrix:
+    should_build_field_value = query_type in {"number_lookup", "date_lookup", "contact_lookup"} or answer_style == "direct"
+    should_build_inverse_list = should_build_keyed_list or looks_like_inverse_value_question(query)
+    if not should_build_keyed_list and not should_build_boolean_matrix and not should_build_field_value and not should_build_inverse_list:
         return empty
 
     structured = [
@@ -1692,11 +1751,23 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
     ]
     if not structured:
         return empty
+    if stronger_unstructured_evidence_precedes_structured(matches, structured):
+        return empty
 
     top_group = top_structured_group(structured)
     query_keywords = meaningful_answer_terms([*extract_keywords(query, limit=16), *entities])
     if not query_keywords:
         return empty
+
+    if should_build_inverse_list:
+        inverse = build_inverse_value_list_answer(query, query_type, query_keywords, top_group)
+        if inverse["direct_answer"]:
+            return inverse
+
+    if should_build_field_value:
+        field_value = build_field_value_answer(query, query_type, query_keywords, top_group)
+        if field_value["direct_answer"]:
+            return field_value
 
     if should_build_keyed_list:
         keyed = build_keyed_list_answer(query, query_type, query_keywords, top_group)
@@ -1709,6 +1780,26 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
             return pivoted
 
     return empty
+
+
+def stronger_unstructured_evidence_precedes_structured(matches: list[dict[str, Any]], structured: list[dict[str, Any]]) -> bool:
+    if not matches or not structured:
+        return False
+    top_match = matches[0]
+    if top_match.get("match_type") == "structured_record":
+        return False
+    top_structured = structured[0]
+    top_score = float(top_match.get("score") or 0)
+    structured_score = float(top_structured.get("score") or 0)
+    top_coverage = float(top_match.get("coverage") or 0)
+    structured_coverage = float(top_structured.get("coverage") or 0)
+    return top_score >= structured_score * 1.25 and top_coverage > structured_coverage
+
+
+def looks_like_inverse_value_question(query: str) -> bool:
+    if not (extract_number_values(query) or extract_date_values(query)):
+        return False
+    return bool(re.search(r"\d[\d,.\s]*(?:[A-Za-z가-힣/%$]+(?:\s+[A-Za-z가-힣/%$]+){0,2})?\s*인\s+", query))
 
 
 def top_structured_group(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1852,10 +1943,286 @@ def split_field_list(value: str) -> list[str]:
     return [clean_cell(part) for part in re.split(r"[,;/]", value or "") if clean_cell(part)]
 
 
+def build_inverse_value_list_answer(
+    query: str,
+    query_type: str,
+    query_terms: list[str],
+    matches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    constraints = extract_scalar_constraints(query, query_type)
+    if not constraints:
+        return {
+            "direct_answer": "",
+            "answer_items": [],
+            "answer_field": "",
+            "filter_terms": [],
+            "mode": "",
+        }
+
+    query_field_terms = [
+        term
+        for term in query_terms
+        if not any(term_in_text(term, value) for value in constraints)
+    ]
+    values = []
+    answer_items = []
+    for match in sorted(matches, key=match_document_order_key):
+        fields = match.get("fields") or {}
+        if not fields:
+            continue
+        constraint_keys = fields_matching_constraints(fields, constraints, query_field_terms)
+        if not constraint_keys:
+            continue
+        target_key = choose_subject_answer_field(fields, query_terms, exclude_keys=set(constraint_keys))
+        value = clean_cell(fields.get(target_key, ""))
+        if not value:
+            continue
+        if normalize_for_match(value) in {normalize_for_match(item) for item in values}:
+            continue
+        values.append(value)
+        answer_items.append(
+            {
+                "value": value,
+                "field": target_key,
+                "record_id": match.get("record_id", ""),
+                "page": match.get("page"),
+                "section_path": match.get("section_path", ""),
+                "fields": fields,
+                "matched_constraint_fields": constraint_keys,
+            }
+        )
+
+    if not values:
+        return {
+            "direct_answer": "",
+            "answer_items": [],
+            "answer_field": "",
+            "filter_terms": [],
+            "mode": "",
+        }
+
+    answer_field = answer_items[0]["field"] if answer_items else ""
+    return {
+        "direct_answer": format_direct_answer_text(answer_field, values),
+        "answer_items": answer_items,
+        "answer_field": answer_field,
+        "filter_terms": [*query_field_terms, *constraints],
+        "mode": "inverse_value_filter",
+    }
+
+
+def build_field_value_answer(
+    query: str,
+    query_type: str,
+    query_terms: list[str],
+    matches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    target_key = choose_target_field_key(query, query_terms, matches)
+    if not target_key:
+        target_key = choose_value_field_from_query(query, query_type, matches)
+    if not target_key:
+        return {
+            "direct_answer": "",
+            "answer_items": [],
+            "answer_field": "",
+            "filter_terms": [],
+            "mode": "",
+        }
+
+    constraints = extract_scalar_constraints(query, query_type)
+    row_filter_terms = [
+        term
+        for term in query_terms
+        if not term_matches_key(term, target_key) and not any(term_in_text(term, value) for value in constraints)
+    ]
+    row_filter_terms = terms_that_match_any_row_value(row_filter_terms, matches, exclude_keys={target_key})
+    filtered_matches = filter_matches_by_row_terms(matches, row_filter_terms, exclude_keys={target_key})
+    if not filtered_matches and constraints:
+        filtered_matches = [
+            match
+            for match in matches
+            if fields_matching_constraints(match.get("fields") or {}, constraints, row_filter_terms)
+        ]
+    if not filtered_matches:
+        filtered_matches = matches[:1]
+
+    values = []
+    answer_items = []
+    for match in sorted(filtered_matches, key=match_document_order_key):
+        fields = match.get("fields") or {}
+        value = clean_cell(fields.get(target_key, ""))
+        if not value:
+            continue
+        subject_key = choose_subject_answer_field(fields, query_terms, exclude_keys={target_key})
+        subject_value = clean_cell(fields.get(subject_key, ""))
+        display_value = f"{subject_value}: {value}" if subject_value and len(filtered_matches) > 1 else value
+        if normalize_for_match(display_value) in {normalize_for_match(item) for item in values}:
+            continue
+        values.append(display_value)
+        answer_items.append(
+            {
+                "value": display_value,
+                "field": target_key,
+                "record_id": match.get("record_id", ""),
+                "page": match.get("page"),
+                "section_path": match.get("section_path", ""),
+                "fields": fields,
+            }
+        )
+
+    if not values:
+        return {
+            "direct_answer": "",
+            "answer_items": [],
+            "answer_field": "",
+            "filter_terms": [],
+            "mode": "",
+        }
+
+    return {
+        "direct_answer": format_direct_answer_text(target_key, values),
+        "answer_items": answer_items,
+        "answer_field": target_key,
+        "filter_terms": row_filter_terms,
+        "mode": "field_value",
+    }
+
+
+def extract_scalar_constraints(query: str, query_type: str) -> list[str]:
+    constraints = extract_inverse_value_constraints(query)
+    if constraints:
+        return constraints
+    if query_type in {"number_lookup", "table_lookup", "condition_lookup"} or NUMBER_RE.search(query):
+        constraints.extend(extract_number_values(query))
+    if query_type in {"date_lookup", "table_lookup", "condition_lookup"} or DATE_RE.search(query):
+        constraints.extend(extract_date_values(query))
+    return unique_keep_order(constraints)
+
+
+def extract_inverse_value_constraints(query: str) -> list[str]:
+    constraints = []
+    pattern = re.compile(
+        r"(?P<value>[$€₩]?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*(?:[A-Za-z가-힣/%$]+(?:\s+[A-Za-z가-힣/%$]+){0,2})?)\s*인\s+"
+    )
+    for match in pattern.finditer(query or ""):
+        value = clean_cell(match.group("value"))
+        if value:
+            constraints.append(value)
+    return unique_keep_order(constraints)
+
+
+def terms_that_match_any_row_value(terms: list[str], matches: list[dict[str, Any]], *, exclude_keys: set[str]) -> list[str]:
+    useful = []
+    for term in terms:
+        if any(
+            term_in_text(term, value)
+            for match in matches
+            for key, value in (match.get("fields") or {}).items()
+            if key not in exclude_keys and key not in MARKER_METADATA_FIELDS
+        ):
+            useful.append(term)
+    return unique_keep_order(useful)
+
+
+def fields_matching_constraints(fields: dict[str, str], constraints: list[str], query_field_terms: list[str]) -> list[str]:
+    matched_keys = []
+    for key, value in fields.items():
+        if key in MARKER_METADATA_FIELDS:
+            continue
+        if not all(scalar_value_in_cell(constraint, value) for constraint in constraints):
+            continue
+        if query_field_terms and not any(term_matches_key(term, key) for term in query_field_terms):
+            if not VALUE_FIELD_RE.search(key):
+                continue
+        matched_keys.append(key)
+    return matched_keys
+
+
+def scalar_value_in_cell(constraint: str, value: Any) -> bool:
+    constraint_norm = normalize_for_match(constraint).replace(" ", "")
+    value_norm = normalize_for_match(str(value or "")).replace(" ", "")
+    if not constraint_norm or not value_norm:
+        return False
+    constraint_numbers = extract_number_values(constraint)
+    if constraint_numbers:
+        value_numbers = extract_number_values(str(value or ""))
+        if not any(number in value_numbers for number in constraint_numbers):
+            return False
+        unit_tokens = [token.lower() for token in re.findall(r"[A-Za-z]{2,}", constraint)]
+        if unit_tokens:
+            value_text = normalize_for_match(str(value or ""))
+            return all(token in value_text for token in unit_tokens)
+        return True
+    constraint_dates = extract_date_values(constraint)
+    if constraint_dates:
+        value_dates = extract_date_values(str(value or ""))
+        return any(date in value_dates or normalize_for_match(date) in value_norm for date in constraint_dates)
+    return constraint_norm in value_norm
+
+
+def choose_subject_answer_field(fields: dict[str, str], query_terms: list[str], *, exclude_keys: set[str]) -> str:
+    preferred_patterns = [
+        r"모집\s*단위|학과|학부|전공|항목|대상|이름|명칭|구분|"
+        r"plan|feature|api|service|system|name|item|category|type|data\s*type|"
+        r"code|error\s*code|id|identifier|key|policy|requirement|owner",
+    ]
+    for pattern in preferred_patterns:
+        for key, value in fields.items():
+            if key in exclude_keys or key in MARKER_METADATA_FIELDS:
+                continue
+            if re.search(pattern, key, re.IGNORECASE) and clean_cell(value):
+                return key
+    for key, value in fields.items():
+        if key in exclude_keys or key in MARKER_METADATA_FIELDS:
+            continue
+        if clean_cell(value) and not looks_like_numeric_or_date(clean_cell(value)) and not VALUE_FIELD_RE.search(key):
+            return key
+    for key, value in fields.items():
+        if key not in exclude_keys and key not in MARKER_METADATA_FIELDS and clean_cell(value):
+            return key
+    return next((key for key in fields if key not in exclude_keys), "")
+
+
+def choose_value_field_from_query(query: str, query_type: str, matches: list[dict[str, Any]]) -> str:
+    query_terms = meaningful_answer_terms(extract_keywords(query, limit=16))
+    scores: Counter[str] = Counter()
+    key_by_norm: dict[str, str] = {}
+    for match in matches:
+        for key, value in (match.get("fields") or {}).items():
+            if key in MARKER_METADATA_FIELDS or not clean_cell(value):
+                continue
+            key_norm = normalize_for_match(key)
+            key_by_norm[key_norm] = key
+            if query_type == "number_lookup" and NUMBER_RE.search(value):
+                scores[key_norm] += 2
+            if query_type == "date_lookup" and DATE_RE.search(value):
+                scores[key_norm] += 2
+            if VALUE_FIELD_RE.search(key):
+                scores[key_norm] += 2
+            for term in query_terms:
+                if term_matches_key(term, key):
+                    scores[key_norm] += 6
+    if not scores:
+        return ""
+    key_norm, score = scores.most_common(1)[0]
+    return key_by_norm.get(key_norm, "") if score >= 3 else ""
+
+
 def term_matches_key(term: str, key: str) -> bool:
     term_norm = normalize_for_match(term)
     key_norm = normalize_for_match(key)
-    return bool(term_norm and key_norm and (term_norm in key_norm or key_norm in term_norm or all(token in key_norm for token in term_norm.split() if len(token) >= 2)))
+    term_compact = term_norm.replace(" ", "")
+    key_compact = key_norm.replace(" ", "")
+    return bool(
+        term_norm
+        and key_norm
+        and (
+            term_norm in key_norm
+            or key_norm in term_norm
+            or (term_compact and key_compact and (term_compact in key_compact or key_compact in term_compact))
+            or all(token in key_norm for token in term_norm.split() if len(token) >= 2)
+        )
+    )
 
 
 def filter_matches_by_row_terms(matches: list[dict[str, Any]], filter_terms: list[str], *, exclude_keys: set[str]) -> list[dict[str, Any]]:
@@ -1948,7 +2315,9 @@ def term_in_text(term: str, text: Any) -> bool:
     text_norm = normalize_for_match(str(text or ""))
     if not term_norm or not text_norm:
         return False
-    if term_norm in text_norm:
+    term_compact = term_norm.replace(" ", "")
+    text_compact = text_norm.replace(" ", "")
+    if term_norm in text_norm or (term_compact and term_compact in text_compact):
         return True
     tokens = [token for token in term_norm.split() if len(token) >= 2]
     return bool(tokens and all(token in text_norm for token in tokens))
@@ -2052,13 +2421,15 @@ def score_record(record: StructuredRecord, terms: list[str], query_type: str) ->
             ]
         )
     )
+    haystack_compact = haystack.replace(" ", "")
     score = 0.0
     matched_terms = 0
     for term in terms:
         term_norm = normalize_for_match(term)
         if not term_norm:
             continue
-        if term_norm in haystack:
+        term_compact = term_norm.replace(" ", "")
+        if term_norm in haystack or (term_compact and term_compact in haystack_compact):
             matched_terms += 1
             score += 5.0 if " " in term_norm else 3.0
         else:
@@ -2093,13 +2464,15 @@ def score_record(record: StructuredRecord, terms: list[str], query_type: str) ->
 
 def score_chunk(chunk: RagChunk, terms: list[str], query_type: str) -> float:
     haystack = normalize_for_match(" ".join([chunk.section_path, chunk.text, " ".join(chunk.keywords), " ".join(chunk.record_types)]))
+    haystack_compact = haystack.replace(" ", "")
     score = 0.0
     exact_term_matches = 0
     for term in terms:
         term_norm = normalize_for_match(term)
         if not term_norm:
             continue
-        if term_norm in haystack:
+        term_compact = term_norm.replace(" ", "")
+        if term_norm in haystack or (term_compact and term_compact in haystack_compact):
             exact_term_matches += 1
             score += 2.0
     coverage = term_coverage(haystack, terms)
@@ -2405,6 +2778,31 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
                 }
             )
 
+    if looks_like_inverse_value_question(question) and not is_abstention_answer(answer):
+        missing_query_constraints = [
+            value
+            for value in extract_scalar_constraints(question, query_type)
+            if not scalar_value_in_cell(value, answer)
+        ]
+        if missing_query_constraints:
+            issues.append(
+                {
+                    "type": "missing_query_constraint_value",
+                    "message": "The answer does not preserve numeric/date constraints from the question.",
+                    "values": missing_query_constraints[:10],
+                }
+            )
+
+    missing_named_entities = missing_requested_named_entities(question, answer, evidence_text)
+    if missing_named_entities:
+        issues.append(
+            {
+                "type": "missing_question_entity",
+                "message": "The answer appears to answer a different named entity than the question requested.",
+                "terms": missing_named_entities[:10],
+            }
+        )
+
     if is_abstention_answer(answer) and evidence_has_answer_candidate(question, evidence_text, query_type):
         issues.append(
             {
@@ -2422,6 +2820,8 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
         "unsupported_date",
         "unsupported_identifier",
         "missing_direct_answer_value",
+        "missing_query_constraint_value",
+        "missing_question_entity",
         "unnecessary_abstention",
     }
     valid = not any(issue["type"] in severe_issue_types for issue in issues)
@@ -2487,6 +2887,38 @@ def evidence_has_answer_candidate(question: str, evidence_text: str, query_type:
     terms = extract_keywords(question, limit=8)
     coverage = term_coverage(evidence_text, terms)
     return query_type in STRUCTURED_LOOKUP_TYPES and coverage >= 0.1
+
+
+def missing_requested_named_entities(question: str, answer: str, evidence_text: str) -> list[str]:
+    entity_pattern = re.compile(
+        r"[가-힣A-Za-z0-9._/-]{2,50}(?:학과|학부|전공|대학|부서|팀|시스템|서비스|API|DB|Plan|Feature)"
+    )
+    requested = unique_keep_order(entity_pattern.findall(question or ""))
+    if not requested:
+        return []
+    answer_norm = normalize_for_match(answer)
+    evidence_norm = normalize_for_match(evidence_text)
+    answer_entities = unique_keep_order(entity_pattern.findall(answer or ""))
+    missing = []
+    for entity in requested:
+        entity_norm = normalize_for_match(entity)
+        if not entity_norm or entity_norm in answer_norm or entity_norm not in evidence_norm:
+            continue
+        conflicting_entity = any(
+            normalize_for_match(candidate) != entity_norm
+            and same_entity_suffix(candidate, entity)
+            for candidate in answer_entities
+        )
+        if conflicting_entity:
+            missing.append(entity)
+    return missing
+
+
+def same_entity_suffix(left: str, right: str) -> bool:
+    suffixes = ["학과", "학부", "전공", "대학", "부서", "팀", "시스템", "서비스", "API", "DB", "Plan", "Feature"]
+    left_lower = left.lower()
+    right_lower = right.lower()
+    return any(left_lower.endswith(suffix.lower()) and right_lower.endswith(suffix.lower()) for suffix in suffixes)
 
 
 def evidence_to_text(evidence: list[Any]) -> str:
@@ -2565,8 +2997,31 @@ def normalize_terms(terms: Iterable[str]) -> list[str]:
         if not term:
             continue
         expanded.append(term)
+        expanded.extend(query_term_variants(term))
+        expanded.extend(extract_number_values(term))
+        expanded.extend(extract_date_values(term))
         expanded.extend(extract_keywords(term, limit=8))
     return unique_keep_order(expanded)
+
+
+def query_term_variants(term: str) -> list[str]:
+    variants = []
+    cleaned = clean_cell(term)
+    particle_stripped = strip_query_particle(cleaned)
+    if particle_stripped != cleaned:
+        variants.append(particle_stripped)
+    compact = normalize_for_match(cleaned).replace(" ", "")
+    if compact and compact != normalize_for_match(cleaned):
+        variants.append(compact)
+    return variants
+
+
+def strip_query_particle(value: str) -> str:
+    value = clean_cell(value)
+    stripped = re.sub(r"(?:에서|으로|에게|부터|까지|처럼|이고|이며|이면|라면|인가|인지|인가요|이야|인가요)$", "", value)
+    stripped = re.sub(r"(?:은|는|이|가|을|를|의|에|로)$", "", stripped)
+    stripped = re.sub(r"(?<=\d)(?:명|개|건|회|원|점|일|년)?인$", lambda match: match.group(0)[:-1], stripped)
+    return stripped if len(normalize_for_match(stripped)) >= 2 else value
 
 
 def normalize_for_match(value: str) -> str:

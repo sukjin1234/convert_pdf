@@ -89,6 +89,16 @@ curl.exe http://127.0.0.1:8000/eval/logs?limit=20
 
 `/eval/log`는 Dify HTTP 노드에서 질문, 각 노드 입력/출력, 최종 답변, 검증 결과를 그대로 받아 JSONL과 run_id별 JSON 파일로 저장한다.
 
+저장된 Dify 실행 로그 분석:
+
+```powershell
+python scripts/analyze_eval_logs.py --log-dir dify-rag-eval-logs --limit 20
+
+python scripts/analyze_eval_logs.py --log-dir dify-rag-eval-logs --json
+```
+
+이 스크립트는 `document_id` 누락, `direct_answer` 부재, `Verify Answer.valid=false`, `valid=true`인데 구조화 직접답변이 없는 케이스를 요약한다. 새 PDF를 재적재한 뒤 같은 질문을 다시 실행하고 이 스크립트의 `missing_document_id`와 `missing_direct_answer` 수가 줄어드는지 확인한다.
+
 ## 환경 변수
 
 ```text

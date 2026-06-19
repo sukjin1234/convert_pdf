@@ -1,10 +1,14 @@
 from io import BytesIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
 from fastapi import UploadFile
+from fastapi.testclient import TestClient
 
-from app.main import ChatflowDebugRequest, ConvertResponse, MarkdownIngestRequest, chatflow_debug, convert, rag_ingest_markdown
+from app.eval_logs import EvalLogStore
+from app.main import app, ChatflowDebugRequest, ConvertResponse, MarkdownIngestRequest, chatflow_debug, convert, rag_ingest_markdown
 
 
 class ApiContractTest(unittest.IsolatedAsyncioTestCase):
@@ -87,6 +91,43 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("간호학과", payload["draft_answer"])
         self.assertTrue(payload["draft_verification"]["valid"])
         self.assertFalse(payload["supplied_answer_verification"]["valid"])
+
+    def test_eval_log_api_writes_jsonl_and_detail_file(self):
+        with TemporaryDirectory() as temp_dir:
+            store = EvalLogStore(Path(temp_dir))
+            client = TestClient(app)
+            payload = {
+                "run_id": "test-run-1",
+                "query": "전공심화 개설 학과 알려줘",
+                "document_id": "sample_2026",
+                "query_plan": {"query_type": "table_lookup"},
+                "structured_lookup_body": {"direct_answer": "모집단위: 컴퓨터정보공학과"},
+                "knowledge_retrieval": [],
+                "final_answer": "컴퓨터정보공학과입니다.",
+                "verify_result": {"valid": True},
+            }
+
+            with patch("app.main.EVAL_LOG_STORE", store):
+                response = client.post("/eval/log", json=payload)
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertTrue(body["success"])
+                self.assertEqual(body["run_id"], "test-run-1")
+                self.assertTrue(Path(body["log_path"]).exists())
+                self.assertTrue(Path(body["jsonl_path"]).exists())
+
+                list_response = client.get("/eval/logs", params={"limit": 10})
+                self.assertEqual(list_response.status_code, 200)
+                logs = list_response.json()["logs"]
+                self.assertEqual(len(logs), 1)
+                self.assertEqual(logs[0]["run_id"], "test-run-1")
+                self.assertIn("전공심화", logs[0]["query"])
+
+                detail_response = client.get("/eval/logs/test-run-1")
+                self.assertEqual(detail_response.status_code, 200)
+                detail = detail_response.json()
+                self.assertTrue(detail["success"])
+                self.assertEqual(detail["log"]["query_plan"]["query_type"], "table_lookup")
 
 
 if __name__ == "__main__":

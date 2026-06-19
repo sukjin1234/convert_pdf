@@ -214,6 +214,8 @@ document_id: string, optional
 
 일반 Chatflow에서는 `query`에 사용자 질문을 넣고, 특정 문서만 조회할 때만 `document_id`를 넣는다.
 
+운영에서 여러 문서를 같은 FastAPI `RAG_STORE_DIR`에 저장한다면 `document_id`를 비워두지 않는다. Knowledge Pipeline의 `PDF to RAG`에서 사용한 `document_id`와 Chatflow의 `Start.document_id`가 같아야 `/lookup`이 해당 문서의 구조화 records만 조회한다. `Eval Log`에서 `document_id: null` 또는 빈 값으로 계속 찍히면 다중 문서 환경에서 오답 가능성이 커진다.
+
 ### 3.2 HTTP Request: Query Plan
 
 노드 이름:
