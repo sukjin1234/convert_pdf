@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -8,9 +9,12 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import zipfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Sequence
+from xml.etree import ElementTree
 
 from .config import Settings, get_settings
 from .markdown import render_document_pages_to_markdown, render_document_to_markdown
@@ -20,6 +24,53 @@ logger = logging.getLogger(__name__)
 
 class ConversionError(RuntimeError):
     pass
+
+
+SUPPORTED_DOCUMENT_SUFFIXES = {
+    ".pdf",
+    ".txt",
+    ".log",
+    ".md",
+    ".markdown",
+    ".docx",
+    ".csv",
+    ".tsv",
+}
+TEXT_DOCUMENT_SUFFIXES = {".txt", ".log", ".md", ".markdown"}
+CSV_DOCUMENT_SUFFIXES = {".csv", ".tsv"}
+SUPPORTED_DOCUMENT_LABEL = "PDF, TXT, Markdown, DOCX, CSV, TSV"
+WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+@dataclass(frozen=True)
+class DocumentConverter:
+    settings: Settings
+
+    def __init__(self, settings: Settings | None = None):
+        object.__setattr__(self, "settings", settings or get_settings())
+
+    def convert_bytes(self, file_bytes: bytes, filename: str = "document") -> str:
+        if not file_bytes:
+            raise ConversionError("Empty document input.")
+
+        safe_name = sanitize_filename(filename or "document")
+        suffix = Path(safe_name).suffix.lower()
+        if suffix == ".pdf" or (not suffix and file_bytes.lstrip().startswith(b"%PDF-")):
+            return PdfConverter(self.settings).convert_pdf_bytes(file_bytes, safe_name)
+        if suffix in TEXT_DOCUMENT_SUFFIXES:
+            return _read_text_document(file_bytes)
+        if suffix in CSV_DOCUMENT_SUFFIXES:
+            delimiter = "\t" if suffix == ".tsv" else ","
+            return _read_csv_document(file_bytes, delimiter=delimiter)
+        if suffix == ".docx":
+            return _read_docx_document(file_bytes)
+
+        if file_bytes.lstrip().startswith(b"%PDF-"):
+            return PdfConverter(self.settings).convert_pdf_bytes(file_bytes, safe_name)
+        raise ConversionError(
+            f"Unsupported document type '{suffix or '(none)'}'. "
+            f"Supported types: {SUPPORTED_DOCUMENT_LABEL}."
+        )
 
 
 @dataclass(frozen=True)
@@ -124,6 +175,205 @@ def sanitize_filename(filename: str) -> str:
     name = Path(filename or "document.pdf").name
     name = re.sub(r"[^A-Za-z0-9_ .-]+", "_", name).strip(" .")
     return name or "document.pdf"
+
+
+def _read_text_document(file_bytes: bytes) -> str:
+    markdown = _normalize_markdown(_decode_text_bytes(file_bytes))
+    if not _has_meaningful_markdown(markdown):
+        raise ConversionError("Text document produced no Markdown.")
+    return markdown
+
+
+def _decode_text_bytes(file_bytes: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("latin-1", errors="replace")
+
+
+def _read_csv_document(file_bytes: bytes, *, delimiter: str) -> str:
+    text = _decode_text_bytes(file_bytes)
+    rows = [
+        [_normalize_table_cell(cell) for cell in row]
+        for row in csv.reader(text.splitlines(), delimiter=delimiter)
+        if any(cell.strip() for cell in row)
+    ]
+    markdown = _markdown_table(rows)
+    if not _has_meaningful_markdown(markdown):
+        raise ConversionError("CSV document produced no Markdown.")
+    return markdown
+
+
+def _read_docx_document(file_bytes: bytes) -> str:
+    try:
+        with zipfile.ZipFile(BytesIO(file_bytes)) as archive:
+            parts = _read_docx_main_parts(archive)
+    except zipfile.BadZipFile as exc:
+        raise ConversionError("Input is not a valid DOCX file.") from exc
+    except KeyError as exc:
+        raise ConversionError("DOCX file is missing word/document.xml.") from exc
+    except ElementTree.ParseError as exc:
+        raise ConversionError("DOCX XML is not readable.") from exc
+
+    markdown = _normalize_markdown("\n\n".join(part for part in parts if part.strip()))
+    if not _has_meaningful_markdown(markdown):
+        raise ConversionError("DOCX document produced no Markdown.")
+    return markdown
+
+
+def _read_docx_main_parts(archive: zipfile.ZipFile) -> list[str]:
+    parts = _read_docx_xml_member(archive, "word/document.xml")
+    auxiliary_members = [
+        member
+        for member in archive.namelist()
+        if re.match(r"word/(header|footer|footnotes|endnotes|comments)\d*\.xml$", member)
+    ]
+    for member in sorted(auxiliary_members):
+        blocks = _read_docx_xml_member(archive, member)
+        if blocks:
+            parts.append(f"## {_docx_member_label(member)}")
+            parts.extend(blocks)
+    return parts
+
+
+def _read_docx_xml_member(archive: zipfile.ZipFile, member_name: str) -> list[str]:
+    root = ElementTree.fromstring(archive.read(member_name))
+    container = _first_child(root, "body") or root
+    return _docx_blocks(container)
+
+
+def _docx_blocks(container: ElementTree.Element) -> list[str]:
+    blocks: list[str] = []
+    for child in list(container):
+        local_name = _xml_local_name(child.tag)
+        if local_name == "p":
+            paragraph = _docx_paragraph_markdown(child)
+            if paragraph:
+                blocks.append(paragraph)
+        elif local_name == "tbl":
+            table = _docx_table_markdown(child)
+            if table:
+                blocks.append(table)
+    return blocks
+
+
+def _docx_paragraph_markdown(paragraph: ElementTree.Element) -> str:
+    text = _normalize_inline_text(_docx_text(paragraph))
+    if not text:
+        return ""
+
+    style = _docx_paragraph_style(paragraph).lower()
+    heading_match = re.search(r"heading\s*([1-6])|heading([1-6])", style)
+    if heading_match:
+        level = int(heading_match.group(1) or heading_match.group(2))
+        return f"{'#' * level} {text}"
+    if _docx_is_numbered_paragraph(paragraph):
+        return f"- {text}"
+    return text
+
+
+def _docx_paragraph_style(paragraph: ElementTree.Element) -> str:
+    ppr = _first_child(paragraph, "pPr")
+    style = _first_child(ppr, "pStyle") if ppr is not None else None
+    if style is None:
+        return ""
+    return (
+        style.attrib.get(f"{{{WORD_NAMESPACE}}}val")
+        or style.attrib.get("val")
+        or ""
+    )
+
+
+def _docx_is_numbered_paragraph(paragraph: ElementTree.Element) -> bool:
+    ppr = _first_child(paragraph, "pPr")
+    return ppr is not None and _first_child(ppr, "numPr") is not None
+
+
+def _docx_table_markdown(table: ElementTree.Element) -> str:
+    rows: list[list[str]] = []
+    for row in _children(table, "tr"):
+        values = [_normalize_table_cell(_docx_text(cell)) for cell in _children(row, "tc")]
+        if any(values):
+            rows.append(values)
+    return _markdown_table(rows)
+
+
+def _markdown_table(rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    normalized_rows = [
+        [_escape_markdown_table_cell(cell) for cell in row + [""] * (width - len(row))]
+        for row in rows
+    ]
+    header = normalized_rows[0]
+    body = normalized_rows[1:]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in range(width)) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    return "\n".join(lines)
+
+
+def _docx_text(element: ElementTree.Element) -> str:
+    parts: list[str] = []
+    for node in element.iter():
+        local_name = _xml_local_name(node.tag)
+        if local_name == "t" and node.text:
+            parts.append(node.text)
+        elif local_name == "tab":
+            parts.append("\t")
+        elif local_name in {"br", "cr"}:
+            parts.append("\n")
+    return "".join(parts)
+
+
+def _normalize_inline_text(value: str) -> str:
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in value.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _normalize_table_cell(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _escape_markdown_table_cell(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace("|", "\\|")
+
+
+def _docx_member_label(member_name: str) -> str:
+    stem = Path(member_name).stem
+    if stem.startswith("header"):
+        return "DOCX Header"
+    if stem.startswith("footer"):
+        return "DOCX Footer"
+    if stem == "footnotes":
+        return "DOCX Footnotes"
+    if stem == "endnotes":
+        return "DOCX Endnotes"
+    if stem == "comments":
+        return "DOCX Comments"
+    return f"DOCX {stem}"
+
+
+def _first_child(element: ElementTree.Element | None, local_name: str) -> ElementTree.Element | None:
+    if element is None:
+        return None
+    for child in list(element):
+        if _xml_local_name(child.tag) == local_name:
+            return child
+    return None
+
+
+def _children(element: ElementTree.Element, local_name: str) -> list[ElementTree.Element]:
+    return [child for child in list(element) if _xml_local_name(child.tag) == local_name]
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
 
 def _create_conversion_tmp_dir(settings: Settings) -> Path:

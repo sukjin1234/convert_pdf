@@ -33,6 +33,22 @@ class RagPipelineTest(unittest.TestCase):
         self.assertEqual(record.fields["모집인원"], "45")
         self.assertTrue(record.chunk_id)
 
+    def test_korean_document_ids_get_unique_ascii_chunk_ids(self):
+        markdown = """
+# 핵심 가치
+
+| 항목 | 값 |
+| --- | --- |
+| 필수 입력 항목 | 이름, 학번, 연락처 |
+"""
+        first = build_rag_artifact(markdown, "회원가입 안내.txt", document_id="회원가입 안내")
+        second = build_rag_artifact(markdown, "지원방법 안내.txt", document_id="지원방법 안내")
+
+        self.assertNotEqual(first.chunks[0].chunk_id, second.chunks[0].chunk_id)
+        self.assertNotEqual(first.records[0].record_id, second.records[0].record_id)
+        self.assertRegex(first.chunks[0].chunk_id, r"^doc_[a-f0-9]{8}_p000_c0001$")
+        self.assertRegex(second.chunks[0].chunk_id, r"^doc_[a-f0-9]{8}_p000_c0001$")
+
     def test_plans_and_looks_up_number_question(self):
         artifact = build_rag_artifact(
             """

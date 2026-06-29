@@ -1,11 +1,14 @@
 import unittest
 import tempfile
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 from app.config import Settings
 from app.converter import (
     ConversionError,
+    DocumentConverter,
     PdfConverter,
     _read_generated_markdown,
     _read_rendered_markdown,
@@ -16,6 +19,51 @@ from app.converter import (
 
 
 class ConverterTest(unittest.TestCase):
+    def test_document_converter_reads_markdown_bytes(self):
+        converter = DocumentConverter(Settings())
+
+        result = converter.convert_bytes(b"# Policy\n\nAllowed domains: all", "policy.md")
+
+        self.assertIn("# Policy", result)
+        self.assertIn("Allowed domains", result)
+
+    def test_document_converter_reads_cp949_text_bytes(self):
+        converter = DocumentConverter(Settings())
+        content = "담당자: 입학처\n연락처: 02-1234-5678".encode("cp949")
+
+        result = converter.convert_bytes(content, "contact.txt")
+
+        self.assertIn("담당자: 입학처", result)
+        self.assertIn("02-1234-5678", result)
+
+    def test_document_converter_reads_csv_as_markdown_table(self):
+        converter = DocumentConverter(Settings())
+
+        result = converter.convert_bytes(
+            "항목,값\n요금,10000원\n기간,30일\n".encode("utf-8"),
+            "pricing.csv",
+        )
+
+        self.assertIn("| 항목 | 값 |", result)
+        self.assertIn("| 요금 | 10000원 |", result)
+
+    def test_document_converter_reads_docx_paragraphs_and_tables(self):
+        converter = DocumentConverter(Settings())
+        content = _minimal_docx_bytes()
+
+        result = converter.convert_bytes(content, "manual.docx")
+
+        self.assertIn("# 운영 정책", result)
+        self.assertIn("장애 대응은 30분 이내에 시작합니다.", result)
+        self.assertIn("| 항목 | 값 |", result)
+        self.assertIn("| SLA | 99.9% |", result)
+
+    def test_document_converter_rejects_unsupported_suffix(self):
+        converter = DocumentConverter(Settings())
+
+        with self.assertRaisesRegex(ConversionError, "Unsupported document type"):
+            converter.convert_bytes(b"hello", "legacy.doc")
+
     def test_command_forces_hybrid_with_no_fallback(self):
         settings = Settings()
         command = build_opendataloader_command(Path("input.pdf"), Path("out"), settings)
@@ -212,6 +260,35 @@ class ConverterTest(unittest.TestCase):
 
             with self.assertRaises(ConversionError):
                 _read_generated_markdown(output_dir)
+
+
+def _minimal_docx_bytes() -> bytes:
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="{namespace}">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>운영 정책</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>장애 대응은 30분 이내에 시작합니다.</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>항목</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>값</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>SLA</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>99.9%</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>
+"""
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", document_xml)
+    return buffer.getvalue()
 
 
 if __name__ == "__main__":

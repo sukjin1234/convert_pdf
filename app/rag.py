@@ -3490,5 +3490,9 @@ def strip_trailing_particle(value: str) -> str:
 
 
 def _safe_id(value: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", value or "doc").strip("_")
+    raw = str(value or "doc")
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_")
+    if re.search(r"[^\x00-\x7f]", raw):
+        suffix = short_hash(raw, length=8)
+        return f"{safe}_{suffix}" if safe else f"doc_{suffix}"
     return safe or "doc"

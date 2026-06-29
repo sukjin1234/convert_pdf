@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from .config import get_settings
-from .converter import PdfConverter
+from .converter import DocumentConverter
 from .eval_logs import EVAL_LOG_STORE
 from .rag import (
     STORE,
@@ -129,21 +129,41 @@ class ChatflowDebugResponse(BaseModel):
     node_status: dict[str, Any] = Field(default_factory=dict)
 
 
+def _select_upload(*uploads: Any) -> UploadFile | None:
+    for upload in uploads:
+        if upload is not None and hasattr(upload, "read") and hasattr(upload, "filename"):
+            return upload
+    return None
+
+
+def _optional_form_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return None
+
+
 @app.post("/convert", response_model=ConvertResponse)
-async def convert(pdf: UploadFile | None = File(None)) -> ConvertResponse:
+async def convert(
+    pdf: UploadFile | None = File(None),
+    file: UploadFile | None = File(None),
+) -> ConvertResponse:
     try:
-        if pdf is None:
-            raise ValueError("PDF file parameter is required.")
-        content = await pdf.read()
-        converter = PdfConverter(get_settings())
+        upload = _select_upload(pdf, file)
+        if upload is None:
+            raise ValueError("File parameter is required. Use form-data field 'pdf' or 'file'.")
+
+        content = await upload.read()
+        source_file_name = upload.filename or "document"
+        converter = DocumentConverter(get_settings())
         markdown = await asyncio.to_thread(
-            converter.convert_pdf_bytes,
+            converter.convert_bytes,
             content,
-            pdf.filename or "document.pdf",
+            source_file_name,
         )
         return ConvertResponse(success=True, markdown=markdown)
     except Exception:
-        logger.exception("PDF conversion failed")
+        logger.exception("Document conversion failed")
         return ConvertResponse(success=False, markdown="")
 
 
@@ -155,24 +175,24 @@ async def convert_rag(
     file_name: str | None = Form(None),
 ) -> ConvertRagResponse:
     try:
-        upload = pdf or file
+        upload = _select_upload(pdf, file)
         if upload is None:
-            raise ValueError("PDF file parameter is required. Use form-data field 'pdf' or 'file'.")
+            raise ValueError("File parameter is required. Use form-data field 'pdf' or 'file'.")
 
         content = await upload.read()
-        source_file_name = file_name or upload.filename or "document.pdf"
-        converter = PdfConverter(get_settings())
+        source_file_name = _optional_form_text(file_name) or upload.filename or "document"
+        converter = DocumentConverter(get_settings())
         markdown = await asyncio.to_thread(
-            converter.convert_pdf_bytes,
+            converter.convert_bytes,
             content,
             source_file_name,
         )
-        artifact = build_rag_artifact(markdown, source_file_name, document_id=document_id)
+        artifact = build_rag_artifact(markdown, source_file_name, document_id=_optional_form_text(document_id))
         STORE.upsert(artifact)
         payload = artifact.to_dict()
         return ConvertRagResponse(**payload)
     except Exception as exc:
-        logger.exception("PDF RAG conversion failed")
+        logger.exception("Document RAG conversion failed")
         return ConvertRagResponse(success=False, error=str(exc))
 
 

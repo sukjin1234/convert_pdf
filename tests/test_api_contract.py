@@ -8,7 +8,8 @@ from fastapi import UploadFile
 from fastapi.testclient import TestClient
 
 from app.eval_logs import EvalLogStore
-from app.main import app, ChatflowDebugRequest, ConvertResponse, MarkdownIngestRequest, chatflow_debug, convert, rag_ingest_markdown
+from app.main import app, ChatflowDebugRequest, ConvertResponse, MarkdownIngestRequest, chatflow_debug, convert, convert_rag, rag_ingest_markdown
+from app.rag import RagStore
 
 
 class ApiContractTest(unittest.IsolatedAsyncioTestCase):
@@ -22,14 +23,27 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         content = b"%PDF-1.4\n%%EOF"
         pdf = UploadFile(file=BytesIO(content), filename="policy.pdf")
 
-        with patch("app.main.PdfConverter") as converter_class:
-            converter_class.return_value.convert_pdf_bytes.return_value = "# Converted"
+        with patch("app.main.DocumentConverter") as converter_class:
+            converter_class.return_value.convert_bytes.return_value = "# Converted"
 
             response = await convert(pdf)
 
         self.assertTrue(response.success)
         self.assertEqual(response.markdown, "# Converted")
-        converter_class.return_value.convert_pdf_bytes.assert_called_once_with(content, "policy.pdf")
+        converter_class.return_value.convert_bytes.assert_called_once_with(content, "policy.pdf")
+
+    async def test_convert_uses_generic_file_parameter(self):
+        content = "# Manual\n\nAllowed domains: all".encode("utf-8")
+        upload = UploadFile(file=BytesIO(content), filename="manual.md")
+
+        with patch("app.main.DocumentConverter") as converter_class:
+            converter_class.return_value.convert_bytes.return_value = "# Manual"
+
+            response = await convert(file=upload)
+
+        self.assertTrue(response.success)
+        self.assertEqual(response.markdown, "# Manual")
+        converter_class.return_value.convert_bytes.assert_called_once_with(content, "manual.md")
 
     async def test_rag_ingest_markdown_builds_artifact(self):
         response = await rag_ingest_markdown(
@@ -53,6 +67,21 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(response.chunks), 1)
         self.assertGreaterEqual(len(response.records), 1)
         self.assertIn("API Limit", response.dify_markdown)
+
+    async def test_convert_rag_accepts_markdown_file_upload(self):
+        content = b"# Manual\n\n| Item | Value |\n| --- | --- |\n| SLA | 99.9% |\n"
+        upload = UploadFile(file=BytesIO(content), filename="manual.md")
+
+        with TemporaryDirectory() as temp_dir:
+            store = RagStore(Path(temp_dir))
+            with patch("app.main.STORE", store):
+                response = await convert_rag(file=upload, document_id="doc_manual")
+
+        self.assertTrue(response.success)
+        self.assertEqual(response.document_id, "doc_manual")
+        self.assertEqual(response.file_name, "manual.md")
+        self.assertIn("SLA", response.dify_markdown)
+        self.assertGreaterEqual(len(response.records), 1)
 
     async def test_chatflow_debug_uses_structured_lookup_without_knowledge_retrieval(self):
         await rag_ingest_markdown(

@@ -1,12 +1,12 @@
 # Dify OpenDataLoader RAG API
 
-OpenDataLoader로 PDF를 Markdown으로 변환하고, Dify RAG에 바로 넣을 수 있도록 표 행 확장, chunk metadata, structured records, lookup, answer verification을 제공하는 FastAPI 서버입니다.
+OpenDataLoader로 PDF를 Markdown으로 변환하고, TXT/Markdown/DOCX/CSV 같은 문서도 Dify RAG에 바로 넣을 수 있도록 표 행 확장, chunk metadata, structured records, lookup, answer verification을 제공하는 FastAPI 서버입니다.
 
 핵심 엔드포인트:
 
 ```text
-POST /convert      기존 호환용 PDF -> Markdown
-POST /convert/rag  PDF -> Dify 저장용 Markdown + chunks + records
+POST /convert      문서 파일 -> Markdown
+POST /convert/rag  문서 파일 -> Dify 저장용 Markdown + chunks + records
 POST /rag/ingest-markdown Markdown -> RAG artifact 저장
 POST /query/plan   질문 유형/키워드/하위질문/검색어 확장
 POST /lookup       구조화 레코드 exact lookup + evidence packing
@@ -44,10 +44,12 @@ Knowledge Pipeline에서는 `/convert/rag`를 호출하고, 응답의 `dify_mark
 Method: POST
 URL: http://<fastapi-host>:8000/convert/rag
 Body Type: form-data
-pdf          File  {{File.file}}
+file         File  {{File.file}}
 document_id  Text  {{File.file.related_id}}
 file_name    Text  {{File.file.name}}
 ```
+
+기존 PDF 전용 노드와의 호환을 위해 `pdf` form-data 필드도 계속 받을 수 있습니다. 새로 구성할 때는 `file` 필드를 사용합니다. 현재 지원 형식은 `PDF`, `TXT`, `MD/Markdown`, `DOCX`, `CSV`, `TSV`입니다.
 
 Chatflow의 JSON/Raw HTTP 노드에서는 다음 헤더만 넣습니다.
 
@@ -62,7 +64,9 @@ Content-Type: application/json
 ```powershell
 curl.exe http://127.0.0.1:8000/health
 
-curl.exe -F "pdf=@2026학년도 입학전형 신입생 모집요강.pdf" -F "document_id=sample_2026" -F "file_name=2026_admission.pdf" http://127.0.0.1:8000/convert/rag
+curl.exe -F "file=@2026학년도 입학전형 신입생 모집요강.pdf" -F "document_id=sample_2026" -F "file_name=2026_admission.pdf" http://127.0.0.1:8000/convert/rag
+
+curl.exe -F "file=@manual.md" -F "document_id=manual" http://127.0.0.1:8000/convert/rag
 ```
 
 조회 테스트:
@@ -97,7 +101,7 @@ python scripts/analyze_eval_logs.py --log-dir dify-rag-eval-logs --limit 20
 python scripts/analyze_eval_logs.py --log-dir dify-rag-eval-logs --json
 ```
 
-이 스크립트는 `document_id` 누락, `direct_answer` 부재, `Verify Answer.valid=false`, `valid=true`인데 구조화 직접답변이 없는 케이스를 요약한다. 새 PDF를 재적재한 뒤 같은 질문을 다시 실행하고 이 스크립트의 `missing_document_id`와 `missing_direct_answer` 수가 줄어드는지 확인한다.
+이 스크립트는 `document_id` 누락, `direct_answer` 부재, `Verify Answer.valid=false`, `valid=true`인데 구조화 직접답변이 없는 케이스를 요약한다. 새 문서를 재적재한 뒤 같은 질문을 다시 실행하고 이 스크립트의 `missing_document_id`와 `missing_direct_answer` 수가 줄어드는지 확인한다.
 
 ## 환경 변수
 
