@@ -279,6 +279,55 @@ class RagPipelineTest(unittest.TestCase):
         self.assertIn("표시 의미", result["context"])
         self.assertIn("complete_values:", result["context"])
 
+    def test_marker_legend_from_following_page_enriches_previous_table_rows(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 26 ---
+
+# 모집인원
+
+| 계열 | 모집단위 | 수업연한 | 모집정원 |
+| --- | --- | --- | --- |
+| 공학 | 로봇자동화공학과 ♣ | 3 | 80 |
+| 공학 | 반도체기계정비학과 | 2 | 60 |
+| 공학 | 자동차공학과 ♣ | 2 | 90 |
+| 공학 | 컴퓨터정보공학과 ♣ | 3 | 93 |
+| 예체능 | 산업디자인학과 | 2 | 75 |
+
+--- Page 27 ---
+
+# 모집인원 주석
+
+※ ♣표시 : 4년제 학사학위(전공심화)과정 개설 학과
+""",
+            "admission_following_note.pdf",
+            document_id="doc_marker_following_note",
+        )
+
+        result = lookup_matches(
+            query="전공심화 개설 학과 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=10,
+        )
+
+        self.assertEqual(result["answer_field"], "모집단위")
+        self.assertIn("로봇자동화공학과", result["direct_answer"])
+        self.assertIn("자동차공학과", result["direct_answer"])
+        self.assertIn("컴퓨터정보공학과", result["direct_answer"])
+        self.assertNotIn("반도체기계정비학과", result["direct_answer"])
+        self.assertNotIn("산업디자인학과", result["direct_answer"])
+        self.assertIn("4년제 학사학위(전공심화)과정 개설 학과", result["context"])
+
+        meaning = lookup_matches(
+            query="♣ 표시는 무슨 의미야?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=5,
+        )
+        self.assertEqual(meaning["answer_field"], "표시 의미")
+        self.assertIn("4년제 학사학위(전공심화)과정 개설 학과", meaning["direct_answer"])
+
     def test_marker_legend_logic_is_domain_neutral(self):
         artifact = build_rag_artifact(
             """
@@ -296,6 +345,41 @@ class RagPipelineTest(unittest.TestCase):
 """,
             "api_catalog.pdf",
             document_id="doc_marker_api",
+        )
+
+        result = lookup_matches(
+            query="deprecated APIs 목록 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=10,
+        )
+
+        self.assertEqual(result["answer_field"], "API")
+        self.assertIn("Legacy Export API", result["direct_answer"])
+        self.assertIn("Classic Dashboard", result["direct_answer"])
+        self.assertNotIn("Bulk Export API", result["direct_answer"])
+
+    def test_marker_legend_from_later_page_is_domain_neutral(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# API Catalog
+
+| API | Version | Owner |
+| --- | --- | --- |
+| Legacy Export API † | v1.4 | Data Platform |
+| Bulk Export API | v2 | Data Platform |
+| Classic Dashboard † | v2.1 | Analytics |
+
+--- Page 2 ---
+
+# Notes
+
+† indicates deprecated APIs
+""",
+            "api_catalog_following_note.pdf",
+            document_id="doc_marker_api_following_note",
         )
 
         result = lookup_matches(
@@ -635,6 +719,65 @@ API 키 교체 후에는 감사 로그에서 발급자를 확인해야 한다.
         self.assertEqual(result["context"], "")
         self.assertFalse(result["diagnostics"]["answerability"]["answerable"])
         self.assertIn("storage", result["diagnostics"]["answerability"]["missing_strict_concepts"])
+
+    def test_query_type_disambiguates_number_condition_and_list_intents(self):
+        self.assertEqual(plan_query("Remote Work 월 한도와 승인자는?")["query_type"], "number_lookup")
+        self.assertEqual(plan_query("Basic 요금제 월 가격과 포함 유저 수 알려줘")["query_type"], "number_lookup")
+        self.assertEqual(plan_query("Data Export는 어떤 승인이 필요해?")["query_type"], "condition_lookup")
+        self.assertEqual(plan_query("SSO는 어떤 요금제에서 지원돼?")["query_type"], "condition_lookup")
+        self.assertEqual(plan_query("수시 면접 학과는 어디야?")["query_type"], "table_lookup")
+        self.assertEqual(plan_query("수시2차 합격자 발표일 알려줘")["query_type"], "date_lookup")
+
+    def test_verify_accepts_equivalent_korean_date_formats(self):
+        result = verify_answer(
+            "수시1차 원서접수 기간 알려줘",
+            "수시1차 원서접수 기간은 2025년 9월 8일(월)부터 9월 30일(화) 21:00까지입니다.",
+            [
+                "[Structured Lookup - authoritative exact evidence]\n"
+                "[Direct Answer - complete structured result]\n"
+                "answer_candidate: 수시1차: 2025. 9. 8.(월) ~ 9. 30.(화) 21:00까지\n"
+                "complete_values:\n"
+                "- 2025. 9. 8.(월) ~ 9. 30.(화) 21:00까지"
+            ],
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertFalse(any(issue["type"] == "unsupported_date" for issue in result["issues"]))
+        self.assertFalse(any(issue["type"] == "missing_direct_answer_value" for issue in result["issues"]))
+
+    def test_membership_question_uses_yes_no_direct_answer(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 26 ---
+
+# 모집인원
+
+| 계열 | 모집단위 | 수업연한 | 모집정원 |
+| --- | --- | --- | --- |
+| 공학 | 컴퓨터정보공학과 ♣ | 3 | 93 |
+| 예체능 | 산업디자인학과 | 2 | 75 |
+
+※ ♣표시 : 4년제 학사학위(전공심화)과정 개설 학과
+""",
+            "admission.pdf",
+            document_id="doc_membership",
+        )
+
+        positive = lookup_matches(
+            query="컴퓨터정보공학과는 전공심화 개설 학과야?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        negative = lookup_matches(
+            query="산업디자인학과는 전공심화 개설 학과야?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+
+        self.assertIn("컴퓨터정보공학과: 예", positive["direct_answer"])
+        self.assertIn("산업디자인학과: 아니오", negative["direct_answer"])
 
 
 if __name__ == "__main__":

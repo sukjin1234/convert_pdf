@@ -124,6 +124,22 @@ EVAL_LOG_DIR                    기본 OS temp/dify-rag-eval-logs
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+Dify Chat API 성능 테스트:
+
+`.env`에 Dify App API 정보를 넣는다.
+
+```text
+DIFY_API_BASE_URL=https://api.dify.ai/v1
+DIFY_APP_API_KEY=app-...
+DIFY_DOCUMENT_ID=sample_2026
+```
+
+```powershell
+python scripts/dify_perf_test.py --questions evaluation/dify_perf_questions.json --concurrency 5 --repeat 3
+```
+
+`scripts/dify_perf_test.py`는 Dify `/chat-messages` API에 질문만 동시 전송합니다. `DIFY_DOCUMENT_ID`가 있으면 Dify App `inputs.document_id`로 자동 전달하고, 질문 JSON에 `document_id`가 있으면 질문별 값이 우선합니다. 노드 결과와 테스트 결과 저장은 Dify Chatflow의 `eval_log` 노드에서 처리합니다. 질문 파일은 `evaluation/dify_perf_questions.json` 같은 JSON, 한 줄에 한 질문을 둔 TXT, 또는 `evaluation/manual_test_questions.md` 같은 Markdown 표를 사용할 수 있습니다.
+
 RAG 품질 평가:
 
 ```powershell

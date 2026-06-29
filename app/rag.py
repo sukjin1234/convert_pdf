@@ -17,8 +17,8 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 
 DATE_RE = re.compile(
     r"(?:(?:19|20)\d{2}\s*[.\-/년]\s*)?"
-    r"(?:0?[1-9]|1[0-2])\s*(?:[.\-/월]\s*)"
-    r"(?:0?[1-9]|[12]\d|3[01])\s*(?:일)?(?!\s*[%A-Za-z])"
+    r"(?:1[0-2]|0?[1-9])\s*(?:[.\-/월]\s*)"
+    r"(?:3[01]|[12]\d|0?[1-9])\s*(?:일)?(?!\s*[%A-Za-z])"
     r"|(?:19|20)\d{2}\s*년"
     r"|(?:상반기|하반기|1학기|2학기|분기|quarter|Q[1-4])",
     re.IGNORECASE,
@@ -150,6 +150,53 @@ CONCEPT_TERMS = {
 }
 
 STRICT_ABSENCE_CONCEPTS = {"storage", "compensation", "backup", "database"}
+
+ATTRIBUTE_CONCEPT_TERMS = {
+    "price": [
+        "가격",
+        "비용",
+        "금액",
+        "전형료",
+        "등록금",
+        "수업료",
+        "price",
+        "cost",
+        "fee",
+        "amount",
+        "monthly price",
+        "$",
+        "usd",
+        "krw",
+    ],
+    "capacity": ["수용인원", "수용 인원", "정원", "모집정원", "모집 정원", "capacity", "quota", "limit"],
+    "schedule": [
+        "일정",
+        "기간",
+        "날짜",
+        "일자",
+        "일시",
+        "마감",
+        "기한",
+        "접수",
+        "등록",
+        "발표",
+        "예약",
+        "schedule",
+        "date",
+        "period",
+        "deadline",
+        "time",
+    ],
+    "location": ["장소", "위치", "location", "place", "venue"],
+    "contact": ["연락처", "전화", "이메일", "문의", "contact", "phone", "email"],
+    "document": ["서류", "문서", "document", "file"],
+    "eligibility": ["자격", "요건", "조건", "requirement", "eligibility", "condition"],
+    "score": ["점수", "총점", "가산점", "등급", "score", "grade", "point"],
+    "status": ["상태", "지원", "가능", "제공", "포함", "status", "support", "available", "included"],
+    "version": ["버전", "폐기", "대체", "version", "deprecation", "replacement"],
+}
+
+STRICT_ATTRIBUTE_CONCEPTS = {"price", "schedule", "location", "contact", "document", "score"}
 
 STOPWORDS = {
     "그리고",
@@ -1448,8 +1495,25 @@ def plan_query(query: str, document_id: str | None = None) -> dict[str, Any]:
 
 def classify_query_type(query: str) -> str:
     lower = query.lower()
+    if re.search(r"비교|차이|대비|compare|difference|versus| vs\.? ", lower):
+        return "comparison"
+    if re.search(r"오류|에러|장애|해결|대응|복구|원인|troubleshoot|incident|resolution|error", lower):
+        return "troubleshooting"
+    if re.search(r"담당|연락처|전화|이메일|문의|owner|contact|phone|email", lower):
+        return "contact_lookup"
+    if re.search(r"의존|연동|dependency|depends|impact", lower):
+        return "dependency_lookup"
+    if re.search(r"언제|날짜|일정|기간|마감|접수|발표|시작|종료|기한|일시|예약|보존|폐기일|개정일|주기|date|deadline|schedule|period|retention|rotation|deprecation", lower):
+        return "date_lookup"
+    if re.search(r"몇|얼마|수량|개수|건수|횟수|인원|정원|모집인원|선발|한도|제한|임계값|기준값|점수|금액|비용|가격|예산|매출|가용성|응답시간|지연시간|비율|율|number|amount|capacity|limit|score|rate|ratio|budget|price|cost", lower):
+        return "number_lookup"
+    if re.search(r"가능|지원|제공|포함|필수|요건|조건|자격|예외|승인|할 수|모집해|휴학|available|supported|included|required|requirement|condition|eligible", lower):
+        return "condition_lookup"
+    if re.search(r"목록|리스트|명단|어떤|어느|어디|학과|부서|종류|카테고리|표|항목|list|which|where|table|category", lower):
+        return "table_lookup"
+
     scores = {
-        query_type: sum(1 for term in terms if term.lower() in lower)
+        query_type: sum(1 for term in terms if query_type_term_matches(term, lower))
         for query_type, terms in QUERY_TYPE_TERMS.items()
     }
     if NUMBER_RE.search(query) and scores["date_lookup"] == 0:
@@ -1458,6 +1522,13 @@ def classify_query_type(query: str) -> str:
         scores["date_lookup"] += 2
     best_type, best_score = max(scores.items(), key=lambda item: item[1])
     return best_type if best_score > 0 else "semantic"
+
+
+def query_type_term_matches(term: str, lower_query: str) -> bool:
+    term_lower = term.lower()
+    if len(term_lower) <= 1:
+        return bool(re.search(rf"(?<![0-9a-z가-힣]){re.escape(term_lower)}(?![0-9a-z가-힣])", lower_query))
+    return term_lower in lower_query
 
 
 def split_sub_queries(query: str, keywords: list[str]) -> list[str]:
@@ -1800,6 +1871,11 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
         if inverse["direct_answer"]:
             return inverse
 
+    if looks_like_membership_question(query) and (should_build_keyed_list or should_build_boolean_matrix):
+        membership = build_membership_answer(query, query_type, query_keywords, top_group)
+        if membership["direct_answer"]:
+            return membership
+
     if should_build_field_value:
         field_value = build_field_value_answer(query, query_type, query_keywords, top_group)
         if field_value["direct_answer"]:
@@ -1916,6 +1992,120 @@ def meaningful_answer_terms(terms: list[str]) -> list[str]:
     return result
 
 
+def looks_like_membership_question(query: str) -> bool:
+    return bool(
+        re.search(
+            r"(?:은|는|이|가).*(?:맞아|맞나요|해당|포함|지원|제공|가능|개설|운영|야\?|인가|인가요|있어\?)"
+            r"|(?:is|are).*(?:available|supported|included|enabled)",
+            query,
+            re.IGNORECASE,
+        )
+    )
+
+
+def build_membership_answer(
+    query: str,
+    query_type: str,
+    query_terms: list[str],
+    matches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    keyed = build_keyed_list_answer(query, query_type, query_terms, matches)
+    if not keyed["answer_items"]:
+        pivoted = build_boolean_matrix_answer(query, query_terms, matches)
+        if pivoted["answer_items"]:
+            return pivoted
+        return {
+            "direct_answer": "",
+            "answer_items": [],
+            "answer_field": "",
+            "filter_terms": [],
+            "mode": "",
+        }
+
+    target_key = keyed["answer_field"]
+    listed_values = [
+        clean_cell(item.get("value", ""))
+        for item in keyed["answer_items"]
+        if isinstance(item, dict) and clean_cell(item.get("value", ""))
+    ]
+    requested_values = requested_values_for_field(query, query_terms, target_key, matches)
+    if not requested_values:
+        return {
+            "direct_answer": "",
+            "answer_items": [],
+            "answer_field": "",
+            "filter_terms": [],
+            "mode": "",
+        }
+
+    listed_norms = {normalize_for_match(value) for value in listed_values}
+    values = []
+    answer_items = []
+    for requested in requested_values:
+        requested_norm = normalize_for_match(requested)
+        supported = requested_norm in listed_norms
+        value = f"{requested}: {'예' if supported else '아니오'}"
+        values.append(value)
+        source_item = next(
+            (
+                item
+                for item in keyed["answer_items"]
+                if isinstance(item, dict) and normalize_for_match(str(item.get("value") or "")) == requested_norm
+            ),
+            keyed["answer_items"][0],
+        )
+        answer_items.append(
+            {
+                "value": value,
+                "field": target_key,
+                "record_id": source_item.get("record_id", "") if isinstance(source_item, dict) else "",
+                "page": source_item.get("page") if isinstance(source_item, dict) else None,
+                "section_path": source_item.get("section_path", "") if isinstance(source_item, dict) else "",
+                "fields": source_item.get("fields", {}) if isinstance(source_item, dict) else {},
+                "membership_value": requested,
+                "supported": supported,
+            }
+        )
+
+    return {
+        "direct_answer": format_direct_answer_text(target_key, values),
+        "answer_items": answer_items,
+        "answer_field": target_key,
+        "filter_terms": keyed.get("filter_terms", []),
+        "mode": "membership",
+    }
+
+
+def requested_values_for_field(
+    query: str,
+    query_terms: list[str],
+    target_key: str,
+    matches: list[dict[str, Any]],
+) -> list[str]:
+    values_by_norm: dict[str, str] = {}
+    for match in matches:
+        fields = match.get("fields") or {}
+        for value in split_compound_answer_value(clean_cell(fields.get(target_key, ""))):
+            norm = normalize_for_match(value)
+            if norm:
+                values_by_norm[norm] = value
+
+    requested = []
+    query_norm = normalize_for_match(query)
+    for norm, value in values_by_norm.items():
+        if norm and norm in query_norm:
+            requested.append(value)
+
+    if requested:
+        return unique_exact_keep_order(requested)
+
+    for term in query_terms:
+        term_norm = normalize_for_match(term)
+        if term_norm in values_by_norm:
+            requested.append(values_by_norm[term_norm])
+    return unique_exact_keep_order(requested)
+
+
 def build_keyed_list_answer(
     query: str,
     query_type: str,
@@ -1945,19 +2135,21 @@ def build_keyed_list_answer(
         value = clean_cell(fields.get(target_key, ""))
         if not value:
             continue
-        if normalize_for_match(value) in {normalize_for_match(item) for item in values}:
-            continue
-        values.append(value)
-        answer_items.append(
-            {
-                "value": value,
-                "field": target_key,
-                "record_id": match.get("record_id", ""),
-                "page": match.get("page"),
-                "section_path": match.get("section_path", ""),
-                "fields": fields,
-            }
-        )
+        for split_value in split_compound_answer_value(value):
+            if normalize_for_match(split_value) in {normalize_for_match(item) for item in values}:
+                continue
+            values.append(split_value)
+            answer_items.append(
+                {
+                    "value": split_value,
+                    "field": target_key,
+                    "record_id": match.get("record_id", ""),
+                    "page": match.get("page"),
+                    "section_path": match.get("section_path", ""),
+                    "fields": fields,
+                    "raw_value": value,
+                }
+            )
 
     if not values:
         return {
@@ -1975,6 +2167,22 @@ def build_keyed_list_answer(
         "filter_terms": filter_terms,
         "mode": "target_field",
     }
+
+
+def split_compound_answer_value(value: str) -> list[str]:
+    cleaned = clean_cell(value)
+    if not cleaned:
+        return []
+    korean_entities = re.findall(
+        r"[가-힣A-Za-z0-9._/-]+(?:학과|학부|전공|대학|기관|부서|센터|팀|조직|시스템|서비스|API|DB|Plan|Feature)",
+        cleaned,
+    )
+    if len(korean_entities) >= 2:
+        compact_entities = normalize_for_match(" ".join(korean_entities)).replace(" ", "")
+        compact_value = normalize_for_match(cleaned).replace(" ", "")
+        if compact_entities and compact_entities == compact_value:
+            return unique_exact_keep_order(korean_entities)
+    return [cleaned]
 
 
 def choose_target_field_key(query: str, query_terms: list[str], matches: list[dict[str, Any]]) -> str:
@@ -2449,6 +2657,9 @@ def assess_answerability(
     query_concepts = detect_concepts(" ".join([query, *entities]))
     evidence_concepts = detect_concepts(evidence_text)
     missing_strict_concepts = sorted((query_concepts & STRICT_ABSENCE_CONCEPTS) - evidence_concepts)
+    query_attributes = detect_attribute_concepts(" ".join([query, *entities]))
+    evidence_attributes = detect_attribute_concepts(evidence_text)
+    missing_strict_attributes = sorted((query_attributes & STRICT_ATTRIBUTE_CONCEPTS) - evidence_attributes)
     average_coverage = sum(float(match.get("coverage") or 0) for match in matches) / len(matches)
     top_score = max(float(match.get("score") or 0) for match in matches)
 
@@ -2460,6 +2671,19 @@ def assess_answerability(
             "evidence_concepts": sorted(evidence_concepts),
             "missing_strict_concepts": missing_strict_concepts,
             "reason": "query asks for a specific concept that is absent from evidence",
+        }
+
+    if missing_strict_attributes:
+        return {
+            "answerable": False,
+            "confidence": 0.25,
+            "query_concepts": sorted(query_concepts),
+            "evidence_concepts": sorted(evidence_concepts),
+            "query_attributes": sorted(query_attributes),
+            "evidence_attributes": sorted(evidence_attributes),
+            "missing_strict_concepts": missing_strict_concepts,
+            "missing_strict_attributes": missing_strict_attributes,
+            "reason": "query asks for a specific attribute that is absent from evidence",
         }
 
     weak_signal = average_coverage < 0.12 and top_score < 6.0 and query_type in STRUCTURED_LOOKUP_TYPES
@@ -2478,7 +2702,10 @@ def assess_answerability(
         "confidence": round(min(0.95, 0.55 + min(average_coverage, 1.0) * 0.35 + min(top_score / 40.0, 0.25)), 3),
         "query_concepts": sorted(query_concepts),
         "evidence_concepts": sorted(evidence_concepts),
+        "query_attributes": sorted(query_attributes),
+        "evidence_attributes": sorted(evidence_attributes),
         "missing_strict_concepts": [],
+        "missing_strict_attributes": [],
         "reason": "evidence passed answerability checks",
     }
 
@@ -2492,6 +2719,22 @@ def detect_concepts(text: str) -> set[str]:
             if term_norm and term_norm in normalized:
                 concepts.add(concept)
                 break
+    return concepts
+
+
+def detect_attribute_concepts(text: str) -> set[str]:
+    normalized = normalize_for_match(text)
+    concepts = set()
+    for concept, terms in ATTRIBUTE_CONCEPT_TERMS.items():
+        for term in terms:
+            term_norm = normalize_for_match(term)
+            if term_norm and term_norm in normalized:
+                concepts.add(concept)
+                break
+    if re.search(r"[$₩€]|(?:^|[\s:])\d[\d,]*(?:원|만원|억원|달러|usd|krw)(?:\s|$)", normalized, re.IGNORECASE):
+        concepts.add("price")
+    if DATE_RE.search(text or ""):
+        concepts.add("schedule")
     return concepts
 
 
@@ -2816,7 +3059,7 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
     if query_type == "date_lookup" and not answer_dates:
         issues.append({"type": "missing_date", "message": "The question asks for a date or period, but the answer has no date."})
     for date in answer_dates:
-        if date not in evidence_dates:
+        if not date_value_supported(date, evidence_dates):
             issues.append(
                 {
                     "type": "unsupported_date",
@@ -2851,11 +3094,10 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
 
     direct_values = extract_complete_answer_values(evidence_text)
     if direct_values:
-        answer_norm = normalize_for_match(answer)
         missing_direct_values = [
             value
             for value in direct_values
-            if normalize_for_match(value) and normalize_for_match(value) not in answer_norm
+            if normalize_for_match(value) and not complete_value_supported_by_text(value, answer)
         ]
         if missing_direct_values:
             issues.append(
@@ -2956,6 +3198,37 @@ def extract_complete_answer_values(evidence_text: str) -> list[str]:
     return unique_keep_order(values)
 
 
+def complete_value_supported_by_text(value: str, text: str) -> bool:
+    value = clean_cell(value)
+    text = clean_cell(text)
+    if not value:
+        return True
+    value_norm = normalize_for_match(value)
+    text_norm = normalize_for_match(text)
+    if value_norm and value_norm in text_norm:
+        return True
+
+    value_dates = extract_date_values(value)
+    if value_dates:
+        text_dates = extract_date_values(text)
+        if not all(date_value_supported(date, text_dates) for date in value_dates):
+            return False
+        value_times = extract_time_values(value)
+        text_times = extract_time_values(text)
+        return all(time_value in text_times for time_value in value_times)
+
+    value_numbers = extract_number_values(value)
+    if value_numbers:
+        text_numbers = extract_number_values(text)
+        return all(number in text_numbers for number in value_numbers)
+
+    parts = split_compound_answer_value(value)
+    if len(parts) > 1:
+        return all(normalize_for_match(part) in text_norm for part in parts)
+
+    return False
+
+
 def is_abstention_answer(answer: str) -> bool:
     return bool(ABSTENTION_RE.search(answer or ""))
 
@@ -2964,9 +3237,12 @@ def evidence_has_answer_candidate(question: str, evidence_text: str, query_type:
     if not evidence_text.strip():
         return False
 
+    question_attributes = detect_attribute_concepts(question)
     for match in ANSWER_CANDIDATE_RE.finditer(evidence_text):
         candidate = clean_cell(match.group(1))
         if candidate and candidate not in {"-", "N/A", "None", "null"}:
+            if question_attributes and not (question_attributes & detect_attribute_concepts(candidate)):
+                continue
             return True
 
     if "[Structured Lookup" not in evidence_text:
@@ -3032,7 +3308,65 @@ def extract_number_values(text: str) -> list[str]:
 
 
 def extract_date_values(text: str) -> list[str]:
-    return unique_keep_order(clean_cell(match.group(0)) for match in DATE_RE.finditer(text))
+    return unique_keep_order(
+        normalized
+        for match in DATE_RE.finditer(text)
+        for normalized in [normalize_date_value(match.group(0))]
+        if normalized
+    )
+
+
+def normalize_date_value(value: str) -> str:
+    cleaned = clean_cell(value)
+    if not cleaned:
+        return ""
+    if re.fullmatch(r"(?:19|20)\d{2}\s*년?", cleaned):
+        year = re.search(r"(?:19|20)\d{2}", cleaned)
+        return year.group(0) if year else ""
+    if re.search(r"상반기|하반기|1학기|2학기|분기|quarter|Q[1-4]", cleaned, re.IGNORECASE):
+        return normalize_for_match(cleaned).replace(" ", "-")
+
+    pattern = re.compile(
+        r"(?:(?P<year>(?:19|20)\d{2})\s*[.\-/년]\s*)?"
+        r"(?P<month>1[0-2]|0?[1-9])\s*(?:[.\-/월]\s*)"
+        r"(?P<day>3[01]|[12]\d|0?[1-9])"
+    )
+    match = pattern.search(cleaned)
+    if not match:
+        return normalize_for_match(cleaned)
+    year = match.group("year")
+    month = int(match.group("month"))
+    day = int(match.group("day"))
+    date_part = f"{month:02d}-{day:02d}"
+    return f"{year}-{date_part}" if year else date_part
+
+
+def date_value_supported(date: str, evidence_dates: list[str]) -> bool:
+    if date in evidence_dates:
+        return True
+    date_month_day = month_day_part(date)
+    if not date_month_day:
+        return False
+    return any(month_day_part(evidence_date) == date_month_day for evidence_date in evidence_dates)
+
+
+def month_day_part(date: str) -> str:
+    match = re.search(r"(?:(?:19|20)\d{2}-)?(?P<month>\d{2})-(?P<day>\d{2})$", date or "")
+    return f"{match.group('month')}-{match.group('day')}" if match else ""
+
+
+def extract_time_values(text: str) -> list[str]:
+    values = []
+    for hour, minute in re.findall(r"(?<!\d)([01]?\d|2[0-3])\s*:\s*([0-5]\d)(?!\d)", text or ""):
+        values.append(f"{int(hour):02d}:{minute}")
+    for period, hour in re.findall(r"(오전|오후)\s*([0-9]{1,2})\s*시", text or ""):
+        hour_value = int(hour)
+        if period == "오후" and hour_value < 12:
+            hour_value += 12
+        if period == "오전" and hour_value == 12:
+            hour_value = 0
+        values.append(f"{hour_value:02d}:00")
+    return unique_keep_order(values)
 
 
 def extract_identifier_values(text: str) -> list[str]:

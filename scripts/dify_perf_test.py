@@ -1,0 +1,352 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_QUESTIONS = ROOT / "evaluation" / "dify_perf_questions.json"
+
+
+@dataclass(frozen=True)
+class Question:
+    id: str
+    text: str
+    inputs: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SendResult:
+    index: int
+    iteration: int
+    question_id: str
+    question: str
+    ok: bool
+    status_code: int | None
+    latency_seconds: float
+    conversation_id: str
+    error: str
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Send performance-test questions to the Dify Chat Messages API."
+    )
+    parser.add_argument("--env-file", default=str(ROOT / ".env"), help="Env file containing DIFY_API_BASE_URL and DIFY_APP_API_KEY.")
+    parser.add_argument("--questions", default=str(DEFAULT_QUESTIONS), help="Question file: JSON, TXT, or Markdown table.")
+    parser.add_argument("--limit", type=int, default=0, help="Use only the first N questions. 0 means all.")
+    parser.add_argument("--repeat", type=int, default=1, help="Repeat the question set N times.")
+    parser.add_argument("--concurrency", type=int, default=4, help="Concurrent request count.")
+    parser.add_argument("--timeout", type=float, default=180.0, help="Per-request timeout seconds.")
+    parser.add_argument("--response-mode", choices=["blocking", "streaming"], default="blocking")
+    parser.add_argument("--user-prefix", default="dify-perf", help="Prefix for Dify user identifiers.")
+    parser.add_argument("--inputs-json", default="{}", help="JSON object for Dify inputs.")
+    parser.add_argument("--inputs-file", default="", help="Path to JSON object for Dify inputs.")
+    parser.add_argument(
+        "--reuse-conversation",
+        action="store_true",
+        help="Reuse one conversation_id per concurrency slot. Default sends each request as a new conversation.",
+    )
+    parser.add_argument("--quiet", action="store_true", help="Print only the final send summary.")
+    args = parser.parse_args()
+
+    load_env_file(Path(args.env_file))
+
+    base_url = (os.getenv("DIFY_API_BASE_URL") or "").rstrip("/")
+    api_key = os.getenv("DIFY_APP_API_KEY") or os.getenv("DIFY_API_KEY") or ""
+    if not base_url:
+        print(f"DIFY_API_BASE_URL is missing. Add it to {args.env_file}.", file=sys.stderr)
+        return 2
+    if not api_key:
+        print(f"DIFY_APP_API_KEY is missing. Add it to {args.env_file}.", file=sys.stderr)
+        return 2
+
+    inputs = load_inputs(args.inputs_json, args.inputs_file)
+    default_document_id = os.getenv("DIFY_DOCUMENT_ID") or os.getenv("DIFY_DEFAULT_DOCUMENT_ID") or ""
+    if default_document_id and "document_id" not in inputs:
+        inputs["document_id"] = default_document_id
+    questions = load_questions(Path(args.questions))
+    if args.limit > 0:
+        questions = questions[: args.limit]
+    if not questions:
+        print(f"No questions found in {args.questions}", file=sys.stderr)
+        return 2
+
+    repeat = max(1, args.repeat)
+    concurrency = max(1, args.concurrency)
+    tasks: list[tuple[int, int, int, Question]] = []
+    for iteration in range(1, repeat + 1):
+        for question in questions:
+            index = len(tasks) + 1
+            slot = (index - 1) % concurrency
+            tasks.append((index, iteration, slot, question))
+
+    started = time.perf_counter()
+    print_lock = threading.Lock()
+
+    def print_progress(result: SendResult) -> None:
+        if args.quiet:
+            return
+        status = "OK" if result.ok else "ERR"
+        with print_lock:
+            print(
+                f"[{status}] #{result.index} {result.latency_seconds:.3f}s "
+                f"{result.question_id} {result.question[:60]}"
+            )
+
+    def run_task(task: tuple[int, int, int, Question], conversation_id: str = "") -> SendResult:
+        index, iteration, slot, question = task
+        request_inputs = {**inputs, **question.inputs}
+        return send_chat_message(
+            base_url=base_url,
+            api_key=api_key,
+            question=question,
+            inputs=request_inputs,
+            response_mode=args.response_mode,
+            conversation_id=conversation_id,
+            user=f"{args.user_prefix}-{slot + 1}",
+            timeout=args.timeout,
+            index=index,
+            iteration=iteration,
+        )
+
+    results: list[SendResult] = []
+    if args.reuse_conversation:
+        tasks_by_slot: list[list[tuple[int, int, int, Question]]] = [[] for _ in range(concurrency)]
+        for task in tasks:
+            tasks_by_slot[task[2]].append(task)
+
+        def run_slot(slot_tasks: list[tuple[int, int, int, Question]]) -> list[SendResult]:
+            slot_results: list[SendResult] = []
+            conversation_id = ""
+            for task in slot_tasks:
+                result = run_task(task, conversation_id=conversation_id)
+                if result.conversation_id:
+                    conversation_id = result.conversation_id
+                slot_results.append(result)
+                print_progress(result)
+            return slot_results
+
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(run_slot, slot_tasks) for slot_tasks in tasks_by_slot if slot_tasks]
+            for future in as_completed(futures):
+                results.extend(future.result())
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(run_task, task) for task in tasks]
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+                print_progress(result)
+
+    elapsed = time.perf_counter() - started
+    results.sort(key=lambda item: item.index)
+    print_summary(results, elapsed)
+
+    return 0 if all(result.ok for result in results) else 1
+
+
+def send_chat_message(
+    *,
+    base_url: str,
+    api_key: str,
+    question: Question,
+    inputs: dict[str, Any],
+    response_mode: str,
+    conversation_id: str,
+    user: str,
+    timeout: float,
+    index: int,
+    iteration: int,
+) -> SendResult:
+    payload = {
+        "inputs": inputs,
+        "query": question.text,
+        "response_mode": response_mode,
+        "conversation_id": conversation_id,
+        "user": user,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/chat-messages",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+
+    started = time.perf_counter()
+    status_code: int | None = None
+    response_conversation_id = ""
+    error = ""
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status_code = response.status
+            if response_mode == "streaming":
+                response_conversation_id = drain_sse_response(response)
+            else:
+                response_body = response.read().decode("utf-8")
+                data = json.loads(response_body) if response_body else {}
+                response_conversation_id = str(data.get("conversation_id") or "")
+    except urllib.error.HTTPError as exc:
+        status_code = exc.code
+        error_body = exc.read().decode("utf-8", errors="replace")
+        error = f"HTTP {exc.code}: {error_body[:500]}"
+    except urllib.error.URLError as exc:
+        error = f"URL error: {exc.reason}"
+    except TimeoutError:
+        error = f"Timeout after {timeout}s"
+    except Exception as exc:  # noqa: BLE001 - CLI should record unexpected per-request failures.
+        error = f"{type(exc).__name__}: {exc}"
+
+    latency_seconds = time.perf_counter() - started
+    ok = bool(status_code and 200 <= status_code < 300 and not error)
+    return SendResult(
+        index=index,
+        iteration=iteration,
+        question_id=question.id,
+        question=question.text,
+        ok=ok,
+        status_code=status_code,
+        latency_seconds=round(latency_seconds, 6),
+        conversation_id=response_conversation_id,
+        error=error,
+    )
+
+
+def drain_sse_response(response: Any) -> str:
+    conversation_id = ""
+
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data_text = line.removeprefix("data:").strip()
+        if data_text == "[DONE]":
+            break
+        try:
+            data = json.loads(data_text)
+        except json.JSONDecodeError:
+            continue
+
+        if data.get("conversation_id"):
+            conversation_id = str(data.get("conversation_id"))
+
+    return conversation_id
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
+
+
+def load_inputs(inputs_json: str, inputs_file: str) -> dict[str, Any]:
+    if inputs_file:
+        value = json.loads(Path(inputs_file).read_text(encoding="utf-8"))
+    else:
+        value = json.loads(inputs_json or "{}")
+    if not isinstance(value, dict):
+        raise ValueError("Dify inputs must be a JSON object.")
+    return value
+
+
+def load_questions(path: Path) -> list[Question]:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return questions_from_json(payload)
+    if suffix in {".txt", ".text"}:
+        return [
+            Question(id=f"q{line_number}", text=line.strip())
+            for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    if suffix in {".md", ".markdown"}:
+        return questions_from_markdown(path.read_text(encoding="utf-8"))
+    raise ValueError(f"Unsupported questions file type: {path}")
+
+
+def questions_from_json(payload: Any) -> list[Question]:
+    if isinstance(payload, list):
+        questions = []
+        for index, item in enumerate(payload, start=1):
+            if isinstance(item, str):
+                questions.append(Question(id=f"q{index}", text=item))
+            elif isinstance(item, dict) and item.get("question"):
+                item_inputs = item.get("inputs") if isinstance(item.get("inputs"), dict) else {}
+                question_inputs = dict(item_inputs)
+                if item.get("document_id") and "document_id" not in question_inputs:
+                    question_inputs["document_id"] = str(item["document_id"])
+                questions.append(
+                    Question(
+                        id=str(item.get("id") or f"q{index}"),
+                        text=str(item["question"]),
+                        inputs=question_inputs,
+                    )
+                )
+        return questions
+
+    if isinstance(payload, dict):
+        if isinstance(payload.get("questions"), list):
+            return questions_from_json(payload["questions"])
+        if isinstance(payload.get("cases"), list):
+            return questions_from_json(payload["cases"])
+
+    raise ValueError("JSON questions must be a list, {questions: [...]}, or {cases: [{question: ...}]}.")
+
+
+def questions_from_markdown(markdown: str) -> list[Question]:
+    questions: list[Question] = []
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or "---" in stripped:
+            continue
+        columns = [column.strip() for column in stripped.strip("|").split("|")]
+        if len(columns) < 2:
+            continue
+        if columns[0].lower() in {"id", "항목"} or columns[1] == "질문":
+            continue
+        if columns[1]:
+            questions.append(Question(id=columns[0] or f"q{len(questions) + 1}", text=columns[1]))
+    return questions
+
+
+def print_summary(results: list[SendResult], elapsed_seconds: float) -> None:
+    success_count = sum(1 for result in results if result.ok)
+    failed = [result for result in results if not result.ok]
+    throughput = len(results) / elapsed_seconds if elapsed_seconds > 0 else 0
+    print("")
+    print("Dify question send summary")
+    print(f"- total/success/failed: {len(results)}/{success_count}/{len(failed)}")
+    print(f"- elapsed: {elapsed_seconds:.3f}s")
+    print(f"- send throughput: {throughput:.3f} req/s")
+    if failed:
+        print("- error samples:")
+        for result in failed[:10]:
+            print(f"  #{result.index} {result.status_code} {result.error}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
