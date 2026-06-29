@@ -51,6 +51,8 @@ file_name    Text  {{File.file.name}}
 
 기존 PDF 전용 노드와의 호환을 위해 `pdf` form-data 필드도 계속 받을 수 있습니다. 새로 구성할 때는 `file` 필드를 사용합니다. 현재 지원 형식은 `PDF`, `TXT`, `MD/Markdown`, `DOCX`, `CSV`, `TSV`입니다.
 
+PDF 본문은 기존 변환 경로를 유지하고, PDF 내부 이미지 객체만 따로 추출해 OpenDataLoader OCR로 인식합니다. DOCX에 포함된 이미지는 `word/media`에서 추출한 뒤 임시 PDF로 만들어 같은 OpenDataLoader OCR 경로로 인식합니다. 이미지 OCR 결과는 변환 Markdown의 `Embedded Image OCR` 섹션에 추가됩니다.
+
 Chatflow의 JSON/Raw HTTP 노드에서는 다음 헤더만 넣습니다.
 
 ```text

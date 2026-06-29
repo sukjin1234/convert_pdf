@@ -38,6 +38,7 @@ SUPPORTED_DOCUMENT_SUFFIXES = {
 }
 TEXT_DOCUMENT_SUFFIXES = {".txt", ".log", ".md", ".markdown"}
 CSV_DOCUMENT_SUFFIXES = {".csv", ".tsv"}
+IMAGE_DOCUMENT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 SUPPORTED_DOCUMENT_LABEL = "PDF, TXT, Markdown, DOCX, CSV, TSV"
 WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
@@ -63,7 +64,7 @@ class DocumentConverter:
             delimiter = "\t" if suffix == ".tsv" else ","
             return _read_csv_document(file_bytes, delimiter=delimiter)
         if suffix == ".docx":
-            return _read_docx_document(file_bytes)
+            return _read_docx_document(file_bytes, self.settings, safe_name)
 
         if file_bytes.lstrip().startswith(b"%PDF-"):
             return PdfConverter(self.settings).convert_pdf_bytes(file_bytes, safe_name)
@@ -96,7 +97,14 @@ class PdfConverter:
             qpdf_repaired_path: Path | None = None
 
             try:
-                return _convert_pdf_file(input_path, tmp_dir / "output-original", self.settings)
+                markdown = _convert_pdf_file(input_path, tmp_dir / "output-original", self.settings)
+                return _append_pdf_image_ocr(
+                    markdown,
+                    input_path,
+                    tmp_dir,
+                    self.settings,
+                    source_name=safe_name,
+                )
             except ConversionError as exc:
                 errors.append(f"original: {exc}")
                 logger.info("Original PDF conversion failed; trying fallbacks. error=%s", exc)
@@ -105,10 +113,17 @@ class PdfConverter:
                 qpdf_repaired_path = tmp_dir / "qpdf-repaired.pdf"
                 try:
                     _repair_pdf_with_pikepdf(input_path, qpdf_repaired_path)
-                    return _convert_pdf_file(
+                    markdown = _convert_pdf_file(
                         qpdf_repaired_path,
                         tmp_dir / "output-qpdf-repaired",
                         self.settings,
+                    )
+                    return _append_pdf_image_ocr(
+                        markdown,
+                        qpdf_repaired_path,
+                        tmp_dir,
+                        self.settings,
+                        source_name=safe_name,
                     )
                 except ConversionError as exc:
                     errors.append(f"qpdf-repaired: {exc}")
@@ -119,7 +134,14 @@ class PdfConverter:
                 repair_source = qpdf_repaired_path if qpdf_repaired_path and qpdf_repaired_path.exists() else input_path
                 try:
                     _repair_pdf(repair_source, repaired_path)
-                    return _convert_pdf_file(repaired_path, tmp_dir / "output-repaired", self.settings)
+                    markdown = _convert_pdf_file(repaired_path, tmp_dir / "output-repaired", self.settings)
+                    return _append_pdf_image_ocr(
+                        markdown,
+                        repaired_path,
+                        tmp_dir,
+                        self.settings,
+                        source_name=safe_name,
+                    )
                 except ConversionError as exc:
                     errors.append(f"repaired: {exc}")
                     logger.info("Repaired PDF conversion failed. error=%s", exc)
@@ -206,16 +228,37 @@ def _read_csv_document(file_bytes: bytes, *, delimiter: str) -> str:
     return markdown
 
 
-def _read_docx_document(file_bytes: bytes) -> str:
+def _read_docx_document(file_bytes: bytes, settings: Settings, filename: str) -> str:
+    images: list[tuple[str, bytes]] = []
     try:
         with zipfile.ZipFile(BytesIO(file_bytes)) as archive:
             parts = _read_docx_main_parts(archive)
+            images = _read_docx_media_images(archive)
     except zipfile.BadZipFile as exc:
         raise ConversionError("Input is not a valid DOCX file.") from exc
     except KeyError as exc:
         raise ConversionError("DOCX file is missing word/document.xml.") from exc
     except ElementTree.ParseError as exc:
         raise ConversionError("DOCX XML is not readable.") from exc
+
+    if images:
+        tmp_dir = _create_conversion_tmp_dir(settings)
+        try:
+            try:
+                image_ocr = _ocr_embedded_images_with_opendataloader(
+                    images,
+                    tmp_dir,
+                    settings,
+                    source_name=filename,
+                )
+            except ConversionError as exc:
+                logger.warning("DOCX embedded image OCR failed for %s: %s", filename, exc)
+                image_ocr = ""
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        if image_ocr:
+            parts.append("## Embedded Image OCR\n\n" + image_ocr)
 
     markdown = _normalize_markdown("\n\n".join(part for part in parts if part.strip()))
     if not _has_meaningful_markdown(markdown):
@@ -236,6 +279,148 @@ def _read_docx_main_parts(archive: zipfile.ZipFile) -> list[str]:
             parts.append(f"## {_docx_member_label(member)}")
             parts.extend(blocks)
     return parts
+
+
+def _read_docx_media_images(archive: zipfile.ZipFile) -> list[tuple[str, bytes]]:
+    images: list[tuple[str, bytes]] = []
+    for member_name in sorted(archive.namelist()):
+        suffix = Path(member_name).suffix.lower()
+        if not member_name.startswith("word/media/") or suffix not in IMAGE_DOCUMENT_SUFFIXES:
+            continue
+        try:
+            image_bytes = archive.read(member_name)
+        except KeyError:
+            continue
+        if image_bytes:
+            images.append((member_name, image_bytes))
+    return images
+
+
+def _ocr_embedded_images_with_opendataloader(
+    images: list[tuple[str, bytes]],
+    tmp_dir: Path,
+    settings: Settings,
+    *,
+    source_name: str,
+) -> str:
+    if not images:
+        return ""
+
+    image_pdf_path = tmp_dir / "embedded-images.pdf"
+    _images_to_pdf(images, image_pdf_path)
+    try:
+        markdown = _convert_pdf_file(
+            image_pdf_path,
+            tmp_dir / "output-embedded-images-ocr",
+            settings,
+            hybrid_mode="full",
+            image_output="off",
+        )
+    except ConversionError as exc:
+        raise ConversionError(f"Embedded image OCR failed for {source_name}: {exc}") from exc
+    return _normalize_markdown(markdown)
+
+
+def _append_pdf_image_ocr(
+    markdown: str,
+    pdf_path: Path,
+    tmp_dir: Path,
+    settings: Settings,
+    *,
+    source_name: str,
+) -> str:
+    try:
+        images = _read_pdf_embedded_images(pdf_path)
+    except ConversionError as exc:
+        logger.warning("PDF image extraction failed for %s: %s", source_name, exc)
+        return markdown
+
+    if not images:
+        return markdown
+
+    try:
+        image_ocr = _ocr_embedded_images_with_opendataloader(
+            images,
+            tmp_dir,
+            settings,
+            source_name=source_name,
+        )
+    except ConversionError as exc:
+        logger.warning("PDF embedded image OCR failed for %s: %s", source_name, exc)
+        return markdown
+
+    if not _has_meaningful_markdown(image_ocr):
+        return markdown
+    return _normalize_markdown(markdown + "\n\n## Embedded Image OCR\n\n" + image_ocr)
+
+
+def _read_pdf_embedded_images(pdf_path: Path) -> list[tuple[str, bytes]]:
+    try:
+        fitz = _load_pymupdf()
+        doc = fitz.open(str(pdf_path))
+    except ConversionError as exc:
+        raise ConversionError("PyMuPDF is required for PDF image extraction.") from exc
+    except Exception as exc:
+        raise ConversionError("Could not open PDF for image extraction.") from exc
+
+    images: list[tuple[str, bytes]] = []
+    seen_xrefs: set[int] = set()
+    try:
+        for page_number, page in enumerate(doc, start=1):
+            for image_number, image_info in enumerate(page.get_images(full=True), start=1):
+                xref = int(image_info[0])
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
+                try:
+                    extracted = doc.extract_image(xref)
+                except Exception:
+                    logger.info("Could not extract PDF image. pdf=%s page=%s xref=%s", pdf_path, page_number, xref)
+                    continue
+                image_bytes = extracted.get("image") or b""
+                if not image_bytes:
+                    continue
+                ext = str(extracted.get("ext") or "png").lower()
+                image_name = f"{pdf_path.stem}-page{page_number:03d}-image{image_number:03d}.{ext}"
+                images.append((image_name, image_bytes))
+        return images
+    except Exception as exc:
+        raise ConversionError("Could not inspect PDF images.") from exc
+    finally:
+        doc.close()
+
+
+def _images_to_pdf(images: list[tuple[str, bytes]], output_path: Path) -> None:
+    fitz = _load_pymupdf()
+    target = fitz.open()
+    try:
+        for image_name, image_bytes in images:
+            image_doc = None
+            image_pdf = None
+            try:
+                image_doc = fitz.open(stream=image_bytes, filetype=_pymupdf_image_type(image_name))
+                image_pdf_bytes = image_doc.convert_to_pdf()
+                image_pdf = fitz.open(stream=image_pdf_bytes, filetype="pdf")
+                target.insert_pdf(image_pdf)
+            except Exception as exc:
+                logger.info("Could not prepare embedded image for OCR: %s error=%s", image_name, exc)
+                continue
+            finally:
+                if image_pdf is not None:
+                    image_pdf.close()
+                if image_doc is not None:
+                    image_doc.close()
+
+        if target.page_count <= 0:
+            raise ConversionError("Document contains no OCR-readable images.")
+        target.save(str(output_path), garbage=4, deflate=True)
+    finally:
+        target.close()
+
+
+def _pymupdf_image_type(image_name: str) -> str:
+    suffix = Path(image_name).suffix.lower().lstrip(".")
+    return "jpeg" if suffix == "jpg" else suffix
 
 
 def _read_docx_xml_member(archive: zipfile.ZipFile, member_name: str) -> list[str]:

@@ -58,6 +58,17 @@ class ConverterTest(unittest.TestCase):
         self.assertIn("| 항목 | 값 |", result)
         self.assertIn("| SLA | 99.9% |", result)
 
+    def test_document_converter_ocr_extracts_docx_embedded_images(self):
+        converter = DocumentConverter(Settings())
+        content = _minimal_docx_bytes(images={"word/media/image1.png": b"fake-png"})
+
+        with patch("app.converter._ocr_embedded_images_with_opendataloader", return_value="이미지 안의 공지 텍스트") as ocr:
+            result = converter.convert_bytes(content, "manual.docx")
+
+        ocr.assert_called_once()
+        self.assertIn("## Embedded Image OCR", result)
+        self.assertIn("이미지 안의 공지 텍스트", result)
+
     def test_document_converter_rejects_unsupported_suffix(self):
         converter = DocumentConverter(Settings())
 
@@ -88,6 +99,30 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(command[command.index("--markdown-page-separator") + 1], "\n\n--- Page %page-number% ---\n\n")
         self.assertIn("--table-method", command)
         self.assertEqual(command[command.index("--table-method") + 1], "cluster")
+
+    def test_pdf_with_images_ocr_only_embedded_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                tmp_root=Path(tmp),
+                qpdf_repair_pdf_on_failure=False,
+                repair_pdf_on_failure=False,
+                rasterize_pdf_on_failure=False,
+            )
+            converter = PdfConverter(settings)
+
+            with (
+                patch("app.converter._convert_pdf_file", return_value="text markdown") as convert,
+                patch("app.converter._read_pdf_embedded_images", return_value=[("page-001-image-001.png", b"image")]),
+                patch("app.converter._ocr_embedded_images_with_opendataloader", return_value="이미지 OCR 텍스트") as ocr,
+            ):
+                result = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "image.pdf")
+
+        self.assertIn("text markdown", result)
+        self.assertIn("## Embedded Image OCR", result)
+        self.assertIn("이미지 OCR 텍스트", result)
+        self.assertEqual(convert.call_count, 1)
+        self.assertEqual(convert.call_args.kwargs, {})
+        ocr.assert_called_once()
 
     def test_rejects_non_pdf_bytes(self):
         converter = PdfConverter(Settings())
@@ -124,7 +159,7 @@ class ConverterTest(unittest.TestCase):
                     raise PermissionError("denied")
                 return original_mkdtemp(prefix=prefix, dir=dir)
 
-            def fake_convert(input_path, _output_dir, _settings):
+            def fake_convert(input_path, _output_dir, _settings, **_kwargs):
                 seen_input_paths.append(Path(input_path))
                 return "markdown"
 
@@ -262,7 +297,7 @@ class ConverterTest(unittest.TestCase):
                 _read_generated_markdown(output_dir)
 
 
-def _minimal_docx_bytes() -> bytes:
+def _minimal_docx_bytes(images: dict[str, bytes] | None = None) -> bytes:
     namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="{namespace}">
@@ -288,6 +323,8 @@ def _minimal_docx_bytes() -> bytes:
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("word/document.xml", document_xml)
+        for name, content in (images or {}).items():
+            archive.writestr(name, content)
     return buffer.getvalue()
 
 
