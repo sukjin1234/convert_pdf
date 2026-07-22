@@ -1,7 +1,8 @@
+import os
+import unittest
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 from unittest.mock import patch
 
 from fastapi import UploadFile
@@ -9,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.eval_logs import EvalLogStore
 from app.main import app, ChatflowDebugRequest, ConvertResponse, MarkdownIngestRequest, chatflow_debug, convert, convert_rag, rag_ingest_markdown
-from app.rag import RagStore
+from app.rag import RagStore, build_rag_artifact
 
 
 class ApiContractTest(unittest.IsolatedAsyncioTestCase):
@@ -82,6 +83,34 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.file_name, "manual.md")
         self.assertIn("SLA", response.dify_markdown)
         self.assertGreaterEqual(len(response.records), 1)
+
+    def test_rag_store_falls_back_when_configured_store_is_not_writable(self):
+        artifact = build_rag_artifact(
+            "--- Page 1 ---\n\n# Manual\n\n| Item | Value |\n| --- | --- |\n| SLA | 99.9% |",
+            "manual.md",
+            document_id="doc_store_fallback",
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            blocked_dir = Path(temp_dir) / "blocked"
+            runtime_dir = Path(temp_dir) / "runtime"
+
+            def fake_assert_writable(path: Path):
+                if path == blocked_dir:
+                    raise PermissionError("denied")
+
+            with (
+                patch.dict(os.environ, {"RAG_STORE_DIR": str(blocked_dir), "DIFY_RUNTIME_DIR": str(runtime_dir)}),
+                patch("app.rag._assert_writable_dir", side_effect=fake_assert_writable),
+            ):
+                store = RagStore()
+                store.upsert(artifact)
+
+            stored_path = runtime_dir / "rag-store" / "doc_store_fallback.json"
+            self.assertEqual(store.store_dir, runtime_dir / "rag-store")
+            self.assertTrue(stored_path.exists())
+            document_ids = {item["document_id"] for item in store.list_documents()}
+            self.assertIn("doc_store_fallback", document_ids)
 
     async def test_chatflow_debug_uses_structured_lookup_without_knowledge_retrieval(self):
         await rag_ingest_markdown(

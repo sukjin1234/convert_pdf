@@ -10,13 +10,14 @@ import signal
 import subprocess
 import tempfile
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 from xml.etree import ElementTree
 
-from .config import Settings, get_settings
+from .config import APP_RUNTIME_DIR_NAME, Settings, get_settings
 from .markdown import render_document_pages_to_markdown, render_document_to_markdown
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,17 @@ CSV_DOCUMENT_SUFFIXES = {".csv", ".tsv"}
 IMAGE_DOCUMENT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 SUPPORTED_DOCUMENT_LABEL = "PDF, TXT, Markdown, DOCX, CSV, TSV"
 WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+@dataclass(frozen=True)
+class EmbeddedImage:
+    name: str
+    content: bytes
+    width: int = 0
+    height: int = 0
+
+
+ImageInput = EmbeddedImage | tuple[str, bytes]
 
 
 @dataclass(frozen=True)
@@ -229,7 +241,7 @@ def _read_csv_document(file_bytes: bytes, *, delimiter: str) -> str:
 
 
 def _read_docx_document(file_bytes: bytes, settings: Settings, filename: str) -> str:
-    images: list[tuple[str, bytes]] = []
+    images: list[EmbeddedImage] = []
     try:
         with zipfile.ZipFile(BytesIO(file_bytes)) as archive:
             parts = _read_docx_main_parts(archive)
@@ -281,8 +293,8 @@ def _read_docx_main_parts(archive: zipfile.ZipFile) -> list[str]:
     return parts
 
 
-def _read_docx_media_images(archive: zipfile.ZipFile) -> list[tuple[str, bytes]]:
-    images: list[tuple[str, bytes]] = []
+def _read_docx_media_images(archive: zipfile.ZipFile) -> list[EmbeddedImage]:
+    images: list[EmbeddedImage] = []
     for member_name in sorted(archive.namelist()):
         suffix = Path(member_name).suffix.lower()
         if not member_name.startswith("word/media/") or suffix not in IMAGE_DOCUMENT_SUFFIXES:
@@ -292,12 +304,12 @@ def _read_docx_media_images(archive: zipfile.ZipFile) -> list[tuple[str, bytes]]
         except KeyError:
             continue
         if image_bytes:
-            images.append((member_name, image_bytes))
+            images.append(EmbeddedImage(member_name, image_bytes))
     return images
 
 
 def _ocr_embedded_images_with_opendataloader(
-    images: list[tuple[str, bytes]],
+    images: list[ImageInput],
     tmp_dir: Path,
     settings: Settings,
     *,
@@ -305,20 +317,56 @@ def _ocr_embedded_images_with_opendataloader(
 ) -> str:
     if not images:
         return ""
+    if not settings.embedded_image_ocr_enabled:
+        logger.info("Embedded image OCR is disabled. source=%s", source_name)
+        return ""
 
-    image_pdf_path = tmp_dir / "embedded-images.pdf"
-    _images_to_pdf(images, image_pdf_path)
-    try:
-        markdown = _convert_pdf_file(
-            image_pdf_path,
-            tmp_dir / "output-embedded-images-ocr",
-            settings,
-            hybrid_mode="full",
-            image_output="off",
-        )
-    except ConversionError as exc:
-        raise ConversionError(f"Embedded image OCR failed for {source_name}: {exc}") from exc
-    return _normalize_markdown(markdown)
+    ocr_images = _select_ocr_images(images, settings, source_name=source_name)
+    if not ocr_images:
+        return ""
+
+    parts: list[str] = []
+    errors: list[str] = []
+    for batch_number, batch in enumerate(_batched(ocr_images, settings.embedded_image_ocr_batch_size), start=1):
+        image_pdf_path = tmp_dir / f"embedded-images-{batch_number:03d}.pdf"
+        try:
+            _images_to_pdf(batch, image_pdf_path, settings)
+            markdown = _convert_pdf_file(
+                image_pdf_path,
+                tmp_dir / f"output-embedded-images-ocr-{batch_number:03d}",
+                settings,
+                hybrid_mode="full",
+                image_output="off",
+            )
+        except ConversionError as exc:
+            message = str(exc)
+            if _is_empty_markdown_error(message):
+                logger.info(
+                    "Embedded image OCR produced no text. source=%s batch=%s images=%s",
+                    source_name,
+                    batch_number,
+                    len(batch),
+                )
+            else:
+                errors.append(message)
+                logger.warning(
+                    "Embedded image OCR batch failed. source=%s batch=%s images=%s error=%s",
+                    source_name,
+                    batch_number,
+                    len(batch),
+                    message,
+                )
+            continue
+
+        normalized = _normalize_markdown(markdown)
+        if _has_meaningful_markdown(normalized):
+            parts.append(normalized)
+
+    if parts:
+        return _normalize_markdown("\n\n".join(parts))
+    if errors:
+        raise ConversionError(f"Embedded image OCR failed for {source_name}: " + "; ".join(errors[:3]))
+    return ""
 
 
 def _append_pdf_image_ocr(
@@ -330,7 +378,7 @@ def _append_pdf_image_ocr(
     source_name: str,
 ) -> str:
     try:
-        images = _read_pdf_embedded_images(pdf_path)
+        images = _read_pdf_embedded_images(pdf_path, settings)
     except ConversionError as exc:
         logger.warning("PDF image extraction failed for %s: %s", source_name, exc)
         return markdown
@@ -354,7 +402,10 @@ def _append_pdf_image_ocr(
     return _normalize_markdown(markdown + "\n\n## Embedded Image OCR\n\n" + image_ocr)
 
 
-def _read_pdf_embedded_images(pdf_path: Path) -> list[tuple[str, bytes]]:
+def _read_pdf_embedded_images(pdf_path: Path, settings: Settings) -> list[EmbeddedImage]:
+    if not settings.embedded_image_ocr_enabled:
+        return []
+
     try:
         fitz = _load_pymupdf()
         doc = fitz.open(str(pdf_path))
@@ -363,7 +414,7 @@ def _read_pdf_embedded_images(pdf_path: Path) -> list[tuple[str, bytes]]:
     except Exception as exc:
         raise ConversionError("Could not open PDF for image extraction.") from exc
 
-    images: list[tuple[str, bytes]] = []
+    images: list[EmbeddedImage] = []
     seen_xrefs: set[int] = set()
     try:
         for page_number, page in enumerate(doc, start=1):
@@ -382,7 +433,22 @@ def _read_pdf_embedded_images(pdf_path: Path) -> list[tuple[str, bytes]]:
                     continue
                 ext = str(extracted.get("ext") or "png").lower()
                 image_name = f"{pdf_path.stem}-page{page_number:03d}-image{image_number:03d}.{ext}"
-                images.append((image_name, image_bytes))
+                image = EmbeddedImage(
+                    image_name,
+                    image_bytes,
+                    width=int(extracted.get("width") or 0),
+                    height=int(extracted.get("height") or 0),
+                )
+                if not _is_ocr_image_candidate(image, settings):
+                    continue
+                images.append(image)
+                if len(images) >= settings.embedded_image_ocr_max_images:
+                    logger.info(
+                        "Embedded image OCR image limit reached. pdf=%s limit=%s",
+                        pdf_path,
+                        settings.embedded_image_ocr_max_images,
+                    )
+                    return images
         return images
     except Exception as exc:
         raise ConversionError("Could not inspect PDF images.") from exc
@@ -390,32 +456,93 @@ def _read_pdf_embedded_images(pdf_path: Path) -> list[tuple[str, bytes]]:
         doc.close()
 
 
-def _images_to_pdf(images: list[tuple[str, bytes]], output_path: Path) -> None:
+def _images_to_pdf(images: list[EmbeddedImage], output_path: Path, settings: Settings) -> None:
     fitz = _load_pymupdf()
     target = fitz.open()
     try:
-        for image_name, image_bytes in images:
-            image_doc = None
-            image_pdf = None
+        for image in images:
             try:
-                image_doc = fitz.open(stream=image_bytes, filetype=_pymupdf_image_type(image_name))
-                image_pdf_bytes = image_doc.convert_to_pdf()
-                image_pdf = fitz.open(stream=image_pdf_bytes, filetype="pdf")
-                target.insert_pdf(image_pdf)
+                width, height = _image_dimensions(fitz, image)
+                page_width, page_height = _fit_dimensions(width, height, settings.embedded_image_ocr_pdf_max_side)
+                page = target.new_page(width=page_width, height=page_height)
+                page.insert_image(page.rect, stream=image.content, keep_proportion=True)
             except Exception as exc:
-                logger.info("Could not prepare embedded image for OCR: %s error=%s", image_name, exc)
+                logger.info("Could not prepare embedded image for OCR: %s error=%s", image.name, exc)
                 continue
-            finally:
-                if image_pdf is not None:
-                    image_pdf.close()
-                if image_doc is not None:
-                    image_doc.close()
 
         if target.page_count <= 0:
             raise ConversionError("Document contains no OCR-readable images.")
         target.save(str(output_path), garbage=4, deflate=True)
     finally:
         target.close()
+
+
+def _select_ocr_images(images: list[ImageInput], settings: Settings, *, source_name: str) -> list[EmbeddedImage]:
+    selected: list[EmbeddedImage] = []
+    skipped: Counter[str] = Counter()
+    for index, raw_image in enumerate(images):
+        image = _coerce_embedded_image(raw_image)
+        skip_reason = _ocr_image_skip_reason(image, settings)
+        if skip_reason:
+            skipped[skip_reason] += 1
+            continue
+        selected.append(image)
+        if len(selected) >= settings.embedded_image_ocr_max_images:
+            skipped["over_limit"] += max(0, len(images) - index - 1)
+            break
+
+    if skipped:
+        logger.info("Embedded image OCR skipped images. source=%s selected=%s skipped=%s", source_name, len(selected), dict(skipped))
+    return selected
+
+
+def _coerce_embedded_image(image: ImageInput) -> EmbeddedImage:
+    if isinstance(image, EmbeddedImage):
+        return image
+    name, content = image
+    return EmbeddedImage(name, content)
+
+
+def _is_ocr_image_candidate(image: EmbeddedImage, settings: Settings) -> bool:
+    return _ocr_image_skip_reason(image, settings) is None
+
+
+def _ocr_image_skip_reason(image: EmbeddedImage, settings: Settings) -> str | None:
+    if len(image.content) > settings.embedded_image_ocr_max_image_bytes:
+        return "too_many_bytes"
+    if image.width > 0 and image.height > 0 and image.width * image.height < settings.embedded_image_ocr_min_pixels:
+        return "too_few_pixels"
+    return None
+
+
+def _batched(images: list[EmbeddedImage], batch_size: int) -> Iterable[list[EmbeddedImage]]:
+    for index in range(0, len(images), batch_size):
+        yield images[index : index + batch_size]
+
+
+def _image_dimensions(fitz, image: EmbeddedImage) -> tuple[float, float]:
+    if image.width > 0 and image.height > 0:
+        return float(image.width), float(image.height)
+
+    image_doc = fitz.open(stream=image.content, filetype=_pymupdf_image_type(image.name))
+    try:
+        if image_doc.page_count <= 0:
+            raise ConversionError("Image has no pages.")
+        rect = image_doc[0].rect
+        return float(rect.width), float(rect.height)
+    finally:
+        image_doc.close()
+
+
+def _fit_dimensions(width: float, height: float, max_side: int) -> tuple[float, float]:
+    width = max(1.0, width)
+    height = max(1.0, height)
+    scale = min(1.0, float(max_side) / max(width, height))
+    return max(1.0, width * scale), max(1.0, height * scale)
+
+
+def _is_empty_markdown_error(message: str) -> bool:
+    return "produced no Markdown" in message or "contains no OCR-readable images" in message
 
 
 def _pymupdf_image_type(image_name: str) -> str:
@@ -567,9 +694,15 @@ def _create_conversion_tmp_dir(settings: Settings) -> Path:
         system_tmp = Path(tempfile.gettempdir())
         if system_tmp != settings.tmp_root:
             candidates.append(system_tmp)
+        try:
+            user_cache = Path.home() / ".cache" / APP_RUNTIME_DIR_NAME / "opendataloader"
+            if user_cache not in candidates:
+                candidates.append(user_cache)
+        except RuntimeError:
+            pass
 
     errors = []
-    for root in candidates:
+    for root in _unique_paths(candidates):
         try:
             root.mkdir(parents=True, exist_ok=True)
             return Path(tempfile.mkdtemp(prefix="convert-", dir=root))
@@ -582,6 +715,18 @@ def _create_conversion_tmp_dir(settings: Settings) -> Path:
         "Set ODL_TMP_ROOT to a directory writable by the FastAPI process. "
         + "; ".join(errors)
     )
+
+
+def _unique_paths(paths: Iterable[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
 
 
 def _convert_pdf_file(
@@ -716,12 +861,15 @@ def build_opendataloader_native_command(input_path: Path, output_dir: Path, sett
 
 
 def _run_command(command: Sequence[str], timeout_seconds: int) -> None:
+    env = os.environ.copy()
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     kwargs = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
         "encoding": "utf-8",
         "errors": "replace",
+        "env": env,
     }
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -738,8 +886,30 @@ def _run_command(command: Sequence[str], timeout_seconds: int) -> None:
         raise ConversionError("PDF conversion timed out.") from exc
 
     if process.returncode != 0:
-        logger.warning("OpenDataLoader failed. stdout=%s stderr=%s", stdout[-2000:], stderr[-2000:])
-        raise ConversionError("OpenDataLoader conversion failed.")
+        detail = _summarize_command_failure(stdout, stderr)
+        logger.warning("OpenDataLoader failed. detail=%s stdout=%s stderr=%s", detail, stdout[-2000:], stderr[-2000:])
+        raise ConversionError(f"OpenDataLoader conversion failed: {detail}" if detail else "OpenDataLoader conversion failed.")
+
+
+def _summarize_command_failure(stdout: str, stderr: str) -> str:
+    output = f"{stdout}\n{stderr}"
+    lowered = output.lower()
+    if "cuda out of memory" in lowered:
+        return "GPU memory exhausted during OCR."
+    if "nccl error" in lowered:
+        return "GPU NCCL/DataParallel error during OCR."
+    if "permission denied" in lowered:
+        return "permission denied while reading or writing conversion files."
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return truncate_for_error(lines[-1], 300)
+
+
+def truncate_for_error(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
 
 
 def _kill_process_tree(pid: int) -> None:

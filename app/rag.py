@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -10,6 +11,11 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from .config import APP_RUNTIME_DIR_NAME
+
+
+logger = logging.getLogger(__name__)
 
 
 PAGE_RE = re.compile(r"(?m)^\s*---\s*Page\s+(\d+)\s*---\s*$")
@@ -695,8 +701,11 @@ class RagArtifact:
 
 class RagStore:
     def __init__(self, store_dir: Path | None = None):
-        root = store_dir or Path(os.getenv("RAG_STORE_DIR", str(Path(tempfile.gettempdir()) / "dify-rag-store")))
-        self.store_dir = root
+        self._store_dir_candidates = _rag_store_dir_candidates(store_dir)
+        self.store_dir = self._store_dir_candidates[0]
+        self._writable_store_dir: Path | None = None
+        self._failed_store_dirs: set[str] = set()
+        self._persistence_warning_logged = False
         self._documents: dict[str, RagArtifact] = {}
         self._loaded = False
         self._lock = threading.Lock()
@@ -705,9 +714,24 @@ class RagStore:
         with self._lock:
             self._ensure_loaded_locked()
             self._documents[artifact.document_id] = artifact
-            self.store_dir.mkdir(parents=True, exist_ok=True)
-            path = self.store_dir / f"{_safe_id(artifact.document_id)}.json"
-            path.write_text(json.dumps(artifact.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            payload = json.dumps(artifact.to_dict(), ensure_ascii=False, indent=2)
+            last_error = ""
+            for _ in range(len(self._store_dir_candidates)):
+                store_dir = self._resolve_writable_store_dir_locked()
+                if store_dir is None:
+                    break
+
+                path = store_dir / f"{_safe_id(artifact.document_id)}.json"
+                try:
+                    path.write_text(payload, encoding="utf-8")
+                    return
+                except OSError as exc:
+                    last_error = f"path={path} error={exc}"
+                    self._failed_store_dirs.add(str(store_dir))
+                    self._writable_store_dir = None
+
+            detail = last_error or "No writable RAG store directory is available."
+            self._warn_persistence_disabled(f"RAG artifact is kept in memory because store write failed. {detail}")
 
     def list_documents(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -745,16 +769,87 @@ class RagStore:
         if self._loaded:
             return
         self._loaded = True
-        if not self.store_dir.exists():
-            return
-        for path in sorted(self.store_dir.glob("*.json")):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                artifact = RagArtifact.from_dict(payload)
-            except Exception:
+        for root in self._store_dir_candidates:
+            if not root.exists():
                 continue
-            if artifact.document_id:
-                self._documents[artifact.document_id] = artifact
+            try:
+                paths = sorted(root.glob("*.json"))
+            except OSError as exc:
+                logger.warning("Could not read RAG store directory. root=%s error=%s", root, exc)
+                continue
+            for path in paths:
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    artifact = RagArtifact.from_dict(payload)
+                except Exception:
+                    continue
+                if artifact.document_id:
+                    self._documents[artifact.document_id] = artifact
+
+    def _resolve_writable_store_dir_locked(self) -> Path | None:
+        if self._writable_store_dir is not None:
+            return self._writable_store_dir
+
+        for root in self._store_dir_candidates:
+            if str(root) in self._failed_store_dirs:
+                continue
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                _assert_writable_dir(root)
+            except OSError as exc:
+                logger.warning("RAG store directory is not writable. root=%s error=%s", root, exc)
+                self._failed_store_dirs.add(str(root))
+                continue
+            self.store_dir = root
+            self._writable_store_dir = root
+            return root
+
+        self._warn_persistence_disabled("No writable RAG store directory is available; artifacts are kept in memory only.")
+        return None
+
+    def _warn_persistence_disabled(self, message: str) -> None:
+        if self._persistence_warning_logged:
+            return
+        self._persistence_warning_logged = True
+        logger.warning(message)
+
+
+def _rag_store_dir_candidates(store_dir: Path | None = None) -> list[Path]:
+    if store_dir is not None:
+        return [store_dir]
+
+    candidates: list[Path] = []
+    explicit = os.getenv("RAG_STORE_DIR")
+    if explicit and explicit.strip():
+        candidates.append(Path(explicit))
+
+    runtime_root = Path(os.getenv("DIFY_RUNTIME_DIR", str(Path.cwd() / ".runtime")))
+    candidates.append(runtime_root / "rag-store")
+
+    try:
+        candidates.append(Path.home() / ".cache" / APP_RUNTIME_DIR_NAME / "rag-store")
+    except RuntimeError:
+        pass
+
+    candidates.append(Path(tempfile.gettempdir()) / "dify-rag-store")
+    return _unique_paths(candidates)
+
+
+def _assert_writable_dir(path: Path) -> None:
+    with tempfile.NamedTemporaryFile("w", dir=path, prefix=".write-test-", encoding="utf-8", delete=True) as probe:
+        probe.write("")
+
+
+def _unique_paths(paths: Iterable[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
 
 
 STORE = RagStore()

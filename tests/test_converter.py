@@ -9,7 +9,9 @@ from app.config import Settings
 from app.converter import (
     ConversionError,
     DocumentConverter,
+    EmbeddedImage,
     PdfConverter,
+    _ocr_embedded_images_with_opendataloader,
     _read_generated_markdown,
     _read_rendered_markdown,
     build_opendataloader_native_command,
@@ -123,6 +125,55 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(convert.call_count, 1)
         self.assertEqual(convert.call_args.kwargs, {})
         ocr.assert_called_once()
+
+    def test_embedded_image_ocr_filters_and_batches_images(self):
+        settings = Settings(
+            embedded_image_ocr_max_images=3,
+            embedded_image_ocr_batch_size=2,
+            embedded_image_ocr_min_pixels=100,
+            embedded_image_ocr_max_image_bytes=4,
+        )
+        images = [
+            EmbeddedImage("too-small.png", b"ok", width=5, height=5),
+            EmbeddedImage("page-1.png", b"ok", width=50, height=50),
+            EmbeddedImage("too-large.png", b"12345", width=50, height=50),
+            EmbeddedImage("page-2.png", b"ok", width=50, height=50),
+            EmbeddedImage("page-3.png", b"ok", width=50, height=50),
+            EmbeddedImage("over-limit.png", b"ok", width=50, height=50),
+        ]
+        batches: list[list[str]] = []
+
+        def fake_images_to_pdf(batch, output_path, _settings):
+            batches.append([image.name for image in batch])
+            output_path.write_bytes(b"%PDF-1.4\n%%EOF")
+
+        def fake_convert(input_path, _output_dir, _settings, **kwargs):
+            self.assertEqual(kwargs, {"hybrid_mode": "full", "image_output": "off"})
+            return f"text from {Path(input_path).stem}"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("app.converter._images_to_pdf", side_effect=fake_images_to_pdf),
+                patch("app.converter._convert_pdf_file", side_effect=fake_convert),
+            ):
+                result = _ocr_embedded_images_with_opendataloader(images, Path(tmp), settings, source_name="images.pdf")
+
+        self.assertEqual(batches, [["page-1.png", "page-2.png"], ["page-3.png"]])
+        self.assertIn("text from embedded-images-001", result)
+        self.assertIn("text from embedded-images-002", result)
+
+    def test_embedded_image_ocr_treats_no_markdown_as_no_text(self):
+        settings = Settings()
+        images = [EmbeddedImage("blank.png", b"ok", width=200, height=200)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("app.converter._images_to_pdf"),
+                patch("app.converter._convert_pdf_file", side_effect=ConversionError("OpenDataLoader produced no Markdown.")),
+            ):
+                result = _ocr_embedded_images_with_opendataloader(images, Path(tmp), settings, source_name="blank.pdf")
+
+        self.assertEqual(result, "")
 
     def test_rejects_non_pdf_bytes(self):
         converter = PdfConverter(Settings())
