@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from .config import Settings, get_settings
@@ -430,13 +430,26 @@ async def answer_verify(request: VerifyRequest) -> VerifyResponse:
 
 
 @app.post("/chatflow/merge-evidence", response_model=MergeEvidenceResponse)
-async def chatflow_merge_evidence(request: MergeEvidenceRequest) -> MergeEvidenceResponse:
+async def chatflow_merge_evidence(request_body: Any = Body(None)) -> MergeEvidenceResponse:
+    request = normalize_merge_evidence_request(request_body)
     knowledge_source = request.knowledge_result
     if knowledge_source is None:
         knowledge_source = request.knowledge_context
     if knowledge_source is None:
         knowledge_source = request.knowledge_body
     return MergeEvidenceResponse(**merge_evidence_context(request.lookup_body, knowledge_source))
+
+
+def normalize_merge_evidence_request(request_body: Any) -> MergeEvidenceRequest:
+    if isinstance(request_body, list):
+        request_body = request_body[0] if request_body else {}
+    if isinstance(request_body, MergeEvidenceRequest):
+        return request_body
+    if not isinstance(request_body, dict):
+        request_body = {}
+    if hasattr(MergeEvidenceRequest, "model_validate"):
+        return MergeEvidenceRequest.model_validate(request_body)
+    return MergeEvidenceRequest.parse_obj(request_body)
 
 
 @app.post("/chatflow/debug", response_model=ChatflowDebugResponse)

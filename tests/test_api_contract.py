@@ -240,6 +240,29 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[knowledge 1] source=admission.md page=4 score=0.91", body["knowledge_context"])
         self.assertIn("- 컴퓨터정보공학과", body["answer_contract_text"])
 
+    def test_chatflow_merge_evidence_endpoint_accepts_single_item_array_body(self):
+        client = TestClient(app)
+        payload = [
+            {
+                "lookup_body": {
+                    "query": "기숙사 비용과 신청기간 알려줘",
+                    "query_type": "date_lookup",
+                    "direct_answer": "",
+                    "answer_items": [],
+                    "context": "",
+                    "diagnostics": {"answerability": {"answerable": False}},
+                },
+                "knowledge_result": [],
+            }
+        ]
+
+        response = client.post("/chatflow/merge-evidence", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["structured_context"], "")
+        self.assertEqual(body["knowledge_context"], "")
+
     def test_eval_log_api_writes_jsonl_and_detail_file(self):
         with TemporaryDirectory() as temp_dir:
             store = EvalLogStore(Path(temp_dir))

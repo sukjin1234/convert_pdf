@@ -90,6 +90,109 @@ class RagPipelineTest(unittest.TestCase):
         self.assertFalse(rejected["valid"])
         self.assertTrue(any(issue["type"] == "unsupported_number" for issue in rejected["issues"]))
 
+    def test_scalar_lookup_prefers_requested_numeric_field_over_subject_field(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 26 ---
+
+# 정원내 전형 모집인원
+
+| 계열 | 모집단위 | 학제 | 정원내 모집정원 | 수시1차 일반고 |
+| --- | --- | --- | --- | --- |
+| 공학 | 컴퓨터정보공학과 | 3 | 93 | 55 |
+| 공학 | 기계공학과 | 2 | 119 | 70 |
+""",
+            "admission.pdf",
+            document_id="doc_capacity_exact",
+        )
+
+        question = "컴퓨터정보공학과 정원내 모집정원은 몇 명이야?"
+        plan = plan_query(question)
+        result = lookup_matches(
+            query=question,
+            records=artifact.records,
+            chunks=artifact.chunks,
+            entities=plan["entities"],
+            query_type=plan["query_type"],
+            limit=8,
+        )
+
+        self.assertEqual(plan["query_type"], "number_lookup")
+        self.assertIn("정원내 모집정원: 93", result["direct_answer"])
+        self.assertNotIn("기계공학과", result["direct_answer"])
+        self.assertEqual(result["answer_items"][0]["field"], "정원내 모집정원")
+
+    def test_money_lookup_returns_all_money_fields_for_subject_row(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 37 ---
+
+# 등록금
+
+| 계열(학과)구분 | 1학기(신입학) | 2학기 |
+| --- | --- | --- |
+| 전 학과 | 3,768,000원 | 3,500,000원 |
+""",
+            "admission.pdf",
+            document_id="doc_tuition",
+        )
+
+        question = "전 학과 등록금은 얼마야?"
+        result = lookup_matches(query=question, records=artifact.records, chunks=artifact.chunks, limit=8)
+
+        self.assertIn("1학기(신입학): 3,768,000원", result["direct_answer"])
+        self.assertIn("2학기: 3,500,000원", result["direct_answer"])
+        self.assertEqual(result["answer_contract"]["required_value_count"], 2)
+
+    def test_date_lookup_uses_requested_schedule_column(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 30 ---
+
+# 전형일정
+
+| 구분 | 원서접수 | 면접 | 합격자 발표 |
+| --- | --- | --- | --- |
+| 수시1차 | 2025. 9. 8.(월) ~ 9. 30.(화) 21:00까지 | 2025. 10. 18.(토) | 2025. 11. 7.(금) |
+| 수시2차 | 2025. 11. 7.(금) ~ 11. 21.(금) 21:00까지 | 2025. 11. 29.(토) | 2025. 12. 12.(금) |
+""",
+            "admission.pdf",
+            document_id="doc_susi_period",
+        )
+
+        question = "수시1차 원서접수 기간 알려줘"
+        result = lookup_matches(query=question, records=artifact.records, chunks=artifact.chunks, limit=8)
+
+        self.assertIn("원서접수: 2025. 9. 8.(월) ~ 9. 30.(화) 21:00까지", result["direct_answer"])
+        self.assertNotIn("2025. 10. 18.", result["direct_answer"])
+        self.assertNotIn("수시2차", result["direct_answer"])
+
+    def test_lookup_rejects_evidence_missing_required_query_entity(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 36 ---
+
+# 원서접수 비용
+
+| 구분 | 전형료 | 면접고사료 | 계 |
+| --- | --- | --- | --- |
+| 비면접학과 | 30,000원 | - | 30,000원 |
+| 면접학과 | 30,000원 | 20,000원 | 50,000원 |
+
+- 원서접수 마감 이후 입학원서 취소 및 변경은 불가하며, 전형료는 반환하지 않음
+""",
+            "admission.pdf",
+            document_id="doc_dorm_absent",
+        )
+
+        question = "기숙사 비용과 신청기간 알려줘"
+        result = lookup_matches(query=question, records=artifact.records, chunks=artifact.chunks, limit=8)
+
+        self.assertEqual(result["matches"], [])
+        self.assertEqual(result["direct_answer"], "")
+        self.assertFalse(result["diagnostics"]["answerability"]["answerable"])
+        self.assertIn("기숙사", result["diagnostics"]["answerability"]["missing_required_terms"])
+
     def test_generic_technical_query_is_not_admission_only(self):
         question = "Kafka Consumer Lag 모니터링 기준과 장애 대응 절차 알려줘"
 

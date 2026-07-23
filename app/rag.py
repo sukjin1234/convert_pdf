@@ -71,11 +71,13 @@ TABLE_RECORD_TYPES = {
 
 VALUE_FIELD_RE = re.compile(
     r"값|수량|개수|건수|횟수|인원|정원|모집인원|한도|제한|임계값|기준값|금액|비용|가격|예산|매출|원가|단가|"
-    r"점수|등급|비율|율|퍼센트|기간|날짜|일자|시간|기한|마감|상태|버전|코드|식별자|연락처|이메일|전화|"
+    r"등록금|수업료|전형료|면접고사료|고사료|장학금액|장학금총액|"
+    r"점수|등급|비율|율|퍼센트|기간|날짜|일자|시간|기한|마감|원서접수|접수기간|상태|버전|코드|식별자|연락처|이메일|전화|"
     r"value|count|quantity|capacity|limit|threshold|amount|cost|price|budget|revenue|score|grade|rate|ratio|"
     r"percent|date|time|deadline|duration|status|version|code|id|identifier|email|phone|contact",
     re.IGNORECASE,
 )
+MONEY_VALUE_RE = re.compile(r"[$₩€]|(?:\d[\d,.\s]*(?:원|만원|억원|달러|usd|krw))", re.IGNORECASE)
 
 IDENTIFIER_RE = re.compile(
     r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]{1,}(?:[_-][A-Z0-9]+)+(?![A-Za-z0-9_])"
@@ -137,6 +139,15 @@ GENERIC_LIST_TERMS = {
     "category",
     "available",
     "supported",
+    "몇",
+    "몇명",
+    "명이야",
+    "얼마",
+    "얼마야",
+    "무엇인가",
+    "무엇인지",
+    "있어",
+    "있나요",
 }
 MARKER_METADATA_FIELDS = {"표시", "표시 의미", "표시 대상 필드"}
 FIELD_ALIAS_GROUPS = [
@@ -147,8 +158,32 @@ FIELD_ALIAS_GROUPS = [
     {"전화", "전화번호", "연락처", "문의", "phone", "tel", "contact"},
     {"자격", "조건", "요건", "대상", "필수", "eligibility", "requirement", "condition"},
     {"절차", "방법", "순서", "단계", "처리", "procedure", "process", "step"},
-    {"일정", "기간", "날짜", "일자", "일시", "마감", "기한", "schedule", "date", "period", "deadline", "time"},
-    {"값", "숫자", "수량", "인원", "정원", "한도", "점수", "금액", "value", "amount", "count", "quantity", "limit", "score"},
+    {"일정", "기간", "날짜", "일자", "일시", "마감", "기한", "원서접수", "접수기간", "schedule", "date", "period", "deadline", "time"},
+    {
+        "값",
+        "숫자",
+        "수량",
+        "인원",
+        "정원",
+        "모집정원",
+        "한도",
+        "점수",
+        "금액",
+        "비용",
+        "등록금",
+        "수업료",
+        "전형료",
+        "면접고사료",
+        "장학금",
+        "장학금액",
+        "장학금총액",
+        "value",
+        "amount",
+        "count",
+        "quantity",
+        "limit",
+        "score",
+    },
     {"내용", "설명", "정책", "규정", "비고", "content", "detail", "description", "policy", "note"},
 ]
 
@@ -179,6 +214,9 @@ ATTRIBUTE_CONCEPT_TERMS = {
         "전형료",
         "등록금",
         "수업료",
+        "장학금",
+        "장학금액",
+        "장학금총액",
         "price",
         "cost",
         "fee",
@@ -198,6 +236,9 @@ ATTRIBUTE_CONCEPT_TERMS = {
         "마감",
         "기한",
         "접수",
+        "원서접수",
+        "접수기간",
+        "신청기간",
         "등록",
         "발표",
         "예약",
@@ -232,7 +273,17 @@ STOPWORDS = {
     "관련",
     "알려줘",
     "무엇",
+    "무엇인가",
+    "무엇인지",
     "어떻게",
+    "어떤",
+    "얼마",
+    "얼마야",
+    "몇",
+    "몇명",
+    "명이야",
+    "있어",
+    "있나요",
     "please",
     "with",
     "from",
@@ -2662,9 +2713,11 @@ def top_structured_group(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def meaningful_answer_terms(terms: list[str]) -> list[str]:
     result = []
     for term in unique_keep_order(terms):
-        cleaned = clean_cell(term)
+        cleaned = strip_query_particle(clean_cell(term))
         norm = normalize_for_match(cleaned)
         if len(norm) < 2:
+            continue
+        if norm in {normalize_for_match(item) for item in STOPWORDS}:
             continue
         if norm in {normalize_for_match(item) for item in GENERIC_LIST_TERMS}:
             continue
@@ -2993,10 +3046,14 @@ def build_field_value_answer(
     query_terms: list[str],
     matches: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    target_key = choose_target_field_key(query, query_terms, matches)
-    if not target_key:
-        target_key = choose_value_field_from_query(query, query_type, matches)
-    if not target_key:
+    scalar_target_keys = choose_scalar_value_field_keys(query, query_type, matches)
+    target_keys = scalar_target_keys[:]
+    if not target_keys:
+        target_key = choose_target_field_key(query, query_terms, matches)
+        if not target_key:
+            target_key = choose_value_field_from_query(query, query_type, matches)
+        target_keys = [target_key] if target_key else []
+    if not target_keys:
         return {
             "direct_answer": "",
             "answer_items": [],
@@ -3005,14 +3062,16 @@ def build_field_value_answer(
             "mode": "",
         }
 
+    target_key_set = set(target_keys)
     constraints = extract_scalar_constraints(query, query_type)
     row_filter_terms = [
         term
         for term in query_terms
-        if not term_matches_key(term, target_key) and not any(term_in_text(term, value) for value in constraints)
+        if not any(term_matches_key(term, target_key) for target_key in target_keys)
+        and not any(term_in_text(term, value) for value in constraints)
     ]
-    row_filter_terms = terms_that_match_any_row_value(row_filter_terms, matches, exclude_keys={target_key})
-    filtered_matches = filter_matches_by_row_terms(matches, row_filter_terms, exclude_keys={target_key})
+    row_filter_terms = terms_that_match_any_row_value(row_filter_terms, matches, exclude_keys=target_key_set)
+    filtered_matches = filter_matches_by_row_terms(matches, row_filter_terms, exclude_keys=target_key_set)
     if not filtered_matches and constraints:
         filtered_matches = [
             match
@@ -3026,25 +3085,34 @@ def build_field_value_answer(
     answer_items = []
     for match in sorted(filtered_matches, key=match_document_order_key):
         fields = match.get("fields") or {}
-        value = clean_cell(fields.get(target_key, ""))
-        if not value:
-            continue
-        subject_key = choose_subject_answer_field(fields, query_terms, exclude_keys={target_key})
+        subject_key = choose_subject_answer_field(fields, query_terms, exclude_keys=target_key_set)
         subject_value = clean_cell(fields.get(subject_key, ""))
-        display_value = f"{subject_value}: {value}" if subject_value and len(filtered_matches) > 1 else value
-        if normalize_for_match(display_value) in {normalize_for_match(item) for item in values}:
-            continue
-        values.append(display_value)
-        answer_items.append(
-            {
-                "value": display_value,
-                "field": target_key,
-                "record_id": match.get("record_id", ""),
-                "page": match.get("page"),
-                "section_path": match.get("section_path", ""),
-                "fields": fields,
-            }
-        )
+        for target_key in target_keys:
+            value = clean_cell(fields.get(target_key, ""))
+            if not value:
+                continue
+            if scalar_target_keys and not value_matches_scalar_query(value, query_type, detect_attribute_concepts(query)):
+                continue
+            display_value = format_field_value_display(
+                subject_value=subject_value,
+                field_name=target_key,
+                value=value,
+                include_subject=bool(subject_value and len(filtered_matches) > 1),
+                include_field_name=len(target_keys) > 1,
+            )
+            if normalize_for_match(display_value) in {normalize_for_match(item) for item in values}:
+                continue
+            values.append(display_value)
+            answer_items.append(
+                {
+                    "value": display_value,
+                    "field": target_key,
+                    "record_id": match.get("record_id", ""),
+                    "page": match.get("page"),
+                    "section_path": match.get("section_path", ""),
+                    "fields": fields,
+                }
+            )
 
     if not values:
         return {
@@ -3055,13 +3123,117 @@ def build_field_value_answer(
             "mode": "",
         }
 
+    answer_field = target_keys[0] if len(target_keys) == 1 else multi_value_answer_field(query, query_type)
     return {
-        "direct_answer": format_direct_answer_text(target_key, values),
+        "direct_answer": format_direct_answer_text(answer_field, values),
         "answer_items": answer_items,
-        "answer_field": target_key,
+        "answer_field": answer_field,
         "filter_terms": row_filter_terms,
         "mode": "field_value",
     }
+
+
+def choose_scalar_value_field_keys(query: str, query_type: str, matches: list[dict[str, Any]]) -> list[str]:
+    if query_type not in {"number_lookup", "date_lookup"}:
+        return []
+
+    query_terms = meaningful_answer_terms(extract_keywords(query, limit=16))
+    query_attrs = detect_attribute_concepts(query)
+    scores: Counter[str] = Counter()
+    explicit_hits: Counter[str] = Counter()
+    key_by_norm: dict[str, str] = {}
+    key_order: list[str] = []
+    first_row_scalar_keys: list[str] = []
+
+    for match in matches:
+        row_scalar_keys: list[str] = []
+        for key, value in (match.get("fields") or {}).items():
+            key = clean_cell(key)
+            if not key or key in MARKER_METADATA_FIELDS:
+                continue
+            value = clean_cell(value)
+            if not value or not value_matches_scalar_query(value, query_type, query_attrs):
+                continue
+
+            key_norm = normalize_for_match(key)
+            if not key_norm:
+                continue
+            if key_norm not in key_by_norm:
+                key_by_norm[key_norm] = key
+                key_order.append(key_norm)
+            row_scalar_keys.append(key_norm)
+
+            score = 3.0
+            if VALUE_FIELD_RE.search(key):
+                score += 3.0
+            if query_type == "number_lookup" and "price" in query_attrs and MONEY_VALUE_RE.search(value):
+                score += 4.0
+            if query_type == "date_lookup" and "schedule" in query_attrs:
+                score += 3.0
+            for term in query_terms:
+                if term_matches_key(term, key):
+                    score += 8.0
+                    explicit_hits[key_norm] += 1
+            scores[key_norm] += score
+
+        if row_scalar_keys and not first_row_scalar_keys:
+            first_row_scalar_keys = unique_keep_order(key_by_norm[key_norm] for key_norm in row_scalar_keys)
+
+    if not scores:
+        return []
+
+    if explicit_hits:
+        best_score = max(scores[key_norm] for key_norm in explicit_hits)
+        return [
+            key_by_norm[key_norm]
+            for key_norm in key_order
+            if explicit_hits[key_norm] and scores[key_norm] >= best_score - 1.0
+        ]
+
+    if query_type == "number_lookup" and "price" in query_attrs and first_row_scalar_keys:
+        return first_row_scalar_keys[:8]
+
+    best_key_norm, best_score = scores.most_common(1)[0]
+    return [key_by_norm[best_key_norm]] if best_score >= 3.0 else []
+
+
+def value_matches_scalar_query(value: str, query_type: str, query_attrs: set[str]) -> bool:
+    text = clean_cell(value)
+    if query_type == "number_lookup":
+        if "price" in query_attrs:
+            return bool(MONEY_VALUE_RE.search(text))
+        return bool(NUMBER_RE.search(text))
+    if query_type == "date_lookup":
+        return bool(DATE_RE.search(text))
+    return False
+
+
+def format_field_value_display(
+    *,
+    subject_value: str,
+    field_name: str,
+    value: str,
+    include_subject: bool,
+    include_field_name: bool,
+) -> str:
+    parts = []
+    if include_subject:
+        parts.append(subject_value)
+    if include_field_name:
+        parts.append(field_name)
+    parts.append(value)
+    return ": ".join(clean_cell(part) for part in parts if clean_cell(part))
+
+
+def multi_value_answer_field(query: str, query_type: str) -> str:
+    query_attrs = detect_attribute_concepts(query)
+    if "price" in query_attrs:
+        return "금액"
+    if query_type == "date_lookup" or "schedule" in query_attrs:
+        return "기간"
+    if "capacity" in query_attrs:
+        return "값"
+    return "값"
 
 
 def extract_scalar_constraints(query: str, query_type: str) -> list[str]:
@@ -3354,6 +3526,7 @@ def assess_answerability(
     query_attributes = detect_attribute_concepts(" ".join([query, *entities]))
     evidence_attributes = detect_attribute_concepts(evidence_text)
     missing_strict_attributes = sorted((query_attributes & STRICT_ATTRIBUTE_CONCEPTS) - evidence_attributes)
+    missing_required_terms = missing_required_query_terms(query, entities, evidence_text)
     average_coverage = sum(float(match.get("coverage") or 0) for match in matches) / len(matches)
     top_score = max(float(match.get("score") or 0) for match in matches)
 
@@ -3378,6 +3551,20 @@ def assess_answerability(
             "missing_strict_concepts": missing_strict_concepts,
             "missing_strict_attributes": missing_strict_attributes,
             "reason": "query asks for a specific attribute that is absent from evidence",
+        }
+
+    if missing_required_terms and query_type in STRUCTURED_LOOKUP_TYPES:
+        return {
+            "answerable": False,
+            "confidence": 0.25,
+            "query_concepts": sorted(query_concepts),
+            "evidence_concepts": sorted(evidence_concepts),
+            "query_attributes": sorted(query_attributes),
+            "evidence_attributes": sorted(evidence_attributes),
+            "missing_strict_concepts": missing_strict_concepts,
+            "missing_strict_attributes": missing_strict_attributes,
+            "missing_required_terms": missing_required_terms,
+            "reason": "evidence is missing a required query entity",
         }
 
     weak_signal = average_coverage < 0.12 and top_score < 6.0 and query_type in STRUCTURED_LOOKUP_TYPES
@@ -3430,6 +3617,75 @@ def detect_attribute_concepts(text: str) -> set[str]:
     if DATE_RE.search(text or ""):
         concepts.add("schedule")
     return concepts
+
+
+def missing_required_query_terms(query: str, entities: list[str], evidence_text: str) -> list[str]:
+    evidence_norm = normalize_for_match(evidence_text)
+    if not evidence_norm:
+        return []
+    missing = []
+    for term in salient_query_terms_for_answerability(query, entities):
+        if not term_in_text(term, evidence_text):
+            missing.append(term)
+    return missing[:5]
+
+
+def salient_query_terms_for_answerability(query: str, entities: list[str]) -> list[str]:
+    raw_terms = [*entities, *extract_keywords(query, limit=12)]
+    terms = []
+    for raw_term in raw_terms:
+        term = strip_query_particle(clean_cell(raw_term))
+        norm = normalize_for_match(term)
+        compact = norm.replace(" ", "")
+        if len(compact) < 2:
+            continue
+        if norm in {normalize_for_match(item) for item in STOPWORDS}:
+            continue
+        if norm in {normalize_for_match(item) for item in GENERIC_LIST_TERMS}:
+            continue
+        if is_attribute_only_query_term(term):
+            continue
+        if looks_like_numeric_or_date(term):
+            continue
+        if is_generic_topic_term(term):
+            continue
+        if is_named_query_entity(term) or is_identifier_query_term(term) or re.search(r"\d", term):
+            terms.append(term)
+    return unique_keep_order(terms)[:6]
+
+
+def is_named_query_entity(term: str) -> bool:
+    return bool(
+        re.search(
+            r"(학과|학부|전공|대학|캠퍼스|기관|부서|센터|팀|기숙사|교통부|교육부|기업부|광역시|관리|진흥원|API|DB|Plan|Feature)$",
+            term,
+            re.IGNORECASE,
+        )
+    )
+
+
+def is_identifier_query_term(term: str) -> bool:
+    return bool(re.search(r"[A-Z][A-Z0-9_/-]{2,}", term))
+
+
+def is_attribute_only_query_term(term: str) -> bool:
+    if is_named_query_entity(term):
+        return False
+    return bool(detect_attribute_concepts(term))
+
+
+def is_generic_topic_term(term: str) -> bool:
+    norm = normalize_for_match(term)
+    return norm in {
+        "사업",
+        "내용",
+        "항목",
+        "정보",
+        "질문",
+        "답변",
+        "총",
+        "전체",
+    }
 
 
 def score_record(record: StructuredRecord, terms: list[str], query_type: str) -> float:
@@ -3984,7 +4240,7 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
     if query_type == "number_lookup" and not answer_numbers:
         issues.append({"type": "missing_number", "message": "The question asks for a numeric answer, but the answer has no number."})
     for number in answer_numbers:
-        if number not in evidence_numbers:
+        if not number_value_supported(number, evidence_numbers):
             issues.append(
                 {
                     "type": "unsupported_number",
@@ -4243,6 +4499,30 @@ def extract_number_values(text: str) -> list[str]:
     return unique_keep_order(values)
 
 
+def number_value_supported(number: str, evidence_numbers: list[str]) -> bool:
+    if number in evidence_numbers:
+        return True
+    canonical = canonical_number_value(number)
+    return bool(canonical and any(canonical_number_value(item) == canonical for item in evidence_numbers))
+
+
+def canonical_number_value(value: str) -> str:
+    raw = clean_cell(value).replace(",", "")
+    if not raw:
+        return ""
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", raw):
+        sign = ""
+        if raw[0] in "+-":
+            sign, raw = raw[0], raw[1:]
+        if "." in raw:
+            integer, fraction = raw.split(".", 1)
+            integer = integer.lstrip("0") or "0"
+            fraction = fraction.rstrip("0")
+            return f"{sign}{integer}.{fraction}" if fraction else f"{sign}{integer}"
+        return sign + (raw.lstrip("0") or "0")
+    return normalize_for_match(raw)
+
+
 def extract_date_values(text: str) -> list[str]:
     return unique_keep_order(
         normalized
@@ -4320,7 +4600,7 @@ def extract_keywords(text: str, limit: int = 20) -> list[str]:
 
     suffix_pattern = re.compile(
         r"[가-힣A-Za-z0-9._/-]{2,50}(?:"
-        r"학과|학부|전공|대학|계열|기관|부서|센터|팀|조직|회사|고객|사용자|"
+        r"학과|학부|전공|대학|캠퍼스|계열|기관|부서|센터|팀|조직|회사|고객|사용자|"
         r"제품|상품|서비스|시스템|플랫폼|애플리케이션|앱|모듈|컴포넌트|엔드포인트|"
         r"모델|데이터베이스|DB|API|테이블|컬럼|필드|스키마|인덱스|큐|토픽|"
         r"워크플로우|파이프라인|프로세스|잡|배치|정책|규정|계약|조항|약관|"
