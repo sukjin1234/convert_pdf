@@ -252,6 +252,12 @@ STOPWORDS = {
     "where",
     "why",
     "how",
+    "structured_record",
+    "record_type",
+    "source_file",
+    "source_page",
+    "source_section",
+    "answer_hint",
 }
 
 IMPORTANT_TERMS = [
@@ -878,6 +884,7 @@ def build_rag_artifact(
 ) -> RagArtifact:
     normalized = normalize_markdown(markdown)
     normalized = normalize_compact_visual_pair_sections(normalized)
+    normalized = remove_non_retrieval_noise_lines(normalized)
     doc_id = document_id or make_document_id(file_name, normalized)
     safe_file_name = file_name or "document.pdf"
     document_marker_legends = extract_unambiguous_marker_legends(normalized.split("\n"))
@@ -888,6 +895,8 @@ def build_rag_artifact(
     section_blocks = list(iter_section_blocks(normalized))
     chunk_index = 0
     for block in section_blocks:
+        block["section_path"] = clean_section_path(block["section_path"])
+        block["title"] = clean_cell(block["title"])
         expanded_text, block_records = expand_tables_to_records(
             block["text"],
             document_id=doc_id,
@@ -985,6 +994,7 @@ def build_metadata_header(
     keywords: list[str],
     record_types: list[str],
 ) -> str:
+    section_path = clean_section_path(section_path)
     page_value = str(page_start) if page_start == page_end else f"{page_start}-{page_end}"
     return "\n".join(
         [
@@ -1004,6 +1014,29 @@ def normalize_markdown(value: str) -> str:
     lines = [line.rstrip() for line in value.split("\n")]
     value = "\n".join(lines)
     return re.sub(r"\n{3,}", "\n\n", value).strip()
+
+
+def remove_non_retrieval_noise_lines(markdown: str) -> str:
+    lines = []
+    for line in (markdown or "").split("\n"):
+        if is_non_retrieval_note_line(line):
+            continue
+        lines.append(line)
+    return normalize_markdown("\n".join(lines))
+
+
+def is_non_retrieval_note_line(line: str) -> bool:
+    text = clean_cell(line)
+    if not text:
+        return False
+    normalized = normalize_for_match(text)
+    compact = re.sub(r"\s+", "", normalized)
+    return (
+        "imageonlypage" in compact
+        or "embeddedimagelayeronly" in compact
+        or ("이미지도식중심페이지" in compact and "텍스트레이어" in compact)
+        or ("pdf텍스트레이어" in compact and "문구만포함" in compact)
+    )
 
 
 def normalize_compact_visual_pair_sections(markdown: str) -> str:
@@ -1156,6 +1189,8 @@ def iter_section_blocks(markdown: str) -> Iterable[dict[str, Any]]:
             if not text:
                 return None
             section_path = resolve_block_section_path(current_section, text)
+            if should_skip_section_block(text, section_path):
+                return None
             return {
                 "page": page,
                 "section_path": section_path,
@@ -1215,10 +1250,45 @@ def should_reset_section_stack_for_page(section_stack: list[tuple[int, str]], pa
 
 
 def resolve_block_section_path(current_section: str, text: str) -> str:
+    current_section = clean_section_path(current_section)
     if current_section and not is_table_of_contents_title(current_section):
         return current_section
     inferred = infer_section_path_from_block(text)
     return inferred or ("" if is_table_of_contents_title(current_section) else current_section)
+
+
+def clean_section_path(value: str) -> str:
+    parts = [clean_cell(part) for part in str(value or "").split(">")]
+    parts = [part for part in parts if part and not re.fullmatch(r"(?:>|\\s)+", part)]
+    return " > ".join(parts)
+
+
+def should_skip_section_block(text: str, section_path: str) -> bool:
+    visible = strip_heading_lines(text)
+    if not visible:
+        return True
+    if all(is_non_retrieval_note_line(line) or not line.strip() for line in visible.splitlines()):
+        return True
+    if clean_section_path(section_path) == "Embedded Image OCR" and is_embedded_ocr_junk_text(visible):
+        return True
+    return False
+
+
+def strip_heading_lines(text: str) -> str:
+    lines = [line for line in (text or "").splitlines() if not HEADING_RE.match(line.strip())]
+    return normalize_markdown("\n".join(lines))
+
+
+def is_embedded_ocr_junk_text(text: str) -> bool:
+    cleaned = re.sub(r"[^0-9A-Za-z가-힣]+", "", text or "")
+    if not cleaned:
+        return True
+    if len(cleaned) <= 12:
+        return True
+    words = re.findall(r"[0-9A-Za-z가-힣]+", text or "")
+    if len(words) >= 4 and sum(1 for word in words if len(word) == 1) / len(words) >= 0.65:
+        return True
+    return False
 
 
 def infer_section_path_from_block(text: str) -> str:
@@ -1501,6 +1571,8 @@ def plain_text_fields(line: str, section_path: str) -> dict[str, str]:
 
     fields: dict[str, str] = {}
     topic = infer_plain_text_topic(line, section_path)
+    if not topic and not emails and not phones and not dependencies and (dates or numbers or identifiers):
+        return {}
     if topic:
         fields["항목"] = topic
     if emails:
@@ -1785,6 +1857,9 @@ def parse_markdown_table(lines: list[str]) -> tuple[list[str], list[list[str]]] 
     rows = [row for row in rows if any(clean_cell(cell) for cell in row)]
     if not rows:
         return None
+    rows = expand_combined_table_rows(headers, rows)
+    if not rows:
+        return None
     return headers, rows
 
 
@@ -1823,6 +1898,100 @@ def merge_multilevel_headers(headers: list[str], subheaders: list[str]) -> list[
         else:
             merged.append(parent or header or f"Column {index + 1}")
     return [clean_cell(header) or f"Column {index}" for index, header in enumerate(merged, start=1)]
+
+
+def expand_combined_table_rows(headers: list[str], rows: list[list[str]]) -> list[list[str]]:
+    expanded: list[list[str]] = []
+    for row in rows:
+        expanded.extend(expand_combined_table_row(headers, row))
+    return expanded
+
+
+def expand_combined_table_row(headers: list[str], row: list[str]) -> list[list[str]]:
+    subject_index = combined_row_subject_index(headers)
+    if subject_index is None or subject_index >= len(row):
+        return [row]
+
+    subjects = split_combined_subject_values(row[subject_index])
+    if len(subjects) <= 1:
+        return [row]
+
+    expected = len(subjects)
+    split_columns: dict[int, list[str]] = {subject_index: subjects}
+    for index, cell in enumerate(row):
+        if index == subject_index:
+            continue
+        values = split_combined_cell_values(headers[index] if index < len(headers) else "", cell, expected)
+        if len(values) == expected:
+            split_columns[index] = values
+
+    if len(split_columns) < 2:
+        return [row]
+
+    new_rows: list[list[str]] = []
+    for row_index in range(expected):
+        new_row = []
+        for column_index, cell in enumerate(row):
+            values = split_columns.get(column_index)
+            new_row.append(values[row_index] if values else cell)
+        new_rows.append(new_row)
+    return new_rows
+
+
+def combined_row_subject_index(headers: list[str]) -> int | None:
+    for index, header in enumerate(headers):
+        normalized = normalize_for_match(header)
+        if any(term in normalized for term in ("모집단위", "학과명", "학과")):
+            return index
+    return None
+
+
+def split_combined_subject_values(value: str) -> list[str]:
+    text = clean_cell(value)
+    if not text:
+        return []
+    matches = [
+        clean_cell(match.group(0))
+        for match in re.finditer(r".+?(?:학부|학과|전공|운항과|항공과|경영과)(?=\s+\S|$)", text)
+    ]
+    if len(matches) >= 2 and clean_cell(" ".join(matches)) == text:
+        return matches
+    return [text]
+
+
+def split_combined_cell_values(header: str, value: str, expected_count: int) -> list[str]:
+    text = clean_cell(value)
+    if not text or expected_count <= 1:
+        return [text] if text else []
+    if "<br" in str(value).lower():
+        values = [clean_cell(part) for part in re.split(r"<br\s*/?>", str(value), flags=re.IGNORECASE)]
+        values = [value for value in values if value]
+        if len(values) == expected_count:
+            return values
+
+    number_values = split_number_sequence_values(text, expected_count)
+    if len(number_values) == expected_count and should_split_numeric_table_cell(header, text):
+        return number_values
+    return [text]
+
+
+def split_number_sequence_values(value: str, expected_count: int) -> list[str]:
+    tokens = re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?%?", value)
+    if len(tokens) == expected_count:
+        return tokens
+    if len(tokens) == expected_count * 2:
+        markers = tokens[::2]
+        values = tokens[1::2]
+        if markers == [str(index) for index in range(1, expected_count + 1)]:
+            return values
+    return []
+
+
+def should_split_numeric_table_cell(header: str, value: str) -> bool:
+    normalized_header = normalize_for_match(header)
+    if any(term in normalized_header for term in ("모집", "정원", "수시", "정시", "일반", "특성화", "특기자", "연계", "연한", "인원")):
+        return True
+    return bool(re.fullmatch(r"(?:\d+(?:,\d{3})*(?:\.\d+)?%?\s*){2,}", value))
 
 
 def split_table_row(line: str) -> list[str]:
@@ -1911,8 +2080,11 @@ def build_record_text(record: StructuredRecord) -> str:
     fields = "\n".join(f"  {key}: {value}" for key, value in record.fields.items())
     return "\n".join(
         [
-            f"- record_id: {record.record_id}",
+            "- structured_record:",
             f"  record_type: {record.record_type}",
+            f"  source_file: {record.file_name}",
+            f"  source_page: {record.page if record.page is not None else ''}",
+            f"  source_section: {clean_section_path(record.section_path) or 'Untitled'}",
             f"  answer_hint: {record.answer_text}",
             fields,
         ]
@@ -4139,6 +4311,7 @@ def extract_identifier_values(text: str) -> list[str]:
 
 def extract_keywords(text: str, limit: int = 20) -> list[str]:
     text = clean_cell(text)
+    text = remove_keyword_metadata_noise(text)
     candidates: list[str] = []
 
     for term in IMPORTANT_TERMS:
@@ -4174,6 +4347,16 @@ def extract_keywords(text: str, limit: int = 20) -> list[str]:
         candidates.append(token)
 
     return unique_keep_order(candidates)[:limit]
+
+
+def remove_keyword_metadata_noise(text: str) -> str:
+    text = re.sub(r"\s*-?\s*structured_record:\s*", " ", text)
+    text = re.sub(r"\brecord_type:\s*[A-Za-z_, ]+", " ", text)
+    text = re.sub(r"\bsource_file:\s*\S+", " ", text)
+    text = re.sub(r"\bsource_page:\s*\S+", " ", text)
+    text = re.sub(r"\bsource_section:\s*", " ", text)
+    text = re.sub(r"\banswer_hint:\s*", " ", text)
+    return clean_cell(text)
 
 
 def normalize_terms(terms: Iterable[str]) -> list[str]:

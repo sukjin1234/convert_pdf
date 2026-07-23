@@ -1006,6 +1006,73 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertTrue(all(" > " not in chunk.section_path.strip() for chunk in artifact.chunks))
         self.assertNotIn("[section:     >  ]", artifact.dify_markdown)
 
+    def test_structured_records_keep_source_metadata_without_uuid_noise(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 12 ---
+
+# 전형별 모집인원
+
+| 모집단위 | 모집인원 |
+| --- | --- |
+| 기계공학과 | 90 |
+""",
+            "admission.pdf",
+            document_id="doc_record_source",
+        )
+
+        self.assertIn("- structured_record:", artifact.dify_markdown)
+        self.assertIn("source_page: 12", artifact.dify_markdown)
+        self.assertIn("source_section: 전형별 모집인원", artifact.dify_markdown)
+        self.assertNotIn("- record_id:", artifact.dify_markdown)
+        self.assertNotIn("_t01_r001", artifact.dify_markdown)
+
+    def test_combined_admission_table_rows_are_split_before_record_generation(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 26 ---
+
+# 모집인원
+
+| 계열 | 모집단위 | 수업 연한 | 모집 정원 | 수시1차 일반고 | 수시1차 특성화고 |
+| --- | --- | --- | --- | --- | --- |
+| 공학 | 자유전공학부 기계공학과 | 2 2 | 30 90 | 10 50 | 2 13 |
+""",
+            "admission.pdf",
+            document_id="doc_combined_rows",
+        )
+
+        by_unit = {record.fields.get("모집단위"): record for record in artifact.records}
+        self.assertEqual(by_unit["자유전공학부"].fields["모집 정원"], "30")
+        self.assertEqual(by_unit["기계공학과"].fields["모집 정원"], "90")
+        self.assertNotIn("모집단위: 자유전공학부 기계공학과", artifact.dify_markdown)
+        self.assertNotIn("모집 정원: 30 90", artifact.dify_markdown)
+
+    def test_non_retrieval_image_notes_and_short_embedded_ocr_are_skipped(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 9 ---
+
+항공분야
+
+> 이미지/도식 중심 페이지로, PDF 텍스트 레이어에서 확인되는 문구만 포함했습니다.
+
+--- Page 10 ---
+
+## Embedded Image OCR
+
+AK
+""",
+            "document.pdf",
+            document_id="doc_noise_filter",
+        )
+
+        self.assertEqual(len(artifact.chunks), 1)
+        self.assertIn("항공분야", artifact.dify_markdown)
+        self.assertNotIn("이미지/도식 중심 페이지", artifact.dify_markdown)
+        self.assertNotIn("Embedded Image OCR", artifact.dify_markdown)
+        self.assertNotIn("AK", artifact.dify_markdown)
+
 
 if __name__ == "__main__":
     unittest.main()
