@@ -931,20 +931,24 @@ def _kill_process_tree(pid: int) -> None:
 
 def _read_rendered_markdown(output_dir: Path) -> str:
     markdown_path = _first_file(output_dir, (".md", ".markdown"))
-    if markdown_path:
-        markdown = _normalize_markdown(markdown_path.read_text(encoding="utf-8"))
-        if _has_page_separators(markdown) and _has_meaningful_markdown(markdown):
-            return markdown
-
+    fallback = markdown_path.read_text(encoding="utf-8") if markdown_path else ""
     json_path = _first_file(output_dir, (".json",))
 
-    fallback = markdown_path.read_text(encoding="utf-8") if markdown_path else ""
     doc = None
+    rendered_from_json = ""
     if json_path:
         with json_path.open(encoding="utf-8") as f:
             doc = json.load(f)
+        rendered_from_json = render_document_pages_to_markdown(doc, fallback)
+        if _has_meaningful_markdown(rendered_from_json) and _has_visual_pair_table(rendered_from_json):
+            return rendered_from_json
 
-    markdown = render_document_to_markdown(doc, fallback)
+    if markdown_path:
+        markdown = _normalize_markdown(fallback)
+        if _has_page_separators(markdown) and _has_meaningful_markdown(markdown):
+            return markdown
+
+    markdown = rendered_from_json or render_document_to_markdown(doc, fallback)
     if not _has_meaningful_markdown(markdown):
         raise ConversionError("OpenDataLoader produced no Markdown.")
     return markdown
@@ -1049,6 +1053,10 @@ def _has_meaningful_markdown(markdown: str) -> bool:
 
 def _has_page_separators(markdown: str) -> bool:
     return bool(re.search(r"(?m)^\s*--- Page \d+ ---\s*$", markdown))
+
+
+def _has_visual_pair_table(markdown: str) -> bool:
+    return bool(re.search(r"(?m)^\|\s*제목\s*\|\s*내용\s*\|", markdown))
 
 
 def _has_enough_page_content(markdown: str) -> bool:

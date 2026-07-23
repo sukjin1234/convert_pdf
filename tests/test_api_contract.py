@@ -144,11 +144,51 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["query_plan"]["query_type"], "table_lookup")
         self.assertTrue(payload["node_status"]["structured_lookup_has_context"])
         self.assertIn("Structured Lookup - authoritative exact evidence", payload["merge_evidence"]["evidence_context"])
+        self.assertEqual(payload["answer_contract"]["status"], "direct_answer")
+        self.assertEqual(payload["answer_contract"]["required_values"], ["컴퓨터정보공학과", "기계공학과", "간호학과"])
+        self.assertIn("Answer Contract - obey before writing", payload["merge_evidence"]["evidence_context"])
         self.assertIn("컴퓨터정보공학과", payload["draft_answer"])
         self.assertIn("기계공학과", payload["draft_answer"])
         self.assertIn("간호학과", payload["draft_answer"])
         self.assertTrue(payload["draft_verification"]["valid"])
         self.assertFalse(payload["supplied_answer_verification"]["valid"])
+
+    def test_chatflow_merge_evidence_endpoint_handles_nested_knowledge_result(self):
+        client = TestClient(app)
+        payload = {
+            "lookup_body": {
+                "query": "전공심화 개설 학과 알려줘",
+                "query_type": "table_lookup",
+                "answer_style": "table_or_bullets",
+                "direct_answer": "개설 학과: 컴퓨터정보공학과, 기계공학과",
+                "answer_field": "개설 학과",
+                "answer_items": [{"value": "컴퓨터정보공학과"}, {"value": "기계공학과"}],
+                "context": "[Direct Answer - complete structured result]\ncomplete_values:\n- 컴퓨터정보공학과\n- 기계공학과",
+                "diagnostics": {"answerability": {"answerable": True}},
+            },
+            "knowledge_result": {
+                "data": {
+                    "records": [
+                        {
+                            "segment": {
+                                "content": "전공심화 과정은 야간 수업으로 운영됩니다.",
+                                "metadata": {"file_name": "admission.md", "page": 4},
+                            },
+                            "score": 0.91,
+                        }
+                    ]
+                }
+            },
+        }
+
+        response = client.post("/chatflow/merge-evidence", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("Answer Contract - obey before writing", body["evidence_context"])
+        self.assertIn("Structured Lookup - authoritative exact evidence", body["evidence_context"])
+        self.assertIn("[knowledge 1] source=admission.md page=4 score=0.91", body["knowledge_context"])
+        self.assertIn("- 컴퓨터정보공학과", body["answer_contract_text"])
 
     def test_eval_log_api_writes_jsonl_and_detail_file(self):
         with TemporaryDirectory() as temp_dir:

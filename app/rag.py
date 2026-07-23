@@ -1964,6 +1964,14 @@ def lookup_matches(
     direct_answer = build_direct_answer(query, active_query_type, active_entities, direct_candidates)
     context_source_matches = merge_match_lists(direct_candidates, combined)
     context_matches = filter_context_matches_for_direct_answer(context_source_matches, direct_answer)
+    answer_contract = build_answer_contract(
+        query=query,
+        query_type=active_query_type,
+        answer_style=plan.get("answer_style", "grounded_explanation"),
+        direct_answer=direct_answer,
+        answerability=answerability,
+        has_structured_context=bool(context_matches),
+    )
     return {
         "query": query,
         "query_type": active_query_type,
@@ -1974,6 +1982,7 @@ def lookup_matches(
         "answer_items": direct_answer["answer_items"],
         "answer_field": direct_answer["answer_field"],
         "filter_terms": direct_answer["filter_terms"],
+        "answer_contract": answer_contract,
         "matches": combined,
         "context": format_lookup_context(context_matches, direct_answer),
         "evidence_items": build_evidence_items(context_matches),
@@ -3233,6 +3242,106 @@ def format_direct_answer_context(direct_answer: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def build_answer_contract(
+    *,
+    query: str,
+    query_type: str,
+    answer_style: str,
+    direct_answer: dict[str, Any],
+    answerability: dict[str, Any],
+    has_structured_context: bool,
+) -> dict[str, Any]:
+    answer_text = clean_cell(direct_answer.get("direct_answer", ""))
+    answer_items = direct_answer.get("answer_items") if isinstance(direct_answer.get("answer_items"), list) else []
+    required_values = unique_exact_keep_order(
+        clean_cell(item.get("value", ""))
+        for item in answer_items
+        if isinstance(item, dict) and clean_cell(item.get("value", ""))
+    )
+    answerable = answerability.get("answerable")
+    if answer_text:
+        status = "direct_answer"
+        priority = "structured_lookup"
+        instruction = "Answer from answer_candidate and include every required_value exactly once."
+    elif answerable is False:
+        status = "insufficient_structured_evidence"
+        priority = "abstain_unless_knowledge_directly_answers"
+        instruction = "Structured lookup says the requested attribute is not supported by evidence; abstain unless supplementary evidence directly answers it."
+    elif has_structured_context:
+        status = "structured_evidence"
+        priority = "structured_lookup"
+        instruction = "Use structured evidence first and preserve labels, conditions, values, page, and section metadata."
+    else:
+        status = "knowledge_only"
+        priority = "knowledge_retrieval"
+        instruction = "Use knowledge retrieval only and abstain if it does not directly answer the question."
+
+    return {
+        "status": status,
+        "query": clean_cell(query),
+        "query_type": query_type,
+        "answer_style": answer_style,
+        "answerable": answerable,
+        "priority": priority,
+        "has_direct_answer": bool(answer_text),
+        "answer_candidate": answer_text,
+        "answer_field": clean_cell(direct_answer.get("answer_field", "")),
+        "filter_terms": [str(term) for term in direct_answer.get("filter_terms", [])],
+        "required_values": required_values,
+        "required_value_count": len(required_values),
+        "instruction": instruction,
+    }
+
+
+def answer_contract_from_lookup(lookup: dict[str, Any], diagnostics: dict[str, Any]) -> dict[str, Any]:
+    existing = lookup.get("answer_contract")
+    if isinstance(existing, dict):
+        return existing
+    answer_items = lookup.get("answer_items") if isinstance(lookup.get("answer_items"), list) else []
+    direct_answer = {
+        "direct_answer": lookup.get("direct_answer", ""),
+        "answer_items": answer_items,
+        "answer_field": lookup.get("answer_field", ""),
+        "filter_terms": lookup.get("filter_terms", []),
+    }
+    answerability = diagnostics.get("answerability") if isinstance(diagnostics.get("answerability"), dict) else {}
+    return build_answer_contract(
+        query=str(lookup.get("query") or ""),
+        query_type=str(lookup.get("query_type") or "semantic"),
+        answer_style=str(lookup.get("answer_style") or "grounded_explanation"),
+        direct_answer=direct_answer,
+        answerability=answerability,
+        has_structured_context=bool(lookup.get("context")),
+    )
+
+
+def format_answer_contract_context(contract: dict[str, Any]) -> str:
+    if not contract:
+        return ""
+    lines = [
+        "[Answer Contract - obey before writing]",
+        f"status: {contract.get('status', '')}",
+        f"priority: {contract.get('priority', '')}",
+        f"query_type: {contract.get('query_type', '')}",
+        f"answer_style: {contract.get('answer_style', '')}",
+        f"answerable: {contract.get('answerable')}",
+    ]
+    answer_candidate = clean_cell(contract.get("answer_candidate", ""))
+    if answer_candidate:
+        lines.append(f"answer_candidate: {answer_candidate}")
+    answer_field = clean_cell(contract.get("answer_field", ""))
+    if answer_field:
+        lines.append(f"answer_field: {answer_field}")
+    required_values = contract.get("required_values") if isinstance(contract.get("required_values"), list) else []
+    if required_values:
+        lines.append("required_values:")
+        lines.extend(f"- {clean_cell(value)}" for value in required_values if clean_cell(value))
+    instruction = clean_cell(contract.get("instruction", ""))
+    if instruction:
+        lines.append(f"Instruction: {instruction}")
+    return "\n".join(lines)
+
+
 def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result: Any = None) -> dict[str, str]:
     lookup_payload = parse_json_like(lookup)
     if not isinstance(lookup_payload, dict):
@@ -3243,28 +3352,15 @@ def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result
     if not isinstance(diagnostics, dict):
         diagnostics = {}
 
-    knowledge_items = parse_json_like(knowledge_result) or []
-    if isinstance(knowledge_items, dict):
-        knowledge_items = (
-            knowledge_items.get("result")
-            or knowledge_items.get("records")
-            or knowledge_items.get("data")
-            or knowledge_items.get("documents")
-            or []
-        )
-    if not isinstance(knowledge_items, list):
-        knowledge_items = [knowledge_items]
+    answer_contract = answer_contract_from_lookup(lookup_payload, diagnostics)
+    answer_contract_block = format_answer_contract_context(answer_contract)
+    knowledge_items = extract_knowledge_items(knowledge_result)
 
     knowledge_blocks = []
     for index, item in enumerate(knowledge_items[:12], start=1):
-        if isinstance(item, dict):
-            segment = item.get("segment") if isinstance(item.get("segment"), dict) else {}
-            content = item.get("content") or item.get("text") or segment.get("content") or ""
-            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-            source = metadata.get("source") or metadata.get("file_name") or item.get("title") or ""
-            knowledge_blocks.append(f"[knowledge {index}] source={source}\n{content}")
-        else:
-            knowledge_blocks.append(f"[knowledge {index}]\n{item}")
+        block = format_knowledge_item(index, item)
+        if block:
+            knowledge_blocks.append(block)
 
     structured_block = (
         "[Structured Lookup - authoritative exact evidence]\n"
@@ -3279,7 +3375,7 @@ def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result
         if knowledge_blocks
         else ""
     )
-    evidence_context = "\n\n".join(part for part in [structured_block, knowledge_block] if part)
+    evidence_context = "\n\n".join(part for part in [answer_contract_block, structured_block, knowledge_block] if part)
     evidence_priority = (
         "Use Structured Lookup first. Knowledge Retrieval is supplementary and may be empty or less specific."
         if structured_context
@@ -3291,9 +3387,154 @@ def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result
         "knowledge_context": "\n\n".join(knowledge_blocks),
         "evidence_context": evidence_context,
         "evidence_priority": evidence_priority,
+        "answer_contract": json.dumps(answer_contract, ensure_ascii=False),
+        "answer_contract_text": answer_contract_block,
         "lookup_diagnostics": json.dumps(diagnostics, ensure_ascii=False),
         "lookup_answerability": json.dumps(diagnostics.get("answerability") or {}, ensure_ascii=False),
     }
+
+
+KNOWLEDGE_CONTAINER_KEYS = (
+    "result",
+    "records",
+    "data",
+    "documents",
+    "chunks",
+    "items",
+    "retrieval",
+    "knowledge",
+    "outputs",
+)
+
+KNOWLEDGE_TEXT_KEYS = (
+    "content",
+    "text",
+    "page_content",
+    "markdown",
+    "body",
+    "answer",
+)
+
+
+def extract_knowledge_items(value: Any, *, limit: int = 12) -> list[Any]:
+    root = parse_json_like(value)
+    items: list[Any] = []
+    seen = set()
+
+    def visit(node: Any, depth: int) -> None:
+        if len(items) >= limit or depth > 8:
+            return
+        node = parse_json_like(node)
+        if node is None:
+            return
+        if isinstance(node, list):
+            for child in node:
+                visit(child, depth + 1)
+                if len(items) >= limit:
+                    break
+            return
+        if isinstance(node, dict):
+            if knowledge_item_has_content(node):
+                key = normalize_for_match(knowledge_item_content(node))[:200]
+                if key and key not in seen:
+                    seen.add(key)
+                    items.append(node)
+                return
+
+            for key in KNOWLEDGE_CONTAINER_KEYS:
+                if key in node:
+                    visit(node.get(key), depth + 1)
+                    if items:
+                        return
+
+            for child in node.values():
+                if isinstance(child, (list, dict)):
+                    visit(child, depth + 1)
+                    if len(items) >= limit:
+                        break
+            return
+
+        text = clean_cell(str(node))
+        if text:
+            key = normalize_for_match(text)[:200]
+            if key and key not in seen:
+                seen.add(key)
+                items.append(text)
+
+    visit(root, 0)
+    return items[:limit]
+
+
+def knowledge_item_has_content(item: dict[str, Any]) -> bool:
+    return bool(knowledge_item_content(item))
+
+
+def knowledge_item_content(item: dict[str, Any]) -> str:
+    for key in KNOWLEDGE_TEXT_KEYS:
+        value = clean_cell(item.get(key, ""))
+        if value:
+            return value
+
+    for nested_key in ("segment", "document", "doc", "data", "metadata"):
+        nested = item.get(nested_key)
+        if isinstance(nested, dict):
+            for key in KNOWLEDGE_TEXT_KEYS:
+                value = clean_cell(nested.get(key, ""))
+                if value:
+                    return value
+    return ""
+
+
+def knowledge_item_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    segment = item.get("segment") if isinstance(item.get("segment"), dict) else {}
+    segment_metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
+    document = item.get("document") if isinstance(item.get("document"), dict) else {}
+    document_metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    data_metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    return {
+        **document_metadata,
+        **segment_metadata,
+        **data_metadata,
+        **metadata,
+    }
+
+
+def format_knowledge_item(index: int, item: Any) -> str:
+    if isinstance(item, dict):
+        content = trim_text(knowledge_item_content(item), MATCH_EVIDENCE_CHAR_LIMIT)
+        if not content:
+            return ""
+        metadata = knowledge_item_metadata(item)
+        source = first_non_empty_text(
+            metadata.get("source"),
+            metadata.get("file_name"),
+            metadata.get("document_name"),
+            item.get("title"),
+            item.get("name"),
+        )
+        page = first_non_empty_text(metadata.get("page"), metadata.get("page_number"), item.get("page"))
+        score = first_non_empty_text(item.get("score"), item.get("similarity"), item.get("rerank_score"))
+        header_parts = [f"[knowledge {index}]"]
+        if source:
+            header_parts.append(f"source={source}")
+        if page:
+            header_parts.append(f"page={page}")
+        if score:
+            header_parts.append(f"score={score}")
+        return " ".join(header_parts) + "\n" + content
+
+    text = trim_text(str(item), MATCH_EVIDENCE_CHAR_LIMIT)
+    return f"[knowledge {index}]\n{text}" if text else ""
+
+
+def first_non_empty_text(*values: Any) -> str:
+    for value in values:
+        text = clean_cell(value)
+        if text:
+            return text
+    return ""
 
 
 def build_grounded_answer_draft(question: str, lookup: dict[str, Any]) -> str:

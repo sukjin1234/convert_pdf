@@ -199,6 +199,10 @@ def _render_page(elements: list[dict[str, Any]]) -> str:
     if metric_grid:
         return metric_grid
 
+    visual_pair_grid = _render_visual_pair_grid_page(elements)
+    if visual_pair_grid:
+        return visual_pair_grid
+
     blocks = []
     has_image = False
     for element in elements:
@@ -276,6 +280,209 @@ def _render_metric_grid_page(elements: list[dict[str, Any]]) -> str:
         table.append(f"| {_escape_table_cell(label['text'])} | {_escape_table_cell(value['text'])} |")
     blocks.append("\n".join(table))
     return "\n\n".join(block for block in blocks if block)
+
+
+def _render_visual_pair_grid_page(elements: list[dict[str, Any]]) -> str:
+    items = _text_items(elements)
+    if len(items) < 4:
+        return ""
+
+    font_threshold = _visual_title_font_threshold(items)
+    titles = [item for item in items if _is_visual_pair_title(item, font_threshold)]
+    if len(titles) < 2:
+        return ""
+
+    groups = _visual_pair_groups(items, titles)
+    if not _is_visual_pair_grid(groups):
+        return ""
+
+    paired_indexes = {title["index"] for title, _ in groups}
+    for _, bodies in groups:
+        paired_indexes.update(body["index"] for body in bodies)
+
+    top_pair_cy = max(title["cy"] for title, _ in groups)
+    lead_items = sorted(
+        (
+            item
+            for item in items
+            if item["index"] not in paired_indexes
+            and item["cy"] > top_pair_cy + max(_item_height(item), 8.0)
+        ),
+        key=lambda item: (-item["cy"], item["x0"]),
+    )
+
+    blocks = _render_lead_items(lead_items)
+    table = ["| 제목 | 내용 |", "| --- | --- |"]
+    for title, bodies in groups:
+        body_text = "<br>".join(_escape_table_cell(_visual_pair_body_text(body)) for body in bodies)
+        table.append(f"| {_escape_table_cell(title['text'])} | {body_text} |")
+    blocks.append("\n".join(table))
+    return "\n\n".join(block for block in blocks if block)
+
+
+def _visual_pair_groups(items: list[dict[str, Any]], titles: list[dict[str, Any]]) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    title_indexes = {title["index"] for title in titles}
+    assignments: dict[int, list[dict[str, Any]]] = defaultdict(list)
+
+    for item in items:
+        if item["index"] in title_indexes or not _is_visual_pair_body(item):
+            continue
+        title = _nearest_visual_pair_title(item, titles, items)
+        if title:
+            assignments[title["index"]].append(item)
+
+    groups = []
+    for title in titles:
+        bodies = assignments.get(title["index"], [])
+        if bodies:
+            groups.append((title, sorted(bodies, key=lambda item: (-item["cy"], item["x0"]))))
+    return sorted(groups, key=lambda group: (-group[0]["cy"], group[0]["x0"]))
+
+
+def _nearest_visual_pair_title(
+    body: dict[str, Any],
+    titles: list[dict[str, Any]],
+    items: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    max_gap = _visual_pair_max_vertical_gap(items)
+    candidates = []
+    for title in titles:
+        if _content_fingerprint(title["text"]) == _content_fingerprint(body["text"]):
+            continue
+        vertical_gap = title["cy"] - body["cy"]
+        if vertical_gap <= 0.0 or vertical_gap > max_gap:
+            continue
+        if not _same_visual_pair_column(title, body):
+            continue
+        if _has_intermediate_visual_title(title, body, titles):
+            continue
+
+        center_distance = abs(title["cx"] - body["cx"])
+        left_distance = abs(title["x0"] - body["x0"])
+        score = vertical_gap + center_distance * 0.65 + left_distance * 0.15
+        candidates.append((score, title))
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def _has_intermediate_visual_title(
+    title: dict[str, Any],
+    body: dict[str, Any],
+    titles: list[dict[str, Any]],
+) -> bool:
+    for other in titles:
+        if other["index"] == title["index"]:
+            continue
+        if title["cy"] > other["cy"] > body["cy"] and _same_visual_pair_column(other, body):
+            return True
+    return False
+
+
+def _is_visual_pair_grid(groups: list[tuple[dict[str, Any], list[dict[str, Any]]]]) -> bool:
+    if len(groups) < 2:
+        return False
+
+    titles = [title for title, _ in groups]
+    if len(_visual_column_clusters(titles)) < 2:
+        return False
+    if len(groups) >= 3:
+        return True
+    return _has_shared_visual_row(titles)
+
+
+def _has_shared_visual_row(items: list[dict[str, Any]]) -> bool:
+    rows: list[list[dict[str, Any]]] = []
+    for item in sorted(items, key=lambda value: -value["cy"]):
+        for row in rows:
+            if abs(row[0]["cy"] - item["cy"]) <= max(_item_height(row[0]), _item_height(item), 24.0):
+                row.append(item)
+                break
+        else:
+            rows.append([item])
+    return any(len(row) >= 2 for row in rows)
+
+
+def _visual_column_clusters(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    if not items:
+        return []
+    page_width = max(item["x1"] for item in items) - min(item["x0"] for item in items)
+    tolerance = max(60.0, page_width * 0.08)
+    clusters: list[list[dict[str, Any]]] = []
+    for item in sorted(items, key=lambda value: value["cx"]):
+        for cluster in clusters:
+            cluster_center = sum(member["cx"] for member in cluster) / len(cluster)
+            if abs(cluster_center - item["cx"]) <= tolerance:
+                cluster.append(item)
+                break
+        else:
+            clusters.append([item])
+    return clusters
+
+
+def _is_visual_pair_title(item: dict[str, Any], font_threshold: float) -> bool:
+    text = item["text"]
+    if not text or _is_year(text) or _is_event_text(text):
+        return False
+    if len(_content_fingerprint(text)) < 2:
+        return False
+    if "\n" in text and len([line for line in text.splitlines() if line.strip()]) > 1:
+        return False
+    if len(text) > 60:
+        return False
+    if item["type"] == "heading":
+        return True
+    return bool(item["font_size"] and item["font_size"] >= font_threshold)
+
+
+def _is_visual_pair_body(item: dict[str, Any]) -> bool:
+    text = item["text"]
+    if not text or len(_content_fingerprint(text)) < 2:
+        return False
+    if re.fullmatch(r"[\d\s.,:/%+\-()]+", text):
+        return False
+    if item["type"] in {"image", "picture", "figure", "table", "header", "footer"}:
+        return False
+    return True
+
+
+def _same_visual_pair_column(title: dict[str, Any], body: dict[str, Any]) -> bool:
+    if _same_visual_column(title, body, tolerance=95.0):
+        return True
+
+    overlap = min(title["x1"], body["x1"]) - max(title["x0"], body["x0"])
+    if overlap <= 0:
+        return False
+    min_width = max(min(_item_width(title), _item_width(body)), 1.0)
+    return overlap / min_width >= 0.25
+
+
+def _visual_pair_max_vertical_gap(items: list[dict[str, Any]]) -> float:
+    page_height = max(item["y1"] for item in items) - min(item["y0"] for item in items)
+    return max(110.0, min(320.0, page_height * 0.38))
+
+
+def _visual_title_font_threshold(items: list[dict[str, Any]]) -> float:
+    fonts = sorted(item["font_size"] for item in items if item["font_size"] > 0)
+    if not fonts:
+        return 0.0
+    middle = len(fonts) // 2
+    median = fonts[middle] if len(fonts) % 2 else (fonts[middle - 1] + fonts[middle]) / 2
+    return max(10.0, median * 1.12)
+
+
+def _visual_pair_body_text(item: dict[str, Any]) -> str:
+    text = item["text"].strip()
+    return re.sub(r"^\s*[\u2022·]\s*", "- ", text)
+
+
+def _item_width(item: dict[str, Any]) -> float:
+    return max(item["x1"] - item["x0"], 1.0)
+
+
+def _item_height(item: dict[str, Any]) -> float:
+    return max(item["y1"] - item["y0"], 1.0)
 
 
 def _render_timeline_page(elements: list[dict[str, Any]]) -> str:

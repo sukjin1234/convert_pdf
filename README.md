@@ -11,6 +11,7 @@ POST /rag/ingest-markdown Markdown -> RAG artifact 저장
 POST /query/plan   질문 유형/키워드/하위질문/검색어 확장
 POST /lookup       구조화 레코드 exact lookup + evidence packing
 POST /answer/verify 답변 숫자/날짜/식별자 근거 검증
+POST /chatflow/merge-evidence Structured Lookup + Knowledge Retrieval 근거 병합
 POST /chatflow/debug Dify Chatflow 노드 흐름 로컬 재현
 POST /eval/log    Dify 실행 trace JSONL 저장
 GET  /eval/logs   저장된 평가 로그 목록/상세 조회
@@ -22,14 +23,16 @@ GET  /health
 
 ```powershell
 pip install -r requirements.txt
-opendataloader-pdf-hybrid --port 5002 --ocr-lang "ko,en" --enrich-picture-description
+$env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+$env:CUDA_VISIBLE_DEVICES="0"
+opendataloader-pdf-hybrid --port 5002 --ocr-lang "ko,en"
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-스캔 PDF가 많으면 OCR을 강제합니다.
+스캔 PDF가 많으면 OCR을 강제합니다. GPU 메모리가 충분하고 이미지 설명까지 필요할 때만 `--enrich-picture-description`을 추가합니다.
 
 ```powershell
-opendataloader-pdf-hybrid --port 5002 --force-ocr --ocr-lang "ko,en" --enrich-picture-description
+opendataloader-pdf-hybrid --port 5002 --force-ocr --ocr-lang "ko,en"
 ```
 
 ## Dify 연결
@@ -59,7 +62,9 @@ Chatflow의 JSON/Raw HTTP 노드에서는 다음 헤더만 넣습니다.
 Content-Type: application/json
 ```
 
-`/lookup` 응답의 `context`는 Dify LLM에 바로 넣는 evidence 본문입니다. 목록/표 질문에서는 `context` 맨 위에 `[Direct Answer - complete structured result]`와 `complete_values`가 들어가므로, LLM은 이 값을 빠뜨리지 않고 답해야 합니다. 표 행의 `♣`, `†`, `◈` 같은 표시와 `표시/indicates/means` 범례도 자동으로 연결해 행 필드에 반영합니다. 범례가 표 바로 아래가 아니라 다음 페이지나 다른 섹션에 있어도 문서 안에서 해당 기호의 의미가 하나로 명확하면 연결됩니다. 추가로 `direct_answer`, `answer_items`, `answer_field`, `filter_terms`, `evidence_items`, `diagnostics`, `answer_style`, `sub_queries`가 들어오므로 디버깅과 프롬프트 분기에 사용할 수 있습니다.
+`/lookup` 응답의 `context`는 Dify LLM에 바로 넣는 evidence 본문입니다. 목록/표 질문에서는 `context` 맨 위에 `[Direct Answer - complete structured result]`와 `complete_values`가 들어가므로, LLM은 이 값을 빠뜨리지 않고 답해야 합니다. 표 행의 `♣`, `†`, `◈` 같은 표시와 `표시/indicates/means` 범례도 자동으로 연결해 행 필드에 반영합니다. 범례가 표 바로 아래가 아니라 다음 페이지나 다른 섹션에 있어도 문서 안에서 해당 기호의 의미가 하나로 명확하면 연결됩니다. 추가로 `direct_answer`, `answer_items`, `answer_field`, `filter_terms`, `answer_contract`, `evidence_items`, `diagnostics`, `answer_style`, `sub_queries`가 들어오므로 디버깅과 프롬프트 분기에 사용할 수 있습니다.
+
+Dify Chatflow에서는 가능하면 Code 노드로 근거를 병합하지 말고 `/chatflow/merge-evidence` HTTP 노드를 사용합니다. 이 엔드포인트는 `Structured Lookup.body`와 `Knowledge Retrieval.result`를 받아 `answer_contract_text`, `evidence_priority`, `evidence_context`를 생성합니다. `answer_contract_text`에 `required_values`가 있으면 Final Answer LLM 프롬프트에서 이 값을 반드시 포함하도록 연결합니다.
 
 ## 수동 테스트
 
@@ -108,6 +113,8 @@ python scripts/analyze_eval_logs.py --log-dir dify-rag-eval-logs --json
 ## 환경 변수
 
 ```text
+DIFY_RUNTIME_DIR                기본 현재 작업 디렉터리/.runtime
+ODL_TMP_ROOT                    기본 DIFY_RUNTIME_DIR/opendataloader
 ODL_HYBRID_URL                  기본 http://localhost:5002
 ODL_HYBRID_MODE                 기본 auto, 허용값 auto/full
 ODL_CONVERSION_TIMEOUT_SECONDS  기본 360
@@ -115,11 +122,17 @@ ODL_HYBRID_TIMEOUT_MS           기본 300000
 ODL_MAX_PDF_BYTES               기본 83886080
 ODL_TABLE_METHOD                기본 cluster
 ODL_USE_STRUCT_TREE             기본 false
-RAG_STORE_DIR                   기본 OS temp/dify-rag-store
+ODL_EMBEDDED_IMAGE_OCR_ENABLED  기본 true
+ODL_EMBEDDED_IMAGE_OCR_MAX_IMAGES 기본 24
+ODL_EMBEDDED_IMAGE_OCR_BATCH_SIZE 기본 2
+ODL_EMBEDDED_IMAGE_OCR_MIN_PIXELS 기본 12000
+ODL_EMBEDDED_IMAGE_OCR_MAX_IMAGE_BYTES 기본 8388608
+ODL_EMBEDDED_IMAGE_OCR_PDF_MAX_SIDE 기본 1600
+RAG_STORE_DIR                   기본 DIFY_RUNTIME_DIR/rag-store
 EVAL_LOG_DIR                    기본 OS temp/dify-rag-eval-logs
 ```
 
-`RAG_STORE_DIR`에는 `/convert/rag` 결과 artifact가 JSON으로 저장됩니다. API 서버가 재시작되어도 `/lookup`이 이전 records를 다시 로드할 수 있습니다.
+`RAG_STORE_DIR`에는 `/convert/rag` 결과 artifact가 JSON으로 저장됩니다. 기본 경로가 쓰기 불가능하면 사용자 캐시와 OS temp를 순서대로 시도하고, 모두 실패하면 현재 프로세스 메모리에만 보관합니다.
 `EVAL_LOG_DIR`에는 `/eval/log` 실행 기록이 날짜별 JSONL과 run_id별 JSON 파일로 저장됩니다.
 
 ## 테스트

@@ -1,11 +1,11 @@
 # Dify RAG 노드 구성 가이드
 
-이 구성은 Dify를 UI, Knowledge Pipeline, Knowledge Retrieval에 쓰고, 정확도를 좌우하는 PDF 정규화, 표 행 확장, 구조화 조회, 답변 검증은 외부 FastAPI가 맡는 방식이다
+이 구성은 Dify를 UI, Knowledge Pipeline, Knowledge Retrieval에 쓰고, 정확도를 좌우하는 문서 정규화, 표 행 확장, 구조화 조회, 답변 검증은 외부 FastAPI가 맡는 방식이다
 
 목표 흐름:
 
 ```text
-PDF
+PDF/TXT/Markdown/DOCX/CSV
 -> FastAPI /convert/rag
 -> Dify Knowledge Base에 dify_markdown 저장
 -> Chatflow에서 /query/plan + /lookup + Knowledge Retrieval
@@ -42,7 +42,7 @@ curl http://172.22.0.1:8000/health
 
 ```text
 Data Source / File
--> PDF to RAG
+-> Document to RAG
 -> Parse RAG Response
 -> Parent-Child Chunker
 -> Knowledge Base
@@ -67,12 +67,12 @@ File.file.mime_type
 
 `document_id`는 직접 추출하지 말고 `File.file.related_id`를 우선 쓴다. 없으면 API가 자동 생성한다.
 
-### 2.2 HTTP Request: PDF to RAG
+### 2.2 HTTP Request: Document to RAG
 
 노드 이름:
 
 ```text
-PDF to RAG
+Document to RAG
 ```
 
 설정:
@@ -95,12 +95,12 @@ Headers:
 Form-data:
 
 ```text
-pdf          File  {{File.file}}
+file         File  {{File.file}}
 document_id  Text  {{File.file.related_id}}
 file_name    Text  {{File.file.name}}
 ```
 
-`pdf` 대신 `file`이라는 필드명을 써도 API가 받는다.
+기존 PDF 전용 노드와의 호환을 위해 `pdf` 필드명도 계속 받지만, 새로 구성할 때는 `file`을 사용한다. 현재 지원 형식은 `PDF`, `TXT`, `MD/Markdown`, `DOCX`, `CSV`, `TSV`다.
 
 ### 2.3 Code: Parse RAG Response
 
@@ -109,7 +109,7 @@ HTTP 노드 출력이 `body: string`으로 보이면 이 Code 노드를 반드�
 입력 변수:
 
 ```text
-body = {{PDF to RAG.body}}
+body = {{Document to RAG.body}}
 ```
 
 Python:
@@ -120,7 +120,7 @@ import json
 def main(body: str) -> dict:
     data = json.loads(body) if isinstance(body, str) else body
     if not data.get("success"):
-        raise ValueError(data.get("error") or "PDF RAG conversion failed")
+        raise ValueError(data.get("error") or "Document RAG conversion failed")
 
     stats = data.get("stats") or {}
     dify_markdown = data.get("dify_markdown") or ""
@@ -214,7 +214,7 @@ document_id: string, optional
 
 일반 Chatflow에서는 `query`에 사용자 질문을 넣고, 특정 문서만 조회할 때만 `document_id`를 넣는다.
 
-운영에서 여러 문서를 같은 FastAPI `RAG_STORE_DIR`에 저장한다면 `document_id`를 비워두지 않는다. Knowledge Pipeline의 `PDF to RAG`에서 사용한 `document_id`와 Chatflow의 `Start.document_id`가 같아야 `/lookup`이 해당 문서의 구조화 records만 조회한다. `Eval Log`에서 `document_id: null` 또는 빈 값으로 계속 찍히면 다중 문서 환경에서 오답 가능성이 커진다.
+운영에서 여러 문서를 같은 FastAPI `RAG_STORE_DIR`에 저장한다면 `document_id`를 비워두지 않는다. Knowledge Pipeline의 `Document to RAG`에서 사용한 `document_id`와 Chatflow의 `Start.document_id`가 같아야 `/lookup`이 해당 문서의 구조화 records만 조회한다. `Eval Log`에서 `document_id: null` 또는 빈 값으로 계속 찍히면 다중 문서 환경에서 오답 가능성이 커진다.
 
 ### 3.2 HTTP Request: Query Plan
 
@@ -358,7 +358,7 @@ Score threshold: 처음에는 낮게 또는 비활성
 Rerank: 가능하면 활성화
 ```
 
-### 3.6 Code: Merge Evidence
+### 3.6 HTTP Request: Merge Evidence
 
 입력 변수:
 
@@ -367,7 +367,56 @@ lookup_body = {{Structured Lookup.body}}
 knowledge_result = {{Knowledge Retrieval.result}}
 ```
 
-입력 변수명을 이미 `knowledge_context`로 만들어 둔 경우에도 아래 코드는 그대로 동작한다.
+권장 노드 이름:
+
+```text
+Merge Evidence
+```
+
+설정:
+
+```text
+Method: POST
+URL: http://<fastapi-host>:8000/chatflow/merge-evidence
+Authorization: None
+Body Type: JSON
+```
+
+Headers:
+
+```text
+Content-Type: application/json
+```
+
+JSON Body:
+
+```json
+{
+  "lookup_body": "{{Structured Lookup.body}}",
+  "knowledge_result": "{{Knowledge Retrieval.result}}"
+}
+```
+
+이 HTTP 노드는 Structured Lookup의 `answer_contract`, `complete_values`, `answerability`와 Knowledge Retrieval 결과를 서버 쪽에서 병합한다. Dify `Knowledge Retrieval.result`가 `data.records`, `segment.content`, `metadata`처럼 중첩되어 와도 근거 텍스트를 보존한다.
+
+출력 변수:
+
+```text
+structured_context: string
+knowledge_context: string
+evidence_context: string
+evidence_priority: string
+answer_contract: string
+answer_contract_text: string
+lookup_diagnostics: string
+lookup_answerability: string
+```
+
+`answer_contract_text`는 최종 LLM이 반드시 따라야 할 답변 계약이다. direct answer가 있으면 필수 포함값이 `required_values`로 들어간다.
+
+만약 현재 Dify 환경에서 HTTP JSON body에 object/list 변수를 직접 넣기 어렵다면 아래 Code 노드를 대체 구성으로 둔다. 단, 정확도를 위해 가능하면 위 HTTP 노드를 쓴다.
+
+### 3.6 대체 Code: Merge Evidence
 
 Python:
 
@@ -389,6 +438,7 @@ def main(lookup_body=None, knowledge_result=None, knowledge_context=None, knowle
     lookup = json.loads(lookup_body) if isinstance(lookup_body, str) else (lookup_body or {})
     structured_context = lookup.get("context") or ""
     diagnostics = lookup.get("diagnostics") or {}
+    answer_contract = lookup.get("answer_contract") or {}
 
     knowledge_source = knowledge_result
     if knowledge_source is None:
@@ -416,6 +466,23 @@ def main(lookup_body=None, knowledge_result=None, knowledge_context=None, knowle
         else:
             knowledge_blocks.append(f"[knowledge {index}]\n{item}")
 
+    required_values = answer_contract.get("required_values") or []
+    contract_lines = [
+        "[Answer Contract - obey before writing]",
+        f"status: {answer_contract.get('status', '')}",
+        f"priority: {answer_contract.get('priority', '')}",
+        f"query_type: {answer_contract.get('query_type', '')}",
+        f"answerable: {answer_contract.get('answerable')}",
+    ]
+    if answer_contract.get("answer_candidate"):
+        contract_lines.append(f"answer_candidate: {answer_contract.get('answer_candidate')}")
+    if required_values:
+        contract_lines.append("required_values:")
+        contract_lines.extend(f"- {value}" for value in required_values)
+    if answer_contract.get("instruction"):
+        contract_lines.append(f"Instruction: {answer_contract.get('instruction')}")
+    answer_contract_text = "\n".join(line for line in contract_lines if line)
+
     structured_block = (
         "[Structured Lookup - authoritative exact evidence]\n"
         "Use this first for table, list, field, value, number, date, identifier, and policy questions.\n"
@@ -429,7 +496,7 @@ def main(lookup_body=None, knowledge_result=None, knowledge_context=None, knowle
         if knowledge_blocks
         else ""
     )
-    evidence_context = "\n\n".join(part for part in [structured_block, knowledge_block] if part)
+    evidence_context = "\n\n".join(part for part in [answer_contract_text, structured_block, knowledge_block] if part)
     evidence_priority = (
         "Use Structured Lookup first. Knowledge Retrieval is supplementary and may be empty or less specific."
         if structured_context
@@ -441,6 +508,8 @@ def main(lookup_body=None, knowledge_result=None, knowledge_context=None, knowle
         "knowledge_context": "\n\n".join(knowledge_blocks),
         "evidence_context": evidence_context,
         "evidence_priority": evidence_priority,
+        "answer_contract": json.dumps(answer_contract, ensure_ascii=False),
+        "answer_contract_text": answer_contract_text,
         "lookup_diagnostics": json.dumps(diagnostics, ensure_ascii=False),
         "lookup_answerability": json.dumps(diagnostics.get("answerability") or {}, ensure_ascii=False),
     }
@@ -453,6 +522,8 @@ structured_context: string
 knowledge_context: string
 evidence_context: string
 evidence_priority: string
+answer_contract: string
+answer_contract_text: string
 lookup_diagnostics: string
 lookup_answerability: string
 ```
@@ -493,6 +564,9 @@ Sub queries:
 Structured lookup answerability:
 {{Merge Evidence.lookup_answerability}}
 
+Answer contract:
+{{Merge Evidence.answer_contract_text}}
+
 Evidence priority:
 {{Merge Evidence.evidence_priority}}
 
@@ -504,6 +578,7 @@ Use only the provided evidence.
 Structured Lookup is authoritative exact evidence from parsed tables, records, and field-value pairs.
 If Structured Lookup contains an answer_candidate or directly relevant evidence, answer from Structured Lookup even when Knowledge Retrieval is empty, broad, or less specific.
 If evidence contains "[Direct Answer - complete structured result]" and "complete_values", include every value in complete_values exactly once. Do not omit values from complete_values and do not add values that are not listed there.
+If Answer contract contains required_values, include every required value exactly once before adding any supplementary explanation.
 Use Knowledge Retrieval only as supplementary context.
 For table, list, field, value, number, date, identifier, and policy questions, do not ignore Structured Lookup just because Knowledge Retrieval has no exact match.
 When evidence contains labels, table headers, page numbers, section names, or record metadata, use them to avoid mixing unrelated values.
@@ -854,10 +929,12 @@ Answer in Korean.
 
 ```text
 multipart/form-data
-pdf 또는 file: PDF 파일
+file: PDF/TXT/Markdown/DOCX/CSV/TSV 파일
 document_id: optional
 file_name: optional
 ```
+
+기존 호환용으로 `pdf` 필드도 받는다.
 
 응답 핵심 필드:
 
@@ -884,7 +961,7 @@ file_name: optional
 
 ### 4.2 POST /rag/ingest-markdown
 
-PDF 변환을 거치지 않고 이미 정제된 Markdown을 RAG artifact로 저장할 때 사용한다. 자동 평가나 외부 Markdown 변환기를 붙일 때 유용하다.
+파일 업로드를 거치지 않고 이미 정제된 Markdown을 RAG artifact로 저장할 때 사용한다. 자동 평가나 외부 Markdown 변환기를 붙일 때 유용하다.
 
 요청:
 
@@ -954,7 +1031,43 @@ Dify에서는 일단 `context`만 써도 된다. 디버깅할 때는 `direct_ans
 }
 ```
 
-### 4.6 POST /chatflow/debug
+### 4.6 POST /chatflow/merge-evidence
+
+Dify `Merge Evidence` HTTP 노드에서 사용한다. `Structured Lookup.body`와 `Knowledge Retrieval.result`를 받아 최종 LLM에 넣을 근거 패키지를 만든다.
+
+요청:
+
+```json
+{
+  "lookup_body": {
+    "query": "전공심화 개설 학과 알려줘",
+    "direct_answer": "개설 학과: 컴퓨터정보공학과, 기계공학과",
+    "answer_contract": {
+      "required_values": ["컴퓨터정보공학과", "기계공학과"]
+    },
+    "context": "..."
+  },
+  "knowledge_result": []
+}
+```
+
+응답 핵심 필드:
+
+```json
+{
+  "structured_context": "...",
+  "knowledge_context": "...",
+  "evidence_context": "...",
+  "evidence_priority": "Use Structured Lookup first...",
+  "answer_contract": "{...}",
+  "answer_contract_text": "[Answer Contract - obey before writing]\\n...",
+  "lookup_answerability": "{...}"
+}
+```
+
+`answer_contract_text`와 `evidence_context`를 Final Answer LLM 프롬프트에 둘 다 연결한다.
+
+### 4.7 POST /chatflow/debug
 
 Dify UI에서 답변이 이상할 때 같은 질문으로 API 쪽 흐름을 먼저 확인한다.
 
@@ -981,7 +1094,7 @@ supplied_answer_verification.valid == false
 
 위 값이 맞으면 FastAPI의 structured lookup, evidence merge, verifier는 정상이다. 그 상태에서 Dify 답변만 실패하면 `Merge Evidence` 코드가 최신인지, `evidence_priority` 출력 변수를 만들었는지, Final Answer LLM User Prompt에 `Evidence priority`와 `Evidence`가 둘 다 연결됐는지 확인한다.
 
-### 4.7 POST /eval/log
+### 4.8 POST /eval/log
 
 Dify 실제 실행 trace를 로컬 JSONL로 저장한다. 요청 body는 자유 형식이며, API가 `run_id`, `created_at`, `_http`, `size`를 추가한다.
 
@@ -1024,7 +1137,9 @@ GET /eval/logs/{run_id}
 ```powershell
 curl.exe http://127.0.0.1:8000/health
 
-curl.exe -F "pdf=@2026학년도 입학전형 신입생 모집요강.pdf" -F "document_id=sample_2026" -F "file_name=2026_admission.pdf" http://127.0.0.1:8000/convert/rag
+curl.exe -F "file=@2026학년도 입학전형 신입생 모집요강.pdf" -F "document_id=sample_2026" -F "file_name=2026_admission.pdf" http://127.0.0.1:8000/convert/rag
+
+curl.exe -F "file=@manual.md" -F "document_id=manual" http://127.0.0.1:8000/convert/rag
 
 curl.exe -H "Content-Type: application/json" -d "{\"query\":\"컴퓨터정보공학과 모집인원 알려줘\"}" http://127.0.0.1:8000/query/plan
 

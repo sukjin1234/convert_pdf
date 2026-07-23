@@ -85,6 +85,7 @@ class LookupResponse(BaseModel):
     answer_items: list[dict[str, Any]] = Field(default_factory=list)
     answer_field: str = ""
     filter_terms: list[str] = Field(default_factory=list)
+    answer_contract: dict[str, Any] = Field(default_factory=dict)
     matches: list[dict[str, Any]] = Field(default_factory=list)
     context: str = ""
     evidence_items: list[dict[str, Any]] = Field(default_factory=list)
@@ -119,10 +120,29 @@ class ChatflowDebugRequest(BaseModel):
     answer: str | None = None
 
 
+class MergeEvidenceRequest(BaseModel):
+    lookup_body: Any = None
+    knowledge_result: Any = None
+    knowledge_context: Any = None
+    knowledge_body: Any = None
+
+
+class MergeEvidenceResponse(BaseModel):
+    structured_context: str = ""
+    knowledge_context: str = ""
+    evidence_context: str = ""
+    evidence_priority: str = ""
+    answer_contract: str = ""
+    answer_contract_text: str = ""
+    lookup_diagnostics: str = ""
+    lookup_answerability: str = ""
+
+
 class ChatflowDebugResponse(BaseModel):
     query_plan: dict[str, Any]
     structured_lookup: dict[str, Any]
     merge_evidence: dict[str, str]
+    answer_contract: dict[str, Any] = Field(default_factory=dict)
     draft_answer: str
     draft_verification: dict[str, Any]
     supplied_answer_verification: dict[str, Any] | None = None
@@ -235,6 +255,16 @@ async def answer_verify(request: VerifyRequest) -> VerifyResponse:
     return VerifyResponse(**verify_answer(request.question, request.answer, request.evidence))
 
 
+@app.post("/chatflow/merge-evidence", response_model=MergeEvidenceResponse)
+async def chatflow_merge_evidence(request: MergeEvidenceRequest) -> MergeEvidenceResponse:
+    knowledge_source = request.knowledge_result
+    if knowledge_source is None:
+        knowledge_source = request.knowledge_context
+    if knowledge_source is None:
+        knowledge_source = request.knowledge_body
+    return MergeEvidenceResponse(**merge_evidence_context(request.lookup_body, knowledge_source))
+
+
 @app.post("/chatflow/debug", response_model=ChatflowDebugResponse)
 async def chatflow_debug(request: ChatflowDebugRequest) -> ChatflowDebugResponse:
     limit = max(1, min(request.limit, 30))
@@ -258,6 +288,7 @@ async def chatflow_debug(request: ChatflowDebugRequest) -> ChatflowDebugResponse
         query_plan=plan,
         structured_lookup=lookup_result,
         merge_evidence=merged,
+        answer_contract=lookup_result.get("answer_contract") or {},
         draft_answer=draft_answer,
         draft_verification=draft_verification,
         supplied_answer_verification=supplied_verification,

@@ -1,6 +1,6 @@
 import unittest
 
-from app.rag import build_rag_artifact, extract_keywords, lookup_matches, plan_query, verify_answer
+from app.rag import build_rag_artifact, extract_keywords, lookup_matches, merge_evidence_context, plan_query, verify_answer
 
 
 class RagPipelineTest(unittest.TestCase):
@@ -249,6 +249,12 @@ class RagPipelineTest(unittest.TestCase):
         self.assertNotIn("산업디자인학과", result["direct_answer"])
         self.assertIn("[Direct Answer - complete structured result]", result["context"])
         self.assertIn("complete_values:", result["context"])
+        self.assertEqual(result["answer_contract"]["status"], "direct_answer")
+        self.assertEqual(result["answer_contract"]["priority"], "structured_lookup")
+        self.assertEqual(
+            result["answer_contract"]["required_values"],
+            ["컴퓨터정보공학과", "기계공학과", "간호학과"],
+        )
 
         incomplete = verify_answer(
             "전공심화 개설 학과 알려줘",
@@ -257,6 +263,43 @@ class RagPipelineTest(unittest.TestCase):
         )
         self.assertFalse(incomplete["valid"])
         self.assertTrue(any(issue["type"] == "missing_direct_answer_value" for issue in incomplete["issues"]))
+
+    def test_merge_evidence_preserves_answer_contract_and_nested_knowledge_result(self):
+        lookup = {
+            "query": "전공심화 개설 학과 알려줘",
+            "query_type": "table_lookup",
+            "answer_style": "table_or_bullets",
+            "direct_answer": "개설 학과: 컴퓨터정보공학과, 기계공학과",
+            "answer_field": "개설 학과",
+            "filter_terms": ["전공심화"],
+            "answer_items": [
+                {"value": "컴퓨터정보공학과"},
+                {"value": "기계공학과"},
+            ],
+            "context": "[Direct Answer - complete structured result]\ncomplete_values:\n- 컴퓨터정보공학과\n- 기계공학과",
+            "diagnostics": {"answerability": {"answerable": True}},
+        }
+        knowledge_result = {
+            "data": {
+                "records": [
+                    {
+                        "segment": {
+                            "content": "전공심화 과정은 야간 수업으로 운영됩니다.",
+                            "metadata": {"file_name": "admission.md", "page": 4},
+                        },
+                        "score": 0.91,
+                    }
+                ]
+            }
+        }
+
+        merged = merge_evidence_context(lookup, knowledge_result)
+
+        self.assertIn("[Answer Contract - obey before writing]", merged["evidence_context"])
+        self.assertIn("required_values:", merged["answer_contract_text"])
+        self.assertIn("- 컴퓨터정보공학과", merged["answer_contract_text"])
+        self.assertIn("[knowledge 1] source=admission.md page=4 score=0.91", merged["knowledge_context"])
+        self.assertIn("전공심화 과정은 야간 수업으로 운영됩니다.", merged["evidence_context"])
 
     def test_marker_legend_rows_build_complete_direct_answer(self):
         artifact = build_rag_artifact(

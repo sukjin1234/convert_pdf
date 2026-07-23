@@ -1,3 +1,4 @@
+import json
 import unittest
 import tempfile
 import zipfile
@@ -309,6 +310,33 @@ class ConverterTest(unittest.TestCase):
 
             with self.assertRaises(ConversionError):
                 _read_rendered_markdown(output_dir)
+
+    def test_rendered_markdown_uses_json_layout_pairs_for_card_grid(self):
+        doc = {
+            "kids": [
+                {"type": "heading", "page number": 1, "bounding box": [70, 700, 210, 735], "font size": 26, "content": "국토교통부"},
+                {"type": "heading", "page number": 1, "bounding box": [305, 700, 500, 735], "font size": 26, "content": "산업통상자원부"},
+                {"type": "heading", "page number": 1, "bounding box": [560, 700, 690, 735], "font size": 26, "content": "교육부"},
+                {"type": "paragraph", "page number": 1, "bounding box": [50, 610, 230, 650], "font size": 15, "content": "공간정보 특성화 전문대학"},
+                {"type": "paragraph", "page number": 1, "bounding box": [320, 590, 500, 655], "font size": 15, "content": "창의융합형 공학인재 양성지원사업"},
+                {"type": "paragraph", "page number": 1, "bounding box": [570, 590, 700, 655], "font size": 15, "content": "고교 장애학생 대학체험지원"},
+            ]
+        }
+        bad_markdown = (
+            "--- Page 1 ---\n\n"
+            "국토교통부\n\n산업통상자원부\n\n교육부\n\n"
+            "공간정보 특성화 전문대학\n\n창의융합형 공학인재 양성지원사업\n\n고교 장애학생 대학체험지원\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "out.md").write_text(bad_markdown, encoding="utf-8")
+            (output_dir / "out.json").write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+            result = _read_rendered_markdown(output_dir)
+
+        self.assertIn("| 국토교통부 | 공간정보 특성화 전문대학 |", result)
+        self.assertIn("| 산업통상자원부 | 창의융합형 공학인재 양성지원사업 |", result)
+        self.assertLess(result.index("공간정보 특성화 전문대학"), result.index("산업통상자원부"))
 
     def test_reads_native_markdown_with_page_order_and_tables(self):
         markdown = "\n\n--- Page 26 ---\n\n| Category | Unit |\n| --- | --- |\n| Engineering | Free Major |\n"
