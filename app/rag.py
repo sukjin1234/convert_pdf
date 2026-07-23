@@ -70,9 +70,9 @@ TABLE_RECORD_TYPES = {
 }
 
 VALUE_FIELD_RE = re.compile(
-    r"수량|개수|건수|횟수|인원|정원|모집인원|한도|제한|임계값|기준값|금액|비용|가격|예산|매출|원가|단가|"
+    r"값|수량|개수|건수|횟수|인원|정원|모집인원|한도|제한|임계값|기준값|금액|비용|가격|예산|매출|원가|단가|"
     r"점수|등급|비율|율|퍼센트|기간|날짜|일자|시간|기한|마감|상태|버전|코드|식별자|연락처|이메일|전화|"
-    r"count|quantity|capacity|limit|threshold|amount|cost|price|budget|revenue|score|grade|rate|ratio|"
+    r"value|count|quantity|capacity|limit|threshold|amount|cost|price|budget|revenue|score|grade|rate|ratio|"
     r"percent|date|time|deadline|duration|status|version|code|id|identifier|email|phone|contact",
     re.IGNORECASE,
 )
@@ -82,6 +82,8 @@ IDENTIFIER_RE = re.compile(
     r"|(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9._%+-])"
     r"|(?<![A-Za-z0-9_])(?:[A-Z]{2,}-)?\d{3,}[A-Z0-9_-]*(?![A-Za-z0-9_])"
 )
+EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9._%+-])")
+PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)\d{3,4}[-.\s]?\d{4}(?!\d)")
 
 ABSTENTION_RE = re.compile(
     r"충분한\s*근거|근거가\s*(?:부족|충분하지)|정보가\s*(?:없|부족)|"
@@ -137,9 +139,21 @@ GENERIC_LIST_TERMS = {
     "supported",
 }
 MARKER_METADATA_FIELDS = {"표시", "표시 의미", "표시 대상 필드"}
+FIELD_ALIAS_GROUPS = [
+    {"해결", "해결방법", "조치", "대응", "복구", "resolution", "resolve", "remediation", "action"},
+    {"원인", "사유", "cause", "reason"},
+    {"의존", "의존성", "연동", "dependency", "dependencies", "depends", "integration"},
+    {"이메일", "메일", "email", "e-mail"},
+    {"전화", "전화번호", "연락처", "문의", "phone", "tel", "contact"},
+    {"자격", "조건", "요건", "대상", "필수", "eligibility", "requirement", "condition"},
+    {"절차", "방법", "순서", "단계", "처리", "procedure", "process", "step"},
+    {"일정", "기간", "날짜", "일자", "일시", "마감", "기한", "schedule", "date", "period", "deadline", "time"},
+    {"값", "숫자", "수량", "인원", "정원", "한도", "점수", "금액", "value", "amount", "count", "quantity", "limit", "score"},
+    {"내용", "설명", "정책", "규정", "비고", "content", "detail", "description", "policy", "note"},
+]
 
 CONCEPT_TERMS = {
-    "storage": ["저장공간", "저장 공간", "스토리지", "용량", "storage", "space", "quota"],
+    "storage": ["저장공간", "저장 공간", "스토리지", "용량", "storage", "storage space", "storage limit", "storage quota", "quota"],
     "compensation": ["연봉", "급여", "임금", "보상", "인상률", "salary", "compensation", "raise"],
     "backup": ["백업", "backup", "restore", "복구"],
     "database": ["데이터베이스", "database", "db"],
@@ -1190,7 +1204,189 @@ def expand_tables_to_records(
         output.append("표시/범례 기반 구조화 레코드:")
         output.extend(build_record_text(record) for record in plain_marker_records)
 
+    plain_text_records = extract_plain_text_records(
+        lines,
+        document_id=document_id,
+        file_name=file_name,
+        page=page,
+        section_path=section_path,
+        table_index=table_index + 1 + (1 if plain_marker_records else 0),
+    )
+    if plain_text_records:
+        records.extend(plain_text_records)
+        output.append("")
+        output.append("본문 구조화 레코드:")
+        output.extend(build_record_text(record) for record in plain_text_records)
+
     return normalize_markdown("\n".join(output)), records
+
+
+def extract_plain_text_records(
+    lines: list[str],
+    *,
+    document_id: str,
+    file_name: str,
+    page: int | None,
+    section_path: str,
+    table_index: int,
+) -> list[StructuredRecord]:
+    records: list[StructuredRecord] = []
+    for line_index, raw_line in enumerate(lines, start=1):
+        line = clean_plain_text_line(raw_line)
+        if not line or should_skip_plain_text_record_line(raw_line, line):
+            continue
+
+        fields = plain_text_fields(line, section_path)
+        if not fields:
+            continue
+
+        record_type = classify_record(fields, line)
+        keywords = extract_keywords(" ".join([section_path, line, " ".join(fields), " ".join(fields.values())]), limit=12)
+        records.append(
+            StructuredRecord(
+                record_id=f"{_safe_id(document_id)}_p{page or 0:03d}_x{table_index:02d}_r{line_index:03d}",
+                record_type=record_type,
+                document_id=document_id,
+                file_name=file_name,
+                chunk_id="",
+                page=page,
+                section_path=section_path,
+                fields=fields,
+                source_text=line,
+                answer_text=row_to_sentence(fields),
+                keywords=keywords,
+            )
+        )
+    return records
+
+
+def clean_plain_text_line(line: str) -> str:
+    cleaned = clean_cell(line)
+    cleaned = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", cleaned)
+    return clean_cell(cleaned)
+
+
+def should_skip_plain_text_record_line(raw_line: str, line: str) -> bool:
+    stripped = raw_line.strip()
+    if HEADING_RE.match(stripped) or looks_like_table_row(stripped) or is_marker_legend_line(stripped):
+        return True
+    if line in {"표 행 설명 및 구조화 레코드:", "표시/범례 기반 구조화 레코드:", "본문 구조화 레코드:"}:
+        return True
+    if line.startswith("record_id:") or line.startswith("record_type:") or line.startswith("answer_hint:"):
+        return True
+    return False
+
+
+def plain_text_fields(line: str, section_path: str) -> dict[str, str]:
+    emails = unique_keep_order(EMAIL_RE.findall(line))
+    phones = unique_keep_order(PHONE_RE.findall(line))
+    excluded_spans = occupied_scalar_spans(line, [EMAIL_RE, PHONE_RE])
+    identifiers = [
+        identifier
+        for identifier in extract_identifier_values(line)
+        if identifier not in emails and identifier not in phones
+    ]
+    dates = extract_plain_date_values(line, excluded_spans)
+    numbers = extract_plain_number_values(line, excluded_spans)
+    dependencies = extract_dependency_values(line)
+
+    has_structured_signal = bool(emails or phones or identifiers or dates or numbers or dependencies)
+    if not has_structured_signal and not re.search(
+        r"해야\s*한다|하여야\s*한다|이어야\s*한다|여야\s*한다|필수|가능|불가|금지|제외|required|must|shall|should|allowed|forbidden",
+        line,
+        re.IGNORECASE,
+    ):
+        return {}
+
+    fields: dict[str, str] = {}
+    topic = infer_plain_text_topic(line, section_path)
+    if topic:
+        fields["항목"] = topic
+    if emails:
+        fields["이메일"] = ", ".join(emails)
+    if phones:
+        fields["전화번호"] = ", ".join(phones)
+    if dependencies:
+        fields["의존성"] = ", ".join(dependencies)
+    if dates:
+        fields["날짜"] = ", ".join(dates)
+    if numbers:
+        fields["값"] = ", ".join(numbers)
+    if identifiers:
+        fields["식별자"] = ", ".join(identifiers)
+    if re.search(r"자격|요건|조건|필수|required|must|eligible", line, re.IGNORECASE):
+        fields["요건"] = line
+    elif re.search(r"절차|단계|방법|처리|진행|procedure|process|step", line, re.IGNORECASE):
+        fields["절차"] = line
+    else:
+        fields["내용"] = line
+    return fields
+
+
+def occupied_scalar_spans(text: str, patterns: list[re.Pattern[str]]) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for pattern in patterns:
+        spans.extend(match.span() for match in pattern.finditer(text or ""))
+    return spans
+
+
+def extract_plain_date_values(text: str, excluded_spans: list[tuple[int, int]]) -> list[str]:
+    values = []
+    for match in DATE_RE.finditer(text or ""):
+        if span_overlaps(match.span(), excluded_spans):
+            continue
+        normalized = normalize_date_value(match.group(0))
+        if normalized:
+            values.append(normalized)
+    return unique_keep_order(values)
+
+
+def extract_plain_number_values(text: str, excluded_spans: list[tuple[int, int]]) -> list[str]:
+    values = []
+    for match in NUMBER_RE.finditer(text or ""):
+        if span_overlaps(match.span(), excluded_spans):
+            continue
+        raw = clean_cell(match.group(0))
+        if raw:
+            values.append(raw.replace(",", ""))
+    return unique_keep_order(values)
+
+
+def span_overlaps(span: tuple[int, int], excluded_spans: list[tuple[int, int]]) -> bool:
+    start, end = span
+    return any(start < excluded_end and end > excluded_start for excluded_start, excluded_end in excluded_spans)
+
+
+def infer_plain_text_topic(line: str, section_path: str) -> str:
+    match = re.match(r"^(.{2,80}?)(?:은|는|이|가)\s+", line)
+    if match:
+        topic = clean_cell(match.group(1))
+        if topic and not looks_like_numeric_or_date(topic):
+            return topic
+    section_tail = clean_cell(section_path.split(">")[-1] if section_path else "")
+    return section_tail
+
+
+def extract_dependency_values(line: str) -> list[str]:
+    values: list[str] = []
+    patterns = [
+        re.compile(r"(?:은|는)\s*(?P<value>.+?)(?:에\s*)?의존(?:한다|합니다|함|한다\.)", re.IGNORECASE),
+        re.compile(r"depends\s+on\s+(?P<value>.+?)(?:\.|$)", re.IGNORECASE),
+    ]
+    for pattern in patterns:
+        for match in pattern.finditer(line):
+            raw_value = re.sub(r"(?:에\s*)?의존.*$", "", clean_cell(match.group("value")))
+            values.extend(split_dependency_value(raw_value))
+    return unique_exact_keep_order(values)
+
+
+def split_dependency_value(value: str) -> list[str]:
+    parts = [
+        clean_cell(part)
+        for part in re.split(r"\s*(?:,|/| 및 |와 |과 | and |&)\s*", value)
+        if clean_cell(part)
+    ]
+    return [part for part in parts if len(normalize_for_match(part)) >= 2]
 
 
 def extract_plain_marker_records(
@@ -1935,7 +2131,14 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
     answer_style = classify_answer_style(query, query_type)
     should_build_keyed_list = query_type == "table_lookup" or answer_style == "table_or_bullets"
     should_build_boolean_matrix = query_type in {"condition_lookup", "table_lookup"} or answer_style == "table_or_bullets"
-    should_build_field_value = query_type in {"number_lookup", "date_lookup", "contact_lookup"} or answer_style == "direct"
+    should_build_field_value = query_type in {
+        "number_lookup",
+        "date_lookup",
+        "contact_lookup",
+        "dependency_lookup",
+        "troubleshooting",
+        "procedure",
+    } or answer_style == "direct"
     should_build_inverse_list = should_build_keyed_list or looks_like_inverse_value_question(query)
     should_build_marker_meaning = looks_like_marker_meaning_question(query)
     if not should_build_keyed_list and not should_build_boolean_matrix and not should_build_field_value and not should_build_inverse_list and not should_build_marker_meaning:
@@ -2613,7 +2816,22 @@ def term_matches_key(term: str, key: str) -> bool:
             or (term_compact and key_compact and (term_compact in key_compact or key_compact in term_compact))
             or all(token in key_norm for token in term_norm.split() if len(token) >= 2)
         )
-    )
+    ) or field_alias_match(term_norm, key_norm)
+
+
+def field_alias_match(term_norm: str, key_norm: str) -> bool:
+    if not term_norm or not key_norm:
+        return False
+    term_compact = term_norm.replace(" ", "")
+    key_compact = key_norm.replace(" ", "")
+    for aliases in FIELD_ALIAS_GROUPS:
+        alias_norms = {normalize_for_match(alias) for alias in aliases}
+        alias_compacts = {alias.replace(" ", "") for alias in alias_norms}
+        term_hit = term_norm in alias_norms or term_compact in alias_compacts
+        key_hit = key_norm in alias_norms or key_compact in alias_compacts
+        if term_hit and key_hit:
+            return True
+    return False
 
 
 def filter_matches_by_row_terms(matches: list[dict[str, Any]], filter_terms: list[str], *, exclude_keys: set[str]) -> list[dict[str, Any]]:
@@ -2744,7 +2962,6 @@ def assess_answerability(
                 str(match.get("answer") or match.get("answer_hint") or ""),
                 str(match.get("evidence") or ""),
                 str(match.get("supporting_context") or ""),
-                " ".join(str(term) for term in match.get("matched_terms", [])),
             ]
         )
         for match in matches
@@ -2948,6 +3165,7 @@ def format_lookup_context(matches: list[dict[str, Any]], direct_answer: dict[str
     used_chars = 0
     direct_block = format_direct_answer_context(direct_answer or {})
     has_direct_answer = bool(direct_block)
+    include_supporting_context = should_include_supporting_context_with_direct_answer(direct_answer or {})
     if direct_block:
         blocks.append(direct_block)
         used_chars += len(direct_block) + 2
@@ -2967,7 +3185,7 @@ def format_lookup_context(matches: list[dict[str, Any]], direct_answer: dict[str
                 f"[reason: {match.get('reason', '')}]",
                 f"answer_candidate: {match['answer'] or match['answer_hint']}",
                 f"evidence:\n{evidence}",
-                f"supporting_context:\n{supporting_context}" if supporting_context and not has_direct_answer else "",
+                f"supporting_context:\n{supporting_context}" if supporting_context and (include_supporting_context or not has_direct_answer) else "",
             ]
         ).strip()
         if used_chars and used_chars + len(block) > CONTEXT_CHAR_BUDGET:
@@ -2980,6 +3198,15 @@ def format_lookup_context(matches: list[dict[str, Any]], direct_answer: dict[str
         if used_chars >= CONTEXT_CHAR_BUDGET:
             break
     return "\n\n".join(blocks)
+
+
+def should_include_supporting_context_with_direct_answer(direct_answer: dict[str, Any]) -> bool:
+    if not direct_answer.get("direct_answer"):
+        return False
+    if direct_answer.get("mode") != "field_value":
+        return False
+    answer_field = clean_cell(direct_answer.get("answer_field", ""))
+    return bool(re.search(r"resolution|해결|조치|절차|내용|방법", answer_field, re.IGNORECASE))
 
 
 def format_direct_answer_context(direct_answer: dict[str, Any]) -> str:

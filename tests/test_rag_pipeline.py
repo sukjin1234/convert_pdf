@@ -679,6 +679,54 @@ API 키 교체 후에는 감사 로그에서 발급자를 확인해야 한다.
         self.assertIn("감사 로그", result["context"])
         self.assertGreater(result["diagnostics"]["average_coverage"], 0)
 
+    def test_plain_text_scalar_contact_and_dependency_records_build_direct_answers(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# 운영 런북
+
+고객 영향이 있으면 status page를 15분 이내 갱신한다.
+입학처 연락처는 admission@example.ac.kr이며 전화번호는 02-123-4567이다.
+Billing API는 Payment Gateway와 Fraud Service에 의존한다.
+AUTH_401 오류는 Reissue API key로 해결한다.
+""",
+            "runbook.md",
+            document_id="doc_plain_text_records",
+        )
+
+        status_page = lookup_matches(
+            query="status page는 몇 분 이내 갱신해?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        contact = lookup_matches(
+            query="입학처 이메일 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        dependency = lookup_matches(
+            query="Billing API 의존성은 뭐야?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        resolution = lookup_matches(
+            query="AUTH_401 해결 방법 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+
+        self.assertIn("값: 15분", status_page["direct_answer"])
+        self.assertIn("이메일: admission@example.ac.kr", contact["direct_answer"])
+        self.assertIn("Payment Gateway", dependency["direct_answer"])
+        self.assertIn("Fraud Service", dependency["direct_answer"])
+        self.assertIn("Reissue API key", resolution["context"])
+        self.assertTrue(any(item["record_type"] == "troubleshooting" for item in resolution["matches"]))
+
     def test_verify_rejects_unsupported_identifier(self):
         result = verify_answer(
             "AUTH_401 해결 방법 알려줘",
