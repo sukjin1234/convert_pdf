@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
@@ -762,7 +763,7 @@ def _convert_pdf_file(
 def _convert_pdf_file_native(input_path: Path, output_dir: Path, settings: Settings) -> str:
     output_dir.mkdir()
     command = build_opendataloader_native_command(input_path, output_dir, settings)
-    _run_command(command, settings.conversion_timeout_seconds)
+    _run_command(command, settings)
     return _read_generated_markdown(output_dir)
 
 
@@ -782,7 +783,7 @@ def _convert_pdf_file_hybrid(
         hybrid_mode=hybrid_mode,
         image_output=image_output,
     )
-    _run_command(command, settings.conversion_timeout_seconds)
+    _run_command(command, settings)
     return _read_rendered_markdown(output_dir)
 
 
@@ -860,7 +861,33 @@ def build_opendataloader_native_command(input_path: Path, output_dir: Path, sett
     return command
 
 
-def _run_command(command: Sequence[str], timeout_seconds: int) -> None:
+def _run_command(command: Sequence[str], settings: Settings) -> None:
+    attempt = 1
+    while True:
+        try:
+            _run_command_once(command, settings.conversion_timeout_seconds)
+            return
+        except ConversionError as exc:
+            message = str(exc)
+            if not _should_wait_for_ocr_resources(message, settings, attempt):
+                raise
+
+            delay = min(
+                settings.resource_retry_interval_seconds * attempt,
+                settings.resource_retry_max_interval_seconds,
+            )
+            logger.warning(
+                "OpenDataLoader OCR resources are unavailable; waiting before retry. attempt=%s delay_seconds=%s max_attempts=%s reason=%s",
+                attempt,
+                delay,
+                settings.resource_retry_max_attempts or "unlimited",
+                message,
+            )
+            time.sleep(delay)
+            attempt += 1
+
+
+def _run_command_once(command: Sequence[str], timeout_seconds: int) -> None:
     env = os.environ.copy()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     kwargs = {
@@ -891,13 +918,62 @@ def _run_command(command: Sequence[str], timeout_seconds: int) -> None:
         raise ConversionError(f"OpenDataLoader conversion failed: {detail}" if detail else "OpenDataLoader conversion failed.")
 
 
+def _should_wait_for_ocr_resources(message: str, settings: Settings, attempt: int) -> bool:
+    if not settings.resource_retry_enabled:
+        return False
+    if settings.resource_retry_max_attempts and attempt >= settings.resource_retry_max_attempts:
+        return False
+    return _is_retryable_ocr_resource_error(message)
+
+
+def _is_retryable_ocr_resource_error(message: str) -> bool:
+    lowered = (message or "").lower()
+    patterns = [
+        "gpu memory exhausted",
+        "cuda out of memory",
+        "outofmemoryerror",
+        "out of memory",
+        "resource exhausted",
+        "insufficient memory",
+        "not enough memory",
+        "nccl",
+        "data parallel",
+        "too many requests",
+        "rate limit",
+        "server busy",
+        "service unavailable",
+        "busy or unavailable",
+        "503",
+        "429",
+        "connection refused",
+        "connection reset",
+        "failed to establish",
+        "max retries exceeded",
+        "temporarily unavailable",
+        "resource temporarily unavailable",
+        "hybrid backend unavailable",
+        "ocr server unavailable",
+    ]
+    return any(pattern in lowered for pattern in patterns)
+
+
 def _summarize_command_failure(stdout: str, stderr: str) -> str:
     output = f"{stdout}\n{stderr}"
     lowered = output.lower()
     if "cuda out of memory" in lowered:
         return "GPU memory exhausted during OCR."
+    if "outofmemoryerror" in lowered or "out of memory" in lowered or "not enough memory" in lowered:
+        return "memory exhausted during OCR."
+    if "resource exhausted" in lowered or "temporarily unavailable" in lowered:
+        return "OCR resources are temporarily unavailable."
     if "nccl error" in lowered:
         return "GPU NCCL/DataParallel error during OCR."
+    if "connection refused" in lowered or "failed to establish" in lowered or "max retries exceeded" in lowered:
+        return "OCR hybrid backend is not reachable."
+    if "503" in lowered or "service unavailable" in lowered or "server busy" in lowered:
+        return "OCR hybrid backend is busy or unavailable."
+    if "429" in lowered or "too many requests" in lowered or "rate limit" in lowered:
+        return "OCR hybrid backend rate limit or queue is full."
     if "permission denied" in lowered:
         return "permission denied while reading or writing conversion files."
     lines = [line.strip() for line in output.splitlines() if line.strip()]

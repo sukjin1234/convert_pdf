@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from pydantic import BaseModel, Field
 
-from .config import get_settings
+from .config import Settings, get_settings
 from .converter import DocumentConverter
 from .eval_logs import EVAL_LOG_STORE
 from .rag import (
@@ -24,11 +28,26 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Dify OpenDataLoader RAG API")
+CONVERSION_LOCK = asyncio.Lock()
+CONVERSION_LOCK_POLL_SECONDS = 2
 
 
 class ConvertResponse(BaseModel):
     success: bool
     markdown: str
+
+
+class ConvertBatchItem(BaseModel):
+    success: bool
+    file_name: str = ""
+    markdown: str = ""
+    error: str = ""
+
+
+class ConvertBatchResponse(BaseModel):
+    success: bool
+    files: list[ConvertBatchItem] = Field(default_factory=list)
+    error: str = ""
 
 
 class ConvertRagResponse(BaseModel):
@@ -41,6 +60,12 @@ class ConvertRagResponse(BaseModel):
     records: list[dict[str, Any]] = Field(default_factory=list)
     document_map: list[dict[str, Any]] = Field(default_factory=list)
     stats: dict[str, Any] = Field(default_factory=dict)
+    error: str = ""
+
+
+class ConvertRagBatchResponse(BaseModel):
+    success: bool
+    files: list[ConvertRagResponse] = Field(default_factory=list)
     error: str = ""
 
 
@@ -156,11 +181,127 @@ def _select_upload(*uploads: Any) -> UploadFile | None:
     return None
 
 
+def _upload_list(value: Any) -> list[UploadFile]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [upload for upload in value if upload is not None and hasattr(upload, "read") and hasattr(upload, "filename")]
+    if hasattr(value, "read") and hasattr(value, "filename"):
+        return [value]
+    return []
+
+
+def _select_uploads(*uploads: Any) -> list[UploadFile]:
+    selected: list[UploadFile] = []
+    for upload in uploads:
+        selected.extend(_upload_list(upload))
+    return selected
+
+
 def _optional_form_text(value: Any) -> str | None:
     if isinstance(value, str):
         stripped = value.strip()
         return stripped or None
     return None
+
+
+def _optional_form_text_at(value: Any, index: int) -> str | None:
+    if isinstance(value, list):
+        if index >= len(value):
+            return None
+        return _optional_form_text(value[index])
+    return _optional_form_text(value)
+
+
+async def _convert_upload_to_markdown(upload: UploadFile, source_file_name: str | None = None) -> ConvertBatchItem:
+    content = await upload.read()
+    safe_file_name = source_file_name or upload.filename or "document"
+    async with CONVERSION_LOCK:
+        logger.info("Starting queued document conversion. file=%s bytes=%s", safe_file_name, len(content))
+        markdown = await asyncio.to_thread(_convert_bytes_with_process_lock, content, safe_file_name)
+        logger.info("Finished queued document conversion. file=%s chars=%s", safe_file_name, len(markdown))
+    return ConvertBatchItem(success=True, file_name=safe_file_name, markdown=markdown)
+
+
+async def _convert_upload_to_rag(
+    upload: UploadFile,
+    *,
+    document_id: str | None = None,
+    source_file_name: str | None = None,
+) -> ConvertRagResponse:
+    content = await upload.read()
+    safe_file_name = source_file_name or upload.filename or "document"
+    async with CONVERSION_LOCK:
+        logger.info("Starting queued RAG conversion. file=%s bytes=%s document_id=%s", safe_file_name, len(content), document_id or "")
+        markdown = await asyncio.to_thread(_convert_bytes_with_process_lock, content, safe_file_name)
+        artifact = build_rag_artifact(markdown, safe_file_name, document_id=document_id)
+        STORE.upsert(artifact)
+        logger.info(
+            "Finished queued RAG conversion. file=%s document_id=%s chunks=%s records=%s",
+            safe_file_name,
+            artifact.document_id,
+            artifact.stats.get("chunk_count"),
+            artifact.stats.get("record_count"),
+        )
+    return ConvertRagResponse(**artifact.to_dict())
+
+
+def _convert_bytes_with_process_lock(content: bytes, source_file_name: str) -> str:
+    settings = get_settings()
+    with _conversion_process_lock(settings):
+        converter = DocumentConverter(settings)
+        return converter.convert_bytes(content, source_file_name)
+
+
+@contextmanager
+def _conversion_process_lock(settings: Settings):
+    lock_path = _conversion_lock_path(settings)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        _acquire_file_lock(lock_file)
+        try:
+            yield
+        finally:
+            _release_file_lock(lock_file)
+
+
+def _conversion_lock_path(settings: Settings) -> Path:
+    return settings.tmp_root.parent / "conversion.lock"
+
+
+def _acquire_file_lock(lock_file: Any) -> None:
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                lock_file.seek(0)
+                lock_file.write("1")
+                lock_file.flush()
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            time.sleep(CONVERSION_LOCK_POLL_SECONDS)
+
+
+def _release_file_lock(lock_file: Any) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        logger.warning("Could not release conversion process lock cleanly.", exc_info=True)
 
 
 @app.post("/convert", response_model=ConvertResponse)
@@ -173,18 +314,31 @@ async def convert(
         if upload is None:
             raise ValueError("File parameter is required. Use form-data field 'pdf' or 'file'.")
 
-        content = await upload.read()
-        source_file_name = upload.filename or "document"
-        converter = DocumentConverter(get_settings())
-        markdown = await asyncio.to_thread(
-            converter.convert_bytes,
-            content,
-            source_file_name,
-        )
-        return ConvertResponse(success=True, markdown=markdown)
+        converted = await _convert_upload_to_markdown(upload)
+        return ConvertResponse(success=True, markdown=converted.markdown)
     except Exception:
         logger.exception("Document conversion failed")
         return ConvertResponse(success=False, markdown="")
+
+
+@app.post("/convert/batch", response_model=ConvertBatchResponse)
+async def convert_batch(
+    pdfs: list[UploadFile] | None = File(None),
+    files: list[UploadFile] | None = File(None),
+    file_names: list[str] | None = Form(None),
+) -> ConvertBatchResponse:
+    uploads = _select_uploads(pdfs, files)
+    if not uploads:
+        return ConvertBatchResponse(success=False, error="File parameter is required. Use form-data field 'files' or 'pdfs'.")
+
+    results: list[ConvertBatchItem] = []
+    for index, upload in enumerate(uploads):
+        try:
+            results.append(await _convert_upload_to_markdown(upload, _optional_form_text_at(file_names, index)))
+        except Exception as exc:
+            logger.exception("Batch document conversion failed. file=%s", upload.filename)
+            results.append(ConvertBatchItem(success=False, file_name=upload.filename or "document", error=str(exc)))
+    return ConvertBatchResponse(success=all(item.success for item in results), files=results)
 
 
 @app.post("/convert/rag", response_model=ConvertRagResponse)
@@ -199,21 +353,41 @@ async def convert_rag(
         if upload is None:
             raise ValueError("File parameter is required. Use form-data field 'pdf' or 'file'.")
 
-        content = await upload.read()
-        source_file_name = _optional_form_text(file_name) or upload.filename or "document"
-        converter = DocumentConverter(get_settings())
-        markdown = await asyncio.to_thread(
-            converter.convert_bytes,
-            content,
-            source_file_name,
+        return await _convert_upload_to_rag(
+            upload,
+            document_id=_optional_form_text(document_id),
+            source_file_name=_optional_form_text(file_name),
         )
-        artifact = build_rag_artifact(markdown, source_file_name, document_id=_optional_form_text(document_id))
-        STORE.upsert(artifact)
-        payload = artifact.to_dict()
-        return ConvertRagResponse(**payload)
     except Exception as exc:
         logger.exception("Document RAG conversion failed")
         return ConvertRagResponse(success=False, error=str(exc))
+
+
+@app.post("/convert/rag/batch", response_model=ConvertRagBatchResponse)
+async def convert_rag_batch(
+    pdfs: list[UploadFile] | None = File(None),
+    files: list[UploadFile] | None = File(None),
+    document_ids: list[str] | None = Form(None),
+    file_names: list[str] | None = Form(None),
+) -> ConvertRagBatchResponse:
+    uploads = _select_uploads(pdfs, files)
+    if not uploads:
+        return ConvertRagBatchResponse(success=False, error="File parameter is required. Use form-data field 'files' or 'pdfs'.")
+
+    results: list[ConvertRagResponse] = []
+    for index, upload in enumerate(uploads):
+        try:
+            results.append(
+                await _convert_upload_to_rag(
+                    upload,
+                    document_id=_optional_form_text_at(document_ids, index),
+                    source_file_name=_optional_form_text_at(file_names, index),
+                )
+            )
+        except Exception as exc:
+            logger.exception("Batch document RAG conversion failed. file=%s", upload.filename)
+            results.append(ConvertRagResponse(success=False, file_name=upload.filename or "document", error=str(exc)))
+    return ConvertRagBatchResponse(success=all(item.success for item in results), files=results)
 
 
 @app.post("/rag/ingest-markdown", response_model=ConvertRagResponse)

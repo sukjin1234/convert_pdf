@@ -96,6 +96,10 @@ class Settings:
     embedded_image_ocr_min_pixels: int = _env_int("ODL_EMBEDDED_IMAGE_OCR_MIN_PIXELS", 12_000)
     embedded_image_ocr_max_image_bytes: int = _env_int("ODL_EMBEDDED_IMAGE_OCR_MAX_IMAGE_BYTES", 8 * 1024 * 1024)
     embedded_image_ocr_pdf_max_side: int = _env_int("ODL_EMBEDDED_IMAGE_OCR_PDF_MAX_SIDE", 1600)
+    resource_retry_enabled: bool = _env_bool("ODL_RESOURCE_RETRY_ENABLED", True)
+    resource_retry_interval_seconds: int = _env_int("ODL_RESOURCE_RETRY_INTERVAL_SECONDS", 30)
+    resource_retry_max_interval_seconds: int = _env_int("ODL_RESOURCE_RETRY_MAX_INTERVAL_SECONDS", 300)
+    resource_retry_max_attempts: int = _env_int("ODL_RESOURCE_RETRY_MAX_ATTEMPTS", 0)
 
     def validate(self) -> None:
         if self.hybrid_backend.lower() == "off":
@@ -120,6 +124,14 @@ class Settings:
             raise ValueError("ODL_EMBEDDED_IMAGE_OCR_MAX_IMAGE_BYTES must be positive.")
         if self.embedded_image_ocr_pdf_max_side <= 0:
             raise ValueError("ODL_EMBEDDED_IMAGE_OCR_PDF_MAX_SIDE must be positive.")
+        if self.resource_retry_interval_seconds <= 0:
+            raise ValueError("ODL_RESOURCE_RETRY_INTERVAL_SECONDS must be positive.")
+        if self.resource_retry_max_interval_seconds <= 0:
+            raise ValueError("ODL_RESOURCE_RETRY_MAX_INTERVAL_SECONDS must be positive.")
+        if self.resource_retry_max_interval_seconds < self.resource_retry_interval_seconds:
+            raise ValueError("ODL_RESOURCE_RETRY_MAX_INTERVAL_SECONDS must be greater than or equal to ODL_RESOURCE_RETRY_INTERVAL_SECONDS.")
+        if self.resource_retry_max_attempts < 0:
+            raise ValueError("ODL_RESOURCE_RETRY_MAX_ATTEMPTS must be zero or positive.")
 
 
 def get_settings() -> Settings:

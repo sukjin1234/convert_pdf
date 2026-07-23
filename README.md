@@ -7,6 +7,8 @@ OpenDataLoader로 PDF를 Markdown으로 변환하고, TXT/Markdown/DOCX/CSV 같�
 ```text
 POST /convert      문서 파일 -> Markdown
 POST /convert/rag  문서 파일 -> Dify 저장용 Markdown + chunks + records
+POST /convert/batch 여러 문서 파일 -> Markdown, 순차 처리
+POST /convert/rag/batch 여러 문서 파일 -> Dify 저장용 Markdown + chunks + records, 순차 처리
 POST /rag/ingest-markdown Markdown -> RAG artifact 저장
 POST /query/plan   질문 유형/키워드/하위질문/검색어 확장
 POST /lookup       구조화 레코드 exact lookup + evidence packing
@@ -55,6 +57,8 @@ file_name    Text  {{File.file.name}}
 기존 PDF 전용 노드와의 호환을 위해 `pdf` form-data 필드도 계속 받을 수 있습니다. 새로 구성할 때는 `file` 필드를 사용합니다. 현재 지원 형식은 `PDF`, `TXT`, `MD/Markdown`, `DOCX`, `CSV`, `TSV`입니다.
 
 PDF 본문은 기존 변환 경로를 유지하고, PDF 내부 이미지 객체만 따로 추출해 OpenDataLoader OCR로 인식합니다. DOCX에 포함된 이미지는 `word/media`에서 추출한 뒤 임시 PDF로 만들어 같은 OpenDataLoader OCR 경로로 인식합니다. 이미지 OCR 결과는 변환 Markdown의 `Embedded Image OCR` 섹션에 추가됩니다.
+
+변환 요청은 서버 내부에서 하나씩 순차 처리됩니다. Dify가 여러 파일을 동시에 보내도 FastAPI는 앞선 변환이 끝난 뒤 다음 파일을 처리하므로 OCR/GPU 자원 경합을 줄입니다. 한 HTTP 요청에 여러 파일을 보내야 하면 `/convert/batch` 또는 `/convert/rag/batch`에 `files` 또는 `pdfs` form-data 필드를 반복해서 넣습니다.
 
 Chatflow의 JSON/Raw HTTP 노드에서는 다음 헤더만 넣습니다.
 
@@ -128,12 +132,17 @@ ODL_EMBEDDED_IMAGE_OCR_BATCH_SIZE 기본 2
 ODL_EMBEDDED_IMAGE_OCR_MIN_PIXELS 기본 12000
 ODL_EMBEDDED_IMAGE_OCR_MAX_IMAGE_BYTES 기본 8388608
 ODL_EMBEDDED_IMAGE_OCR_PDF_MAX_SIDE 기본 1600
+ODL_RESOURCE_RETRY_ENABLED      기본 true
+ODL_RESOURCE_RETRY_INTERVAL_SECONDS 기본 30
+ODL_RESOURCE_RETRY_MAX_INTERVAL_SECONDS 기본 300
+ODL_RESOURCE_RETRY_MAX_ATTEMPTS 기본 0, 0은 무제한 대기
 RAG_STORE_DIR                   기본 DIFY_RUNTIME_DIR/rag-store
 EVAL_LOG_DIR                    기본 OS temp/dify-rag-eval-logs
 ```
 
 `RAG_STORE_DIR`에는 `/convert/rag` 결과 artifact가 JSON으로 저장됩니다. 기본 경로가 쓰기 불가능하면 사용자 캐시와 OS temp를 순서대로 시도하고, 모두 실패하면 현재 프로세스 메모리에만 보관합니다.
 `EVAL_LOG_DIR`에는 `/eval/log` 실행 기록이 날짜별 JSONL과 run_id별 JSON 파일로 저장됩니다.
+OCR hybrid backend가 GPU 메모리 부족, 429/503, connection refused 등 자원 부족 상태를 반환하면 변환 subprocess를 즉시 실패시키지 않고 위 retry 설정에 따라 대기 후 같은 파일을 다시 변환합니다.
 
 ## 테스트
 

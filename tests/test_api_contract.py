@@ -1,4 +1,7 @@
+import asyncio
 import os
+import threading
+import time
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -9,7 +12,7 @@ from fastapi import UploadFile
 from fastapi.testclient import TestClient
 
 from app.eval_logs import EvalLogStore
-from app.main import app, ChatflowDebugRequest, ConvertResponse, MarkdownIngestRequest, chatflow_debug, convert, convert_rag, rag_ingest_markdown
+from app.main import app, ChatflowDebugRequest, ConvertResponse, MarkdownIngestRequest, chatflow_debug, convert, convert_batch, convert_rag, rag_ingest_markdown
 from app.rag import RagStore, build_rag_artifact
 
 
@@ -45,6 +48,53 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.success)
         self.assertEqual(response.markdown, "# Manual")
         converter_class.return_value.convert_bytes.assert_called_once_with(content, "manual.md")
+
+    async def test_convert_requests_are_serialized(self):
+        first = UploadFile(file=BytesIO(b"# First"), filename="first.md")
+        second = UploadFile(file=BytesIO(b"# Second"), filename="second.md")
+        active = 0
+        max_active = 0
+        order: list[str] = []
+        counter_lock = threading.Lock()
+
+        def fake_convert(_content: bytes, name: str) -> str:
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with counter_lock:
+                active -= 1
+                order.append(name)
+            return f"# {name}"
+
+        with patch("app.main.DocumentConverter") as converter_class:
+            converter_class.return_value.convert_bytes.side_effect = fake_convert
+            first_task = asyncio.create_task(convert(file=first))
+            await asyncio.sleep(0.01)
+            second_task = asyncio.create_task(convert(file=second))
+            responses = await asyncio.gather(first_task, second_task)
+
+        self.assertTrue(all(response.success for response in responses))
+        self.assertEqual(max_active, 1)
+        self.assertEqual(order, ["first.md", "second.md"])
+
+    async def test_convert_batch_processes_files_in_order(self):
+        first = UploadFile(file=BytesIO(b"# First"), filename="first.md")
+        second = UploadFile(file=BytesIO(b"# Second"), filename="second.md")
+        order: list[str] = []
+
+        def fake_convert(_content: bytes, name: str) -> str:
+            order.append(name)
+            return f"# {name}"
+
+        with patch("app.main.DocumentConverter") as converter_class:
+            converter_class.return_value.convert_bytes.side_effect = fake_convert
+            response = await convert_batch(files=[first, second])
+
+        self.assertTrue(response.success)
+        self.assertEqual([item.file_name for item in response.files], ["first.md", "second.md"])
+        self.assertEqual(order, ["first.md", "second.md"])
 
     async def test_rag_ingest_markdown_builds_artifact(self):
         response = await rag_ingest_markdown(

@@ -15,6 +15,7 @@ from app.converter import (
     _ocr_embedded_images_with_opendataloader,
     _read_generated_markdown,
     _read_rendered_markdown,
+    _run_command,
     build_opendataloader_native_command,
     build_opendataloader_command,
     sanitize_filename,
@@ -102,6 +103,51 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(command[command.index("--markdown-page-separator") + 1], "\n\n--- Page %page-number% ---\n\n")
         self.assertIn("--table-method", command)
         self.assertEqual(command[command.index("--table-method") + 1], "cluster")
+
+    def test_resource_shortage_retries_opendataloader_command_until_success(self):
+        settings = Settings(
+            resource_retry_interval_seconds=1,
+            resource_retry_max_interval_seconds=1,
+            resource_retry_max_attempts=3,
+        )
+
+        with (
+            patch(
+                "app.converter.subprocess.Popen",
+                side_effect=[
+                    _FakeProcess(returncode=1, stderr="CUDA out of memory"),
+                    _FakeProcess(returncode=0),
+                ],
+            ) as popen,
+            patch("app.converter.time.sleep") as sleep,
+        ):
+            _run_command(["opendataloader-pdf", "input.pdf"], settings)
+
+        self.assertEqual(popen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_resource_shortage_retry_respects_max_attempts(self):
+        settings = Settings(
+            resource_retry_interval_seconds=1,
+            resource_retry_max_interval_seconds=1,
+            resource_retry_max_attempts=2,
+        )
+
+        with (
+            patch(
+                "app.converter.subprocess.Popen",
+                side_effect=[
+                    _FakeProcess(returncode=1, stderr="service unavailable"),
+                    _FakeProcess(returncode=1, stderr="service unavailable"),
+                ],
+            ) as popen,
+            patch("app.converter.time.sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(ConversionError, "busy or unavailable"):
+                _run_command(["opendataloader-pdf", "input.pdf"], settings)
+
+        self.assertEqual(popen.call_count, 2)
+        sleep.assert_called_once_with(1)
 
     def test_pdf_with_images_ocr_only_embedded_images(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -405,6 +451,18 @@ def _minimal_docx_bytes(images: dict[str, bytes] | None = None) -> bytes:
         for name, content in (images or {}).items():
             archive.writestr(name, content)
     return buffer.getvalue()
+
+
+class _FakeProcess:
+    pid = 12345
+
+    def __init__(self, *, returncode: int, stdout: str = "", stderr: str = ""):
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+
+    def communicate(self, timeout: int | None = None):
+        return self._stdout, self._stderr
 
 
 if __name__ == "__main__":
