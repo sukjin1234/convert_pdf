@@ -886,6 +886,126 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertIn("컴퓨터정보공학과: 예", positive["direct_answer"])
         self.assertIn("산업디자인학과: 아니오", negative["direct_answer"])
 
+    def test_toc_section_does_not_carry_into_next_page_table(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 2 ---
+
+## 목   차
+
+Ⅰ. 모집인원 ··························· 2
+Ⅱ. 전형일정 ··························· 3
+
+--- Page 3 ---
+
+| 계열 | 모집단위 | 모집 정원 |
+| --- | --- | --- |
+| 공학 | 기계공학과 | 90 |
+| 공학 | 컴퓨터정보공학과 | 80 |
+""",
+            "admission.pdf",
+            document_id="doc_toc_reset",
+        )
+
+        page3_chunks = [chunk for chunk in artifact.chunks if chunk.page_start == 3]
+        self.assertEqual(len(page3_chunks), 1)
+        self.assertEqual(page3_chunks[0].section_path, "모집인원")
+        self.assertNotIn("[section: 목   차]", page3_chunks[0].metadata_text)
+        self.assertTrue(any(record.fields.get("모집단위") == "기계공학과" for record in artifact.records))
+        self.assertFalse(any("목   차 항목" in record.answer_text for record in artifact.records))
+
+    def test_compact_visual_title_content_rows_become_structured_pairs(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 7 ---
+
+## 국토교통부 산업통상자원부 교육부
+
+공간정보 특성화 전문대학 창의융합형 공학인재 양성지원사업
+
+고교 장애학생 대학체험지원
+""",
+            "document.pdf",
+            document_id="doc_visual_pairs",
+        )
+
+        self.assertIn("| 국토교통부 | 공간정보 특성화 전문대학 |", artifact.markdown)
+        self.assertIn("| 산업통상자원부 | 창의융합형 공학인재 양성지원사업 |", artifact.markdown)
+        self.assertIn("| 교육부 | 고교 장애학생 대학체험지원 |", artifact.markdown)
+
+        pairs = {record.fields.get("제목"): record.fields.get("내용") for record in artifact.records}
+        self.assertEqual(pairs.get("국토교통부"), "공간정보 특성화 전문대학")
+        self.assertEqual(pairs.get("산업통상자원부"), "창의융합형 공학인재 양성지원사업")
+        self.assertEqual(pairs.get("교육부"), "고교 장애학생 대학체험지원")
+
+    def test_compact_visual_pairs_allow_multiword_titles(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 13 ---
+
+## 사이버 한국외국어대학교 경희사이버대학교 세종사이버대학교
+
+전 학과 전 학과 전 학과
+""",
+            "document.pdf",
+            document_id="doc_visual_multiword_titles",
+        )
+
+        pairs = {record.fields.get("제목"): record.fields.get("내용") for record in artifact.records}
+        self.assertEqual(pairs.get("사이버 한국외국어대학교"), "전 학과")
+        self.assertEqual(pairs.get("경희사이버대학교"), "전 학과")
+        self.assertEqual(pairs.get("세종사이버대학교"), "전 학과")
+
+    def test_compact_visual_section_title_does_not_carry_to_following_page(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 7 ---
+
+## 인천광역시 케이워터운영관리 인천인재평생교육진흥원
+
+상생일자리 지원사업 FRP레저보트 선체정비 테크니션 양성과정
+
+신중년 직업교육과정
+
+--- Page 8 ---
+
+기업과 함께 성장하다
+
+| 항목 | 내용 |
+| --- | --- |
+| 참여 기업 | 글로벌 반도체 기업 |
+""",
+            "document.pdf",
+            document_id="doc_visual_reset",
+        )
+
+        page8_chunks = [chunk for chunk in artifact.chunks if chunk.page_start == 8]
+        self.assertEqual(len(page8_chunks), 1)
+        self.assertNotIn("인천광역시", page8_chunks[0].section_path)
+        self.assertNotIn("케이워터운영관리", page8_chunks[0].section_path)
+
+    def test_empty_headings_do_not_create_blank_section_paths(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 17 ---
+
+####
+
+※ 모집인원은 최초 공고 기준이며, 등록포기 등으로 입학인원과 다를 수 있음
+
+| 학과명 | 모집인원 |
+| --- | --- |
+| 기계공학과 | 90 |
+""",
+            "admission.pdf",
+            document_id="doc_empty_heading",
+        )
+
+        self.assertTrue(artifact.chunks)
+        self.assertTrue(all(chunk.section_path != ">" for chunk in artifact.chunks))
+        self.assertTrue(all(" > " not in chunk.section_path.strip() for chunk in artifact.chunks))
+        self.assertNotIn("[section:     >  ]", artifact.dify_markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

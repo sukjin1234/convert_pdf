@@ -193,7 +193,8 @@ Start
 -> Parse Query Plan
 -> Structured Lookup
 -> Knowledge Retrieval
--> Merge Evidence
+-> Merge Evidence Request
+-> Parse Merge Evidence
 -> Final Answer LLM
 -> Build Verify Body
 -> Verify Answer
@@ -358,19 +359,12 @@ Score threshold: 처음에는 낮게 또는 비활성
 Rerank: 가능하면 활성화
 ```
 
-### 3.6 HTTP Request: Merge Evidence
+### 3.6 HTTP Request: Merge Evidence Request
 
-입력 변수:
-
-```text
-lookup_body = {{Structured Lookup.body}}
-knowledge_result = {{Knowledge Retrieval.result}}
-```
-
-권장 노드 이름:
+노드 이름:
 
 ```text
-Merge Evidence
+Merge Evidence Request
 ```
 
 설정:
@@ -397,121 +391,62 @@ JSON Body:
 }
 ```
 
-이 HTTP 노드는 Structured Lookup의 `answer_contract`, `complete_values`, `answerability`와 Knowledge Retrieval 결과를 서버 쪽에서 병합한다. Dify `Knowledge Retrieval.result`가 `data.records`, `segment.content`, `metadata`처럼 중첩되어 와도 근거 텍스트를 보존한다.
+이 노드는 Structured Lookup의 `answer_contract`, `complete_values`, `answerability`와 Knowledge Retrieval 결과를 서버 쪽에서 병합한다. Dify `Knowledge Retrieval.result`가 `data.records`, `segment.content`, `metadata`처럼 중첩되어 와도 FastAPI가 근거 텍스트를 보존한다.
 
-출력 변수:
+Dify HTTP Request 노드 출력은 다음처럼 고정된다.
 
 ```text
-structured_context: string
-knowledge_context: string
-evidence_context: string
-evidence_priority: string
-answer_contract: string
-answer_contract_text: string
-lookup_diagnostics: string
-lookup_answerability: string
+body: string
+status_code: number
+headers: object
+files: array[file]
 ```
 
-`answer_contract_text`는 최종 LLM이 반드시 따라야 할 답변 계약이다. direct answer가 있으면 필수 포함값이 `required_values`로 들어간다.
+따라서 `Merge Evidence Request.body`를 Final Answer LLM에 직접 연결하지 않는다. 바로 뒤에 `Parse Merge Evidence` Code 노드를 두고, `body`에서 실제 출력 변수를 추출한다.
 
-만약 현재 Dify 환경에서 HTTP JSON body에 object/list 변수를 직접 넣기 어렵다면 아래 Code 노드를 대체 구성으로 둔다. 단, 정확도를 위해 가능하면 위 HTTP 노드를 쓴다.
+### 3.7 Code: Parse Merge Evidence
 
-### 3.6 대체 Code: Merge Evidence
+입력 변수:
+
+```text
+body = {{Merge Evidence Request.body}}
+status_code = {{Merge Evidence Request.status_code}}
+```
 
 Python:
 
 ```python
 import json
 
-def parse_json(value):
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            return None
-        try:
-            return json.loads(value)
-        except Exception:
-            return value
-    return value
+def as_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
 
-def main(lookup_body=None, knowledge_result=None, knowledge_context=None, knowledge_body=None) -> dict:
-    lookup = json.loads(lookup_body) if isinstance(lookup_body, str) else (lookup_body or {})
-    structured_context = lookup.get("context") or ""
-    diagnostics = lookup.get("diagnostics") or {}
-    answer_contract = lookup.get("answer_contract") or {}
+def main(body, status_code=200) -> dict:
+    code = int(status_code or 0)
+    if code < 200 or code >= 300:
+        raise ValueError(f"Merge Evidence Request failed. status_code={code} body={as_text(body)[:500]}")
 
-    knowledge_source = knowledge_result
-    if knowledge_source is None:
-        knowledge_source = knowledge_context
-    if knowledge_source is None:
-        knowledge_source = knowledge_body
+    data = json.loads(body) if isinstance(body, str) else body
+    if not isinstance(data, dict):
+        raise ValueError("Merge Evidence Request body is not a JSON object")
 
-    knowledge_items = parse_json(knowledge_source) or []
-    if isinstance(knowledge_items, dict):
-        knowledge_items = (
-            knowledge_items.get("result")
-            or knowledge_items.get("records")
-            or knowledge_items.get("data")
-            or knowledge_items.get("documents")
-            or []
-        )
-
-    knowledge_blocks = []
-    for index, item in enumerate(knowledge_items[:12], start=1):
-        if isinstance(item, dict):
-            content = item.get("content") or item.get("text") or item.get("segment", {}).get("content") or ""
-            metadata = item.get("metadata") or {}
-            source = metadata.get("source") or metadata.get("file_name") or item.get("title") or ""
-            knowledge_blocks.append(f"[knowledge {index}] source={source}\n{content}")
-        else:
-            knowledge_blocks.append(f"[knowledge {index}]\n{item}")
-
-    required_values = answer_contract.get("required_values") or []
-    contract_lines = [
-        "[Answer Contract - obey before writing]",
-        f"status: {answer_contract.get('status', '')}",
-        f"priority: {answer_contract.get('priority', '')}",
-        f"query_type: {answer_contract.get('query_type', '')}",
-        f"answerable: {answer_contract.get('answerable')}",
-    ]
-    if answer_contract.get("answer_candidate"):
-        contract_lines.append(f"answer_candidate: {answer_contract.get('answer_candidate')}")
-    if required_values:
-        contract_lines.append("required_values:")
-        contract_lines.extend(f"- {value}" for value in required_values)
-    if answer_contract.get("instruction"):
-        contract_lines.append(f"Instruction: {answer_contract.get('instruction')}")
-    answer_contract_text = "\n".join(line for line in contract_lines if line)
-
-    structured_block = (
-        "[Structured Lookup - authoritative exact evidence]\n"
-        "Use this first for table, list, field, value, number, date, identifier, and policy questions.\n"
-        + structured_context
-        if structured_context
-        else ""
-    )
-    knowledge_block = (
-        "[Knowledge Retrieval - supplementary semantic evidence]\n"
-        + "\n\n".join(knowledge_blocks)
-        if knowledge_blocks
-        else ""
-    )
-    evidence_context = "\n\n".join(part for part in [answer_contract_text, structured_block, knowledge_block] if part)
-    evidence_priority = (
-        "Use Structured Lookup first. Knowledge Retrieval is supplementary and may be empty or less specific."
-        if structured_context
-        else "Use Knowledge Retrieval only because Structured Lookup is empty."
-    )
+    evidence_context = as_text(data.get("evidence_context"))
+    if not evidence_context.strip():
+        raise ValueError("Merge Evidence response has empty evidence_context")
 
     return {
-        "structured_context": structured_context,
-        "knowledge_context": "\n\n".join(knowledge_blocks),
+        "structured_context": as_text(data.get("structured_context")),
+        "knowledge_context": as_text(data.get("knowledge_context")),
         "evidence_context": evidence_context,
-        "evidence_priority": evidence_priority,
-        "answer_contract": json.dumps(answer_contract, ensure_ascii=False),
-        "answer_contract_text": answer_contract_text,
-        "lookup_diagnostics": json.dumps(diagnostics, ensure_ascii=False),
-        "lookup_answerability": json.dumps(diagnostics.get("answerability") or {}, ensure_ascii=False),
+        "evidence_priority": as_text(data.get("evidence_priority")),
+        "answer_contract": as_text(data.get("answer_contract")),
+        "answer_contract_text": as_text(data.get("answer_contract_text")),
+        "lookup_diagnostics": as_text(data.get("lookup_diagnostics")),
+        "lookup_answerability": as_text(data.get("lookup_answerability")),
     }
 ```
 
@@ -528,7 +463,9 @@ lookup_diagnostics: string
 lookup_answerability: string
 ```
 
-### 3.7 LLM: Final Answer
+이 구조가 기존의 긴 Dify Code 병합보다 낫다. 정확도에 영향을 주는 근거 병합, `required_values`, Knowledge Retrieval 중첩 포맷 파싱은 FastAPI 한 곳에서 관리하고, Dify Code 노드는 HTTP `body`를 검증하고 펼치는 역할만 한다.
+
+### 3.8 LLM: Final Answer
 
 System Prompt:
 
@@ -562,16 +499,16 @@ Sub queries:
 {{Parse Query Plan.sub_query_text}}
 
 Structured lookup answerability:
-{{Merge Evidence.lookup_answerability}}
+{{Parse Merge Evidence.lookup_answerability}}
 
 Answer contract:
-{{Merge Evidence.answer_contract_text}}
+{{Parse Merge Evidence.answer_contract_text}}
 
 Evidence priority:
-{{Merge Evidence.evidence_priority}}
+{{Parse Merge Evidence.evidence_priority}}
 
 Evidence:
-{{Merge Evidence.evidence_context}}
+{{Parse Merge Evidence.evidence_context}}
 
 Write a concise answer with exact supporting facts.
 Use only the provided evidence.
@@ -587,14 +524,14 @@ If the evidence is insufficient, say that the provided document does not contain
 Answer in Korean unless the user asks for another language.
 ```
 
-### 3.8 Code: Build Verify Body
+### 3.9 Code: Build Verify Body
 
 입력 변수:
 
 ```text
 question = {{sys.query}}
 answer = {{Final Answer.text}}
-evidence_context = {{Merge Evidence.evidence_context}}
+evidence_context = {{Parse Merge Evidence.evidence_context}}
 ```
 
 Python:
@@ -617,7 +554,7 @@ def main(question: str, answer: str, evidence_context: str) -> dict:
 verify_body_json: string
 ```
 
-### 3.9 HTTP Request: Verify Answer
+### 3.10 HTTP Request: Verify Answer
 
 노드 이름:
 
@@ -647,7 +584,7 @@ Raw Body:
 {{Build Verify Body.verify_body_json}}
 ```
 
-### 3.10 Code: Parse Verify Result
+### 3.11 Code: Parse Verify Result
 
 먼저 `Verify Answer.body`를 파싱하는 Code 노드를 하나 둔다.
 
@@ -711,7 +648,7 @@ should_answer: boolean
 should_rewrite: boolean
 ```
 
-### 3.11 Code: Build Eval Log Body
+### 3.12 Code: Build Eval Log Body
 
 Dify HTTP Request의 JSON body 편집기에는 boolean 변수나 `Knowledge Retrieval.result` 같은 object/list 변수가 직접 들어가지 않는 경우가 많다. 그래서 로그 payload는 Code 노드에서 JSON 문자열로 만든 뒤, HTTP 노드에는 raw body로 전달한다.
 
@@ -728,15 +665,16 @@ query = {{sys.query}}
 document_id = {{Parse Query Plan.document_id}}
 query_plan_body = {{Query Plan.body}}
 structured_lookup_body = {{Structured Lookup.body}}
-knowledge_context = {{Merge Evidence.knowledge_context}}
-evidence_context = {{Merge Evidence.evidence_context}}
-evidence_priority = {{Merge Evidence.evidence_priority}}
-lookup_answerability = {{Merge Evidence.lookup_answerability}}
+knowledge_context = {{Parse Merge Evidence.knowledge_context}}
+evidence_context = {{Parse Merge Evidence.evidence_context}}
+evidence_priority = {{Parse Merge Evidence.evidence_priority}}
+answer_contract_text = {{Parse Merge Evidence.answer_contract_text}}
+lookup_answerability = {{Parse Merge Evidence.lookup_answerability}}
 final_answer = {{Final Answer.text}}
 verify_answer_body = {{Verify Answer.body}}
 ```
 
-중요: `knowledge_context`에는 `Knowledge Retrieval.result`를 직접 넣지 말고, 반드시 `Merge Evidence.knowledge_context`를 넣는다. 이 값은 앞선 Merge Evidence 코드에서 검색 결과를 문자열로 정리한 출력이다.
+중요: `knowledge_context`에는 `Knowledge Retrieval.result`를 직접 넣지 말고, 반드시 `Parse Merge Evidence.knowledge_context`를 넣는다. 이 값은 앞선 Merge Evidence Request 응답을 파싱해 검색 결과를 문자열로 정리한 출력이다.
 
 Python:
 
@@ -779,6 +717,7 @@ def main(
     knowledge_context="",
     evidence_context="",
     evidence_priority="",
+    answer_contract_text="",
     lookup_answerability="",
     final_answer="",
     verify_answer_body="",
@@ -807,6 +746,7 @@ def main(
             "merge_evidence": {
                 "evidence_context": evidence_context,
                 "evidence_priority": evidence_priority,
+                "answer_contract_text": answer_contract_text,
                 "lookup_answerability": answerability,
             },
             "final_answer": final_answer,
@@ -834,7 +774,7 @@ def main(
 eval_log_body_json: string
 ```
 
-### 3.12 HTTP Request: Eval Log
+### 3.13 HTTP Request: Eval Log
 
 노드 이름:
 
@@ -880,7 +820,7 @@ curl http://<fastapi-host>:8000/eval/logs?limit=20
 curl http://<fastapi-host>:8000/eval/logs/<run_id>
 ```
 
-### 3.13 Conditional
+### 3.14 Conditional
 
 조건:
 
@@ -908,10 +848,10 @@ Verification issues:
 {{Parse Verify Result.issues_text}}
 
 Evidence priority:
-{{Merge Evidence.evidence_priority}}
+{{Parse Merge Evidence.evidence_priority}}
 
 Evidence:
-{{Merge Evidence.evidence_context}}
+{{Parse Merge Evidence.evidence_context}}
 
 Rewrite the answer using only the evidence.
 If Structured Lookup contains an answer_candidate or directly relevant evidence, answer from Structured Lookup even when Knowledge Retrieval is empty or less specific.
@@ -1000,7 +940,7 @@ file_name: optional
 }
 ```
 
-응답에는 기존 `context` 외에 `direct_answer`, `answer_items`, `answer_field`, `filter_terms`, `answer_style`, `sub_queries`, `evidence_items`, `diagnostics`가 포함된다.
+응답에는 기존 `context` 외에 `direct_answer`, `answer_items`, `answer_field`, `filter_terms`, `answer_contract`, `answer_style`, `sub_queries`, `evidence_items`, `diagnostics`가 포함된다.
 
 목록/표 질문에서는 `context` 맨 위에 다음 블록이 자동으로 붙는다.
 
@@ -1033,7 +973,7 @@ Dify에서는 일단 `context`만 써도 된다. 디버깅할 때는 `direct_ans
 
 ### 4.6 POST /chatflow/merge-evidence
 
-Dify `Merge Evidence` HTTP 노드에서 사용한다. `Structured Lookup.body`와 `Knowledge Retrieval.result`를 받아 최종 LLM에 넣을 근거 패키지를 만든다.
+Dify `Merge Evidence Request` HTTP 노드에서 사용한다. `Structured Lookup.body`와 `Knowledge Retrieval.result`를 받아 최종 LLM에 넣을 근거 패키지를 만든다.
 
 요청:
 
@@ -1065,7 +1005,7 @@ Dify `Merge Evidence` HTTP 노드에서 사용한다. `Structured Lookup.body`�
 }
 ```
 
-`answer_contract_text`와 `evidence_context`를 Final Answer LLM 프롬프트에 둘 다 연결한다.
+Dify HTTP Request 노드에서는 위 JSON이 `body` 문자열로 들어온다. 따라서 `Parse Merge Evidence` Code 노드에서 `body`를 파싱한 뒤 `answer_contract_text`와 `evidence_context`를 Final Answer LLM 프롬프트에 연결한다.
 
 ### 4.7 POST /chatflow/debug
 

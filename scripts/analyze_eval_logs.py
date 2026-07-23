@@ -109,6 +109,9 @@ def analyze_record(record: dict[str, Any]) -> tuple[dict[str, Any], list[LogFind
     selected_count = int((lookup.get("diagnostics") or {}).get("selected_count") or 0) if isinstance(lookup.get("diagnostics"), dict) else 0
     valid = verify.get("valid")
     confidence = verify.get("confidence")
+    evidence_context = str(merge_evidence.get("evidence_context") or "")
+    answer_contract_text = str(merge_evidence.get("answer_contract_text") or "")
+    has_answer_contract = "Answer Contract - obey before writing" in f"{answer_contract_text}\n{evidence_context}"
 
     findings = []
     if not document_id:
@@ -161,6 +164,16 @@ def analyze_record(record: dict[str, Any]) -> tuple[dict[str, Any], list[LogFind
                 "Verifier passed an answer even though structured direct_answer is empty.",
             )
         )
+    if qtype in STRUCTURED_QUERY_TYPES and direct_answer and not has_answer_contract:
+        findings.append(
+            LogFinding(
+                "warning",
+                "missing_answer_contract",
+                run_id,
+                query,
+                "Structured Lookup produced a direct_answer, but Merge Evidence did not pass answer_contract_text.",
+            )
+        )
     if not final_answer.strip():
         findings.append(LogFinding("error", "empty_final_answer", run_id, query, "Final answer is empty."))
 
@@ -173,6 +186,7 @@ def analyze_record(record: dict[str, Any]) -> tuple[dict[str, Any], list[LogFind
         "valid": valid,
         "confidence": confidence,
         "has_direct_answer": bool(direct_answer),
+        "has_answer_contract": has_answer_contract,
         "selected_count": selected_count,
         "final_answer_preview": truncate(final_answer.replace("\n", " "), 220),
         "findings": [finding.to_dict() for finding in findings],
@@ -191,6 +205,7 @@ def summarize(records: list[dict[str, Any]], findings: list[LogFinding]) -> dict
         "valid_false": sum(1 for record in records if record.get("valid") is False),
         "missing_document_id": sum(1 for record in records if not record.get("document_id")),
         "direct_answer_present": sum(1 for record in records if record.get("has_direct_answer")),
+        "answer_contract_present": sum(1 for record in records if record.get("has_answer_contract")),
         "finding_count": len(findings),
         "error_count": severity_counts.get("error", 0),
         "warning_count": severity_counts.get("warning", 0),
@@ -203,7 +218,11 @@ def print_human_report(summary: dict[str, Any], findings: list[LogFinding], *, l
     print("Eval Log Analysis")
     print("=================")
     print(f"total={summary['total']} valid_true={summary['valid_true']} valid_false={summary['valid_false']}")
-    print(f"missing_document_id={summary['missing_document_id']} direct_answer_present={summary['direct_answer_present']}")
+    print(
+        f"missing_document_id={summary['missing_document_id']} "
+        f"direct_answer_present={summary['direct_answer_present']} "
+        f"answer_contract_present={summary['answer_contract_present']}"
+    )
     print(f"errors={summary['error_count']} warnings={summary['warning_count']}")
     print()
     print("Finding Types")

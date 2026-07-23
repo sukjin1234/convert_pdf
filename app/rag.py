@@ -877,6 +877,7 @@ def build_rag_artifact(
     chunk_char_limit: int = 3500,
 ) -> RagArtifact:
     normalized = normalize_markdown(markdown)
+    normalized = normalize_compact_visual_pair_sections(normalized)
     doc_id = document_id or make_document_id(file_name, normalized)
     safe_file_name = file_name or "document.pdf"
     document_marker_legends = extract_unambiguous_marker_legends(normalized.split("\n"))
@@ -1005,9 +1006,147 @@ def normalize_markdown(value: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", value).strip()
 
 
+def normalize_compact_visual_pair_sections(markdown: str) -> str:
+    pages = split_pages(markdown)
+    if not pages:
+        return markdown
+
+    blocks = []
+    for page, page_text in pages:
+        normalized_page = normalize_compact_visual_pair_page(page_text)
+        if page is None:
+            blocks.append(normalized_page)
+        else:
+            blocks.append(f"--- Page {page} ---\n\n{normalized_page}".strip())
+    return normalize_markdown("\n\n".join(block for block in blocks if block))
+
+
+def normalize_compact_visual_pair_page(page_text: str) -> str:
+    lines = page_text.split("\n")
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        heading_match = HEADING_RE.match(line.strip())
+        if not heading_match:
+            output.append(line)
+            index += 1
+            continue
+
+        titles = split_compact_visual_titles(heading_match.group(2))
+        if len(titles) < 2:
+            output.append(line)
+            index += 1
+            continue
+
+        body_start = index + 1
+        while body_start < len(lines) and not lines[body_start].strip():
+            body_start += 1
+        body_end = body_start
+        body_lines = []
+        while body_end < len(lines):
+            candidate = lines[body_end]
+            if HEADING_RE.match(candidate.strip()) or looks_like_table_row(candidate):
+                break
+            if candidate.strip():
+                body_lines.append(clean_cell(candidate))
+            elif body_lines:
+                next_non_empty = next((later for later in lines[body_end + 1 :] if later.strip()), "")
+                if not next_non_empty or HEADING_RE.match(next_non_empty.strip()) or looks_like_table_row(next_non_empty):
+                    break
+            body_end += 1
+            if len(body_lines) >= max(len(titles) + 2, 6):
+                break
+
+        bodies = split_compact_visual_bodies(body_lines, len(titles))
+        if len(bodies) != len(titles):
+            output.append(line)
+            index += 1
+            continue
+
+        output.append(line)
+        output.append("")
+        output.extend(compact_visual_pairs_to_table(titles, bodies))
+        index = body_end
+    return normalize_markdown("\n".join(output))
+
+
+def split_compact_visual_titles(value: str) -> list[str]:
+    text = clean_cell(value)
+    if not text:
+        return []
+    parts = [part for part in re.split(r"\s{1,}", text) if part]
+    if not (2 <= len(parts) <= 8):
+        return []
+    if all(is_compact_visual_title_part(part) for part in parts):
+        return parts
+
+    titles: list[str] = []
+    buffer: list[str] = []
+    for part in parts:
+        buffer.append(part)
+        candidate = clean_cell(" ".join(buffer))
+        if is_compact_visual_title_part(candidate):
+            titles.append(candidate)
+            buffer = []
+    if not buffer and 2 <= len(titles) <= 8:
+        return titles
+    return []
+
+
+def is_compact_visual_title_part(value: str) -> bool:
+    value = clean_cell(value)
+    if len(value) < 2 or re.search(r"\d", value):
+        return False
+    return bool(
+        re.search(
+            r"(?:부|청|처|원|관리|공사|재단|대학교(?:\(본교\))?|대학|캠퍼스|광역시|특별시|시|도|군|구)$",
+            value,
+        )
+    )
+
+
+def split_compact_visual_bodies(lines: list[str], expected_count: int) -> list[str]:
+    body_lines = [clean_cell(line) for line in lines if clean_cell(line)]
+    if len(body_lines) == expected_count:
+        return body_lines
+    if not body_lines or expected_count <= 0:
+        return []
+
+    text = clean_cell(" ".join(body_lines))
+    if not text:
+        return []
+    suffix = (
+        r"지원체계\s*\([^)]+\)\s*사업|"
+        r"양성지원사업|지원사업|육성지원사업|특화\s*프로그램|"
+        r"대학체험지원|직업교육과정|양성과정|전문대학|"
+        r"프로그램|서비스|선정|지원|사업|과정|학과"
+    )
+    pieces = [
+        clean_cell(match.group(0))
+        for match in re.finditer(rf".+?(?:{suffix})(?=\s+\S|$)", text)
+    ]
+    if len(pieces) == expected_count and "".join(pieces):
+        return pieces
+    return []
+
+
+def compact_visual_pairs_to_table(titles: list[str], bodies: list[str]) -> list[str]:
+    lines = ["| 제목 | 내용 |", "| --- | --- |"]
+    for title, body in zip(titles, bodies):
+        lines.append(f"| {escape_markdown_table_cell(title)} | {escape_markdown_table_cell(body)} |")
+    return lines
+
+
+def escape_markdown_table_cell(value: str) -> str:
+    return clean_cell(value).replace("|", r"\|").replace("\n", "<br>")
+
+
 def iter_section_blocks(markdown: str) -> Iterable[dict[str, Any]]:
     section_stack: list[tuple[int, str]] = []
     for page, page_text in split_pages(markdown):
+        if should_reset_section_stack_for_page(section_stack, page_text):
+            section_stack = []
         current_lines: list[str] = []
         current_section = " > ".join(title for _, title in section_stack)
         current_title = section_stack[-1][1] if section_stack else ""
@@ -1016,21 +1155,24 @@ def iter_section_blocks(markdown: str) -> Iterable[dict[str, Any]]:
             text = normalize_markdown("\n".join(current_lines))
             if not text:
                 return None
+            section_path = resolve_block_section_path(current_section, text)
             return {
                 "page": page,
-                "section_path": current_section,
-                "title": current_title,
+                "section_path": section_path,
+                "title": section_path.split(">")[-1].strip() if section_path else current_title,
                 "text": text,
             }
 
         for line in page_text.split("\n"):
             match = HEADING_RE.match(line.strip())
             if match:
+                title = clean_cell(match.group(2))
+                if not title:
+                    continue
                 block = flush()
                 if block:
                     yield block
                 level = len(match.group(1))
-                title = clean_cell(match.group(2))
                 section_stack = [(item_level, item_title) for item_level, item_title in section_stack if item_level < level]
                 section_stack.append((level, title))
                 current_section = " > ".join(item_title for _, item_title in section_stack)
@@ -1059,6 +1201,60 @@ def split_pages(markdown: str) -> list[tuple[int | None, str]]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
         pages.append((int(match.group(1)), markdown[start:end].strip()))
     return pages
+
+
+def should_reset_section_stack_for_page(section_stack: list[tuple[int, str]], page_text: str) -> bool:
+    if not section_stack:
+        return False
+    current_title = section_stack[-1][1]
+    if is_table_of_contents_title(current_title):
+        return True
+    if split_compact_visual_titles(current_title):
+        return True
+    return False
+
+
+def resolve_block_section_path(current_section: str, text: str) -> str:
+    if current_section and not is_table_of_contents_title(current_section):
+        return current_section
+    inferred = infer_section_path_from_block(text)
+    return inferred or ("" if is_table_of_contents_title(current_section) else current_section)
+
+
+def infer_section_path_from_block(text: str) -> str:
+    normalized = normalize_for_match(text)
+    if "모집단위" in text and re.search(r"모집\s*(?:정원|인원)", text):
+        return "모집인원"
+    if "전형일정" in text or ("원서접수" in text and DATE_RE.search(text)):
+        return "전형일정"
+    if "지원자격" in text or "지원 자격" in text:
+        return "지원자격"
+    if "제출서류" in text or "제출 서류" in text:
+        return "제출서류"
+    if "성적 반영" in text or "성적반영" in text:
+        return "성적 반영 방법"
+    if "합격자 발표" in text or "충원" in text:
+        return "합격자 발표 및 충원"
+    if "전형료" in text or "원서접수 비용" in text:
+        return "원서접수 비용"
+    if "toc" in normalized or "contents" in normalized:
+        return ""
+    return ""
+
+
+def is_table_of_contents_title(value: str) -> bool:
+    text = clean_cell(value)
+    text = re.sub(r"\s+", "", text).lower()
+    return text in {"목차", "contents", "content"}
+
+
+def is_table_of_contents_line(line: str) -> bool:
+    text = clean_cell(line)
+    if not text:
+        return False
+    if re.search(r"[·.]{4,}\s*\d{1,3}\s*$", text):
+        return True
+    return bool(re.fullmatch(r"(?:[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVXLC]+\.?|[0-9]+[.)])\s+.+\s+\d{1,3}", text))
 
 
 def split_chunk_text(text: str, limit: int) -> list[str]:
@@ -1230,6 +1426,9 @@ def extract_plain_text_records(
     section_path: str,
     table_index: int,
 ) -> list[StructuredRecord]:
+    if is_table_of_contents_title(section_path):
+        return []
+
     records: list[StructuredRecord] = []
     for line_index, raw_line in enumerate(lines, start=1):
         line = clean_plain_text_line(raw_line)
@@ -1269,6 +1468,8 @@ def clean_plain_text_line(line: str) -> str:
 def should_skip_plain_text_record_line(raw_line: str, line: str) -> bool:
     stripped = raw_line.strip()
     if HEADING_RE.match(stripped) or looks_like_table_row(stripped) or is_marker_legend_line(stripped):
+        return True
+    if is_table_of_contents_line(stripped):
         return True
     if line in {"표 행 설명 및 구조화 레코드:", "표시/범례 기반 구조화 레코드:", "본문 구조화 레코드:"}:
         return True
