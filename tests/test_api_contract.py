@@ -238,6 +238,7 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Answer Contract - obey before writing", body["evidence_context"])
         self.assertIn("Structured Lookup - authoritative exact evidence", body["evidence_context"])
         self.assertIn("[knowledge 1] source=admission.md page=4 score=0.91", body["knowledge_context"])
+        self.assertIn("참조 문서: admission.md (p.4)", body["source_summary"])
         self.assertIn("- 컴퓨터정보공학과", body["answer_contract_text"])
 
     def test_chatflow_merge_evidence_endpoint_accepts_single_item_array_body(self):

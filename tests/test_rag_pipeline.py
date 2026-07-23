@@ -403,6 +403,46 @@ class RagPipelineTest(unittest.TestCase):
         self.assertIn("- 컴퓨터정보공학과", merged["answer_contract_text"])
         self.assertIn("[knowledge 1] source=admission.md page=4 score=0.91", merged["knowledge_context"])
         self.assertIn("전공심화 과정은 야간 수업으로 운영됩니다.", merged["evidence_context"])
+        self.assertIn("참조 문서: admission.md (p.4)", merged["source_summary"])
+
+    def test_merge_evidence_summarizes_structured_sources_before_knowledge_sources(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 전형일정
+
+| 구분 | 항목 | 수시1차 |
+| --- | --- | --- |
+| 접수 | 원서접수 | 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지 |
+""",
+            "2027_admission.pdf",
+            document_id="doc_admission",
+        )
+        lookup = lookup_matches(
+            query="수시1차 원서접수 기간 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+        knowledge_result = {
+            "data": {
+                "records": [
+                    {
+                        "segment": {
+                            "content": "다른 문서의 보조 검색 결과입니다.",
+                            "metadata": {"file_name": "document.pdf", "page": 7},
+                        },
+                        "score": 0.88,
+                    }
+                ]
+            }
+        }
+
+        merged = merge_evidence_context(lookup, knowledge_result)
+
+        self.assertIn("참조 문서: 2027_admission.pdf (p.5, 전형일정)", merged["source_summary"])
+        self.assertIn("보조 검색: document.pdf (p.7)", merged["source_summary"])
 
     def test_marker_legend_rows_build_complete_direct_answer(self):
         artifact = build_rag_artifact(
@@ -955,6 +995,87 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertFalse(any(issue["type"] == "unsupported_date" for issue in result["issues"]))
         self.assertFalse(any(issue["type"] == "missing_direct_answer_value" for issue in result["issues"]))
 
+    def test_rotated_schedule_table_filters_row_label_and_column(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 전형일정
+
+| 구분 | 항목 | 수시1차 | 수시2차 | 정시 |
+| --- | --- | --- | --- | --- |
+| 접수 | 원서접수 | 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지 | 2026. 11. 7.(토) 09:00 ~ 11. 21.(토) 21:00까지 | 2027. 1. 5.(화) 09:00 ~ 1. 16.(토) 21:00까지 |
+| 접수 | 서류제출 | 2026. 9. 7.(월) 09:00 ~ 10. 2.(금) 18:00까지 | 2026. 11. 7.(토) 09:00 ~ 11. 24.(화) 18:00까지 | 2027. 1. 5.(화) 09:00 ~ 1. 19.(화) 18:00까지 |
+| 면접 | 면접예약 | 2026. 10. 10.(토) 10:00 ~ 10. 13.(화) 16:00까지 | 2026. 11. 27.(금) 10:00 ~ 11. 30.(월) 16:00까지 |  |
+""",
+            "admission.pdf",
+            document_id="doc_schedule",
+        )
+
+        result = lookup_matches(
+            query="수시1차 원서접수 기간 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+
+        self.assertEqual(result["answer_field"], "수시1차")
+        self.assertIn("2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지", result["direct_answer"])
+        self.assertNotIn("10. 2.(금)", result["direct_answer"])
+        self.assertNotIn("10. 10.(토)", result["direct_answer"])
+
+    def test_scalar_lookup_keeps_tied_values_from_multiple_documents(self):
+        older = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 전형일정
+
+| 구분 | 항목 | 수시1차 |
+| --- | --- | --- |
+| 접수 | 원서접수 | 2026. 2. 3.(화) 09:00 ~ 2. 5.(목) 16:00까지 |
+""",
+            "document.pdf",
+            document_id="doc_visual",
+        )
+        current = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 전형일정
+
+| 구분 | 항목 | 수시1차 |
+| --- | --- | --- |
+| 접수 | 원서접수 | 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지 |
+""",
+            "2027_admission.pdf",
+            document_id="doc_admission",
+        )
+
+        result = lookup_matches(
+            query="수시1차 원서접수 기간 알려줘",
+            records=[*older.records, *current.records],
+            chunks=[*older.chunks, *current.chunks],
+            limit=8,
+        )
+
+        self.assertIn("document.pdf", result["direct_answer"])
+        self.assertIn("2027_admission.pdf", result["direct_answer"])
+        self.assertIn("2026. 2. 3.(화) 09:00 ~ 2. 5.(목) 16:00까지", result["direct_answer"])
+        self.assertIn("2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지", result["direct_answer"])
+
+    def test_verify_accepts_abstention_when_evidence_is_missing(self):
+        result = verify_answer(
+            "기숙사 비용과 신청기간 알려줘",
+            "제공된 문서에는 기숙사 비용과 신청기간을 확인할 충분한 근거가 없습니다.",
+            [""],
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertFalse(any(issue["type"] == "missing_evidence" for issue in result["issues"]))
+        self.assertFalse(any(issue["type"] == "missing_number" for issue in result["issues"]))
+        self.assertFalse(any(issue["type"] == "missing_date" for issue in result["issues"]))
+
     def test_membership_question_uses_yes_no_direct_answer(self):
         artifact = build_rag_artifact(
             """
@@ -1129,6 +1250,52 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertIn("source_section: 전형별 모집인원", artifact.dify_markdown)
         self.assertNotIn("- record_id:", artifact.dify_markdown)
         self.assertNotIn("_t01_r001", artifact.dify_markdown)
+
+    def test_dify_markdown_uses_compact_record_blocks_instead_of_raw_table_rows(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 12 ---
+
+# 전형별 모집인원
+
+| 계열 | 모집단위 | 모집 정원 |
+| --- | --- | --- |
+| 공학 | 컴퓨터정보공학과 | 93 |
+| 공학 | 기계공학과 | 90 |
+""",
+            "admission.pdf",
+            document_id="doc_knowledge_compact",
+        )
+
+        self.assertIn("표 구조 요약: 열=계열, 모집단위, 모집 정원; 행수=2", artifact.dify_markdown)
+        self.assertIn("answer_hint: 컴퓨터정보공학과 항목은 계열: 공학, 모집 정원: 93입니다.", artifact.dify_markdown)
+        self.assertNotIn("| 공학 | 컴퓨터정보공학과 | 93 |", artifact.dify_markdown)
+
+    def test_table_of_contents_blocks_are_not_indexed_as_knowledge_chunks(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 2 ---
+
+## 목   차
+
+Ⅰ. 모집인원 ··························· 2
+Ⅱ. 전형일정 ··························· 3
+
+--- Page 3 ---
+
+# 전형일정
+
+| 구분 | 원서접수 |
+| --- | --- |
+| 수시1차 | 2025. 9. 8.(월) ~ 9. 30.(화) 21:00까지 |
+""",
+            "admission.pdf",
+            document_id="doc_no_toc_index",
+        )
+
+        self.assertNotIn("목   차", artifact.dify_markdown)
+        self.assertNotIn("Ⅰ. 모집인원", artifact.dify_markdown)
+        self.assertEqual({chunk.page_start for chunk in artifact.chunks}, {3})
 
     def test_combined_admission_table_rows_are_split_before_record_generation(self):
         artifact = build_rag_artifact(

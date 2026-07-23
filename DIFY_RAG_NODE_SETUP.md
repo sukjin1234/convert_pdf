@@ -9,7 +9,7 @@ PDF/TXT/Markdown/DOCX/CSV
 -> FastAPI /convert/rag
 -> Dify Knowledge Base에 dify_markdown 저장
 -> Chatflow에서 /query/plan + /lookup + Knowledge Retrieval
--> LLM 답변
+-> LLM 답변 + 참조 문서 표시
 -> /answer/verify
 ```
 
@@ -193,9 +193,10 @@ Start
 -> Parse Query Plan
 -> Structured Lookup
 -> Knowledge Retrieval
+-> Build Merge Evidence Body
 -> Merge Evidence Request
 -> Parse Merge Evidence
--> Final Answer LLM
+-> Final Answer LLM, 답변 끝에 참조 문서 표시
 -> Build Verify Body
 -> Verify Answer
 -> Parse Verify Result
@@ -210,12 +211,20 @@ Start
 
 ```text
 query: string
-document_id: string, optional
+document_id: string, optional, hidden/internal
 ```
 
-일반 Chatflow에서는 `query`에 사용자 질문을 넣고, 특정 문서만 조회할 때만 `document_id`를 넣는다.
+일반 사용자에게 `document_id`를 직접 입력하게 하지 않는다. 기본 UX는 사용자가 질문만 입력하고, 답변 끝에 `참조 문서:`로 실제 사용한 문서, 페이지, 섹션을 보여주는 방식이다.
 
-운영에서 여러 문서를 같은 FastAPI `RAG_STORE_DIR`에 저장한다면 `document_id`를 비워두지 않는다. Knowledge Pipeline의 `Document to RAG`에서 사용한 `document_id`와 Chatflow의 `Start.document_id`가 같아야 `/lookup`이 해당 문서의 구조화 records만 조회한다. `Eval Log`에서 `document_id: null` 또는 빈 값으로 계속 찍히면 다중 문서 환경에서 오답 가능성이 커진다.
+`document_id`는 특정 파일 보기, 관리자 테스트, 파일 업로드 직후 해당 파일 안에서만 묻는 모드처럼 문서 범위가 이미 정해진 경우에만 hidden/internal 입력으로 넣는다. 예를 들어 업로드형 화면이면 Knowledge Pipeline의 `Document to RAG`에서 사용한 `document_id`를 앱 내부 상태로 보관했다가 Chatflow의 `Start.document_id`에 전달한다.
+
+전체 Knowledge를 대상으로 묻는 공개 채팅에서는 `document_id`를 비워둘 수 있다. 이때 `/lookup`은 여러 문서의 구조화 records를 함께 검색하고, 동점 수준의 후보가 여러 문서에 있으면 단일 값으로 무리하게 단정하지 않도록 출처별 값을 근거에 남긴다. 최종 답변은 `Parse Merge Evidence.source_summary`를 사용해 어떤 문서를 참조했는지 표시한다.
+
+실제 점검 기준:
+
+- 특정 문서 모드인데 Dify App API 호출에서 `inputs.document_id`를 넘겨도 Start 노드에 `document_id` 입력 변수가 없으면 값이 완전히 무시된다.
+- 특정 문서 모드에서 스트리밍 이벤트의 `workflow_started.data.inputs`에 `document_id`가 없고 `Query Plan` 요청 body가 `{"query": ...}`만 포함하면 Chatflow 설정 오류다.
+- 전체 Knowledge 검색 모드라면 `document_id`가 빈 값인 것이 정상이다. 대신 Final Answer에 반드시 `참조 문서:` 줄이 있어야 한다.
 
 ### 3.2 HTTP Request: Query Plan
 
@@ -354,10 +363,12 @@ JSON Body:
 
 ```text
 Retrieval mode: Hybrid Search
-Top K: 12~20
+Top K: 8~12
 Score threshold: 처음에는 낮게 또는 비활성
 Rerank: 가능하면 활성화
 ```
+
+Knowledge에는 `/convert/rag` 응답의 `dify_markdown`만 넣는다. 현재 변환기는 Knowledge 검색용 chunk에서 큰 원본 표와 목차를 줄이고, 행 단위 `structured_record`와 `answer_hint`를 우선 노출한다. 기존 PDF 원문을 그대로 넣은 문서는 긴 숫자 표와 목차가 상위 검색을 오염시키므로, compact RAG Markdown으로 재적재한 뒤 기존 PDF 문서는 비활성화한다.
 
 ### 3.6 HTTP Request: Merge Evidence Request
 
@@ -373,7 +384,8 @@ Merge Evidence Request
 Method: POST
 URL: http://<fastapi-host>:8000/chatflow/merge-evidence
 Authorization: None
-Body Type: JSON
+Body Type: raw
+Raw Body Type: JSON
 ```
 
 Headers:
@@ -382,13 +394,51 @@ Headers:
 Content-Type: application/json
 ```
 
-JSON Body:
+권장 방식은 바로 앞에 `Build Merge Evidence Body` Code 노드를 두고 raw JSON 문자열을 만든 뒤 이 노드에 연결하는 것이다. Dify HTTP Request의 JSON 편집기에서 객체 변수를 직접 섞으면 특정 케이스에서 body가 `[{"lookup_body": ...}]` 배열로 나가 FastAPI/Pydantic 422가 발생할 수 있다.
 
-```json
-{
-  "lookup_body": "{{Structured Lookup.body}}",
-  "knowledge_result": "{{Knowledge Retrieval.result}}"
-}
+#### Code: Build Merge Evidence Body
+
+입력 변수:
+
+```text
+lookup_body = {{Structured Lookup.body}}
+knowledge_result = {{Knowledge Retrieval.result}}
+```
+
+Python:
+
+```python
+import json
+
+def parse_json_like(value):
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+    return value
+
+def main(lookup_body=None, knowledge_result=None) -> dict:
+    body = {
+        "lookup_body": parse_json_like(lookup_body),
+        "knowledge_result": parse_json_like(knowledge_result),
+    }
+    return {"merge_body_json": json.dumps(body, ensure_ascii=False)}
+```
+
+출력 변수 타입:
+
+```text
+merge_body_json: string
+```
+
+Merge Evidence Request Raw Body:
+
+```text
+{{Build Merge Evidence Body.merge_body_json}}
 ```
 
 이 노드는 Structured Lookup의 `answer_contract`, `complete_values`, `answerability`와 Knowledge Retrieval 결과를 서버 쪽에서 병합한다. Dify `Knowledge Retrieval.result`가 `data.records`, `segment.content`, `metadata`처럼 중첩되어 와도 FastAPI가 근거 텍스트를 보존한다.
@@ -436,13 +486,14 @@ def main(body, status_code=200) -> dict:
 
     evidence_context = as_text(data.get("evidence_context"))
     if not evidence_context.strip():
-        raise ValueError("Merge Evidence response has empty evidence_context")
+        evidence_context = "제공된 구조화/Knowledge 근거가 비어 있습니다. 문서에 충분한 근거가 없다고 답하세요."
 
     return {
         "structured_context": as_text(data.get("structured_context")),
         "knowledge_context": as_text(data.get("knowledge_context")),
         "evidence_context": evidence_context,
         "evidence_priority": as_text(data.get("evidence_priority")),
+        "source_summary": as_text(data.get("source_summary")),
         "answer_contract": as_text(data.get("answer_contract")),
         "answer_contract_text": as_text(data.get("answer_contract_text")),
         "lookup_diagnostics": as_text(data.get("lookup_diagnostics")),
@@ -457,6 +508,7 @@ structured_context: string
 knowledge_context: string
 evidence_context: string
 evidence_priority: string
+source_summary: string
 answer_contract: string
 answer_contract_text: string
 lookup_diagnostics: string
@@ -507,6 +559,9 @@ Answer contract:
 Evidence priority:
 {{Parse Merge Evidence.evidence_priority}}
 
+Source summary:
+{{Parse Merge Evidence.source_summary}}
+
 Evidence:
 {{Parse Merge Evidence.evidence_context}}
 
@@ -519,6 +574,7 @@ If Answer contract contains required_values, include every required value exactl
 Use Knowledge Retrieval only as supplementary context.
 For table, list, field, value, number, date, identifier, and policy questions, do not ignore Structured Lookup just because Knowledge Retrieval has no exact match.
 When evidence contains labels, table headers, page numbers, section names, or record metadata, use them to avoid mixing unrelated values.
+End the answer with one short line that starts with "참조 문서:" and uses Source summary. If Source summary says there is no evidence, write "참조 문서: 제공된 근거 없음".
 If structured lookup answerability says answerable=false and the remaining evidence does not directly answer the requested attribute, say that the provided document does not contain enough evidence.
 If the evidence is insufficient, say that the provided document does not contain enough evidence.
 Answer in Korean unless the user asks for another language.
@@ -668,6 +724,7 @@ structured_lookup_body = {{Structured Lookup.body}}
 knowledge_context = {{Parse Merge Evidence.knowledge_context}}
 evidence_context = {{Parse Merge Evidence.evidence_context}}
 evidence_priority = {{Parse Merge Evidence.evidence_priority}}
+source_summary = {{Parse Merge Evidence.source_summary}}
 answer_contract_text = {{Parse Merge Evidence.answer_contract_text}}
 lookup_answerability = {{Parse Merge Evidence.lookup_answerability}}
 final_answer = {{Final Answer.text}}
@@ -717,6 +774,7 @@ def main(
     knowledge_context="",
     evidence_context="",
     evidence_priority="",
+    source_summary="",
     answer_contract_text="",
     lookup_answerability="",
     final_answer="",
@@ -746,6 +804,7 @@ def main(
             "merge_evidence": {
                 "evidence_context": evidence_context,
                 "evidence_priority": evidence_priority,
+                "source_summary": source_summary,
                 "answer_contract_text": answer_contract_text,
                 "lookup_answerability": answerability,
             },
@@ -850,6 +909,9 @@ Verification issues:
 Evidence priority:
 {{Parse Merge Evidence.evidence_priority}}
 
+Source summary:
+{{Parse Merge Evidence.source_summary}}
+
 Evidence:
 {{Parse Merge Evidence.evidence_context}}
 
@@ -857,6 +919,7 @@ Rewrite the answer using only the evidence.
 If Structured Lookup contains an answer_candidate or directly relevant evidence, answer from Structured Lookup even when Knowledge Retrieval is empty or less specific.
 If evidence contains complete_values, include every value in complete_values exactly once.
 Fix unsupported numbers, unsupported dates, and claims without evidence.
+End the answer with one short line that starts with "참조 문서:" and uses Source summary. If Source summary says there is no evidence, write "참조 문서: 제공된 근거 없음".
 If the evidence is insufficient, say that the provided document does not contain enough evidence.
 Answer in Korean.
 ```
@@ -999,13 +1062,14 @@ Dify `Merge Evidence Request` HTTP 노드에서 사용한다. `Structured Lookup
   "knowledge_context": "...",
   "evidence_context": "...",
   "evidence_priority": "Use Structured Lookup first...",
+  "source_summary": "참조 문서: sample.pdf (p.5, 전형일정)",
   "answer_contract": "{...}",
   "answer_contract_text": "[Answer Contract - obey before writing]\\n...",
   "lookup_answerability": "{...}"
 }
 ```
 
-Dify HTTP Request 노드에서는 위 JSON이 `body` 문자열로 들어온다. 따라서 `Parse Merge Evidence` Code 노드에서 `body`를 파싱한 뒤 `answer_contract_text`와 `evidence_context`를 Final Answer LLM 프롬프트에 연결한다.
+Dify HTTP Request 노드에서는 위 JSON이 `body` 문자열로 들어온다. 따라서 `Parse Merge Evidence` Code 노드에서 `body`를 파싱한 뒤 `answer_contract_text`, `evidence_priority`, `source_summary`, `evidence_context`를 Final Answer LLM 프롬프트에 연결한다.
 
 ### 4.7 POST /chatflow/debug
 
@@ -1028,11 +1092,12 @@ Dify UI에서 답변이 이상할 때 같은 질문으로 API 쪽 흐름을 먼�
 query_plan.query_type == table_lookup
 node_status.structured_lookup_has_context == true
 merge_evidence.evidence_context contains "Structured Lookup - authoritative exact evidence"
+merge_evidence.source_summary starts with "참조 문서:"
 draft_verification.valid == true
 supplied_answer_verification.valid == false
 ```
 
-위 값이 맞으면 FastAPI의 structured lookup, evidence merge, verifier는 정상이다. 그 상태에서 Dify 답변만 실패하면 `Merge Evidence` 코드가 최신인지, `evidence_priority` 출력 변수를 만들었는지, Final Answer LLM User Prompt에 `Evidence priority`와 `Evidence`가 둘 다 연결됐는지 확인한다.
+위 값이 맞으면 FastAPI의 structured lookup, evidence merge, verifier는 정상이다. 그 상태에서 Dify 답변만 실패하면 `Merge Evidence` 코드가 최신인지, `evidence_priority`와 `source_summary` 출력 변수를 만들었는지, Final Answer LLM User Prompt에 `Evidence priority`, `Source summary`, `Evidence`가 모두 연결됐는지 확인한다.
 
 ### 4.8 POST /eval/log
 

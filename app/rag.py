@@ -931,7 +931,7 @@ def build_rag_artifact(
     file_name: str,
     document_id: str | None = None,
     *,
-    chunk_char_limit: int = 3500,
+    chunk_char_limit: int = 1600,
 ) -> RagArtifact:
     normalized = normalize_markdown(markdown)
     normalized = normalize_compact_visual_pair_sections(normalized)
@@ -1318,6 +1318,11 @@ def should_skip_section_block(text: str, section_path: str) -> bool:
     visible = strip_heading_lines(text)
     if not visible:
         return True
+    if is_table_of_contents_title(section_path):
+        return True
+    visible_lines = [line for line in visible.splitlines() if line.strip()]
+    if visible_lines and all(is_table_of_contents_line(line.strip()) for line in visible_lines[:40]):
+        return True
     if all(is_non_retrieval_note_line(line) or not line.strip() for line in visible.splitlines()):
         return True
     if clean_section_path(section_path) == "Embedded Image OCR" and is_embedded_ocr_junk_text(visible):
@@ -1465,8 +1470,8 @@ def expand_tables_to_records(
             index += 1
 
         parsed = parse_markdown_table(table_lines)
-        output.extend(table_lines)
         if not parsed:
+            output.extend(table_lines)
             continue
 
         table_index += 1
@@ -1503,8 +1508,10 @@ def expand_tables_to_records(
 
         if row_texts:
             output.append("")
+            output.append(format_table_retrieval_summary(headers, rows))
+            output.append("")
             output.append("표 행 설명 및 구조화 레코드:")
-            output.extend(row_texts)
+            append_structured_record_blocks(output, row_texts)
 
     plain_marker_records = extract_plain_marker_records(
         lines,
@@ -1519,7 +1526,7 @@ def expand_tables_to_records(
         records.extend(plain_marker_records)
         output.append("")
         output.append("표시/범례 기반 구조화 레코드:")
-        output.extend(build_record_text(record) for record in plain_marker_records)
+        append_structured_record_blocks(output, [build_record_text(record) for record in plain_marker_records])
 
     plain_text_records = extract_plain_text_records(
         lines,
@@ -1533,9 +1540,22 @@ def expand_tables_to_records(
         records.extend(plain_text_records)
         output.append("")
         output.append("본문 구조화 레코드:")
-        output.extend(build_record_text(record) for record in plain_text_records)
+        append_structured_record_blocks(output, [build_record_text(record) for record in plain_text_records])
 
     return normalize_markdown("\n".join(output)), records
+
+
+def format_table_retrieval_summary(headers: list[str], rows: list[list[str]]) -> str:
+    header_text = ", ".join(clean_cell(header) for header in headers if clean_cell(header))
+    return f"표 구조 요약: 열={header_text}; 행수={len(rows)}"
+
+
+def append_structured_record_blocks(output: list[str], record_texts: list[str]) -> None:
+    for record_text in record_texts:
+        if not clean_cell(record_text):
+            continue
+        output.append("")
+        output.append(record_text)
 
 
 def extract_plain_text_records(
@@ -2084,6 +2104,15 @@ def row_to_sentence(fields: dict[str, str]) -> str:
 
 
 def choose_subject_field(items: list[tuple[str, str]]) -> tuple[str, str]:
+    preferred_patterns = [
+        r"모집\s*단위|학과명|학과|학부|전공|제목|항목|대상|명칭|이름|"
+        r"error\s*code|code|api|service|system|feature|plan|data\s*type",
+        r"구분|유형|종류|category|type",
+    ]
+    for pattern in preferred_patterns:
+        for key, value in items:
+            if clean_cell(value) and not looks_like_numeric_or_date(value) and re.search(pattern, key, re.IGNORECASE):
+                return key, value
     for key, value in items:
         if not looks_like_numeric_or_date(value) and not VALUE_FIELD_RE.search(key):
             return key, value
@@ -2707,6 +2736,17 @@ def top_structured_group(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for match in matches
         if (match.get("document_id"), match.get("chunk_id"), match.get("section_path")) == first_key
     ]
+    if len({str(match.get("document_id") or "") for match in matches if match.get("document_id")}) > 1:
+        first_score = float(first.get("score") or 0)
+        first_coverage = float(first.get("coverage") or 0)
+        tied = [
+            match
+            for match in matches
+            if float(match.get("score") or 0) >= first_score - 2.0
+            and float(match.get("coverage") or 0) >= max(0.0, first_coverage - 0.15)
+        ]
+        if len({str(match.get("document_id") or "") for match in tied if match.get("document_id")}) > 1:
+            return tied
     return grouped or matches
 
 
@@ -3083,6 +3123,7 @@ def build_field_value_answer(
 
     values = []
     answer_items = []
+    include_source = len({match_source_label(match) for match in filtered_matches if match_source_label(match)}) > 1
     for match in sorted(filtered_matches, key=match_document_order_key):
         fields = match.get("fields") or {}
         subject_key = choose_subject_answer_field(fields, query_terms, exclude_keys=target_key_set)
@@ -3099,6 +3140,7 @@ def build_field_value_answer(
                 value=value,
                 include_subject=bool(subject_value and len(filtered_matches) > 1),
                 include_field_name=len(target_keys) > 1,
+                source_label=match_source_label(match) if include_source else "",
             )
             if normalize_for_match(display_value) in {normalize_for_match(item) for item in values}:
                 continue
@@ -3215,14 +3257,21 @@ def format_field_value_display(
     value: str,
     include_subject: bool,
     include_field_name: bool,
+    source_label: str = "",
 ) -> str:
     parts = []
+    if source_label:
+        parts.append(source_label)
     if include_subject:
         parts.append(subject_value)
     if include_field_name:
         parts.append(field_name)
     parts.append(value)
     return ": ".join(clean_cell(part) for part in parts if clean_cell(part))
+
+
+def match_source_label(match: dict[str, Any]) -> str:
+    return clean_cell(match.get("file_name") or match.get("document_id") or "")
 
 
 def multi_value_answer_field(query: str, query_type: str) -> str:
@@ -4010,12 +4059,14 @@ def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result
         if structured_context
         else "Use Knowledge Retrieval only because Structured Lookup is empty."
     )
+    source_summary = build_source_summary(lookup_payload, knowledge_items, prefer_structured=bool(structured_context))
 
     return {
         "structured_context": structured_context,
         "knowledge_context": "\n\n".join(knowledge_blocks),
         "evidence_context": evidence_context,
         "evidence_priority": evidence_priority,
+        "source_summary": source_summary,
         "answer_contract": json.dumps(answer_contract, ensure_ascii=False),
         "answer_contract_text": answer_contract_block,
         "lookup_diagnostics": json.dumps(diagnostics, ensure_ascii=False),
@@ -4158,6 +4209,104 @@ def format_knowledge_item(index: int, item: Any) -> str:
     return f"[knowledge {index}]\n{text}" if text else ""
 
 
+def build_source_summary(lookup_payload: dict[str, Any], knowledge_items: list[Any], *, prefer_structured: bool) -> str:
+    structured_sources = source_refs_from_lookup(lookup_payload)
+    knowledge_sources = source_refs_from_knowledge_items(knowledge_items)
+    primary_sources = structured_sources if prefer_structured and structured_sources else knowledge_sources
+    supplementary_sources = knowledge_sources if prefer_structured and structured_sources else []
+    if not primary_sources:
+        return "참조 문서: 제공된 근거 없음"
+
+    summary = "참조 문서: " + "; ".join(format_source_ref(source) for source in primary_sources[:5])
+    extra_sources = [
+        source
+        for source in supplementary_sources
+        if source_ref_key(source) not in {source_ref_key(primary) for primary in primary_sources}
+    ]
+    if extra_sources:
+        summary += " / 보조 검색: " + "; ".join(format_source_ref(source) for source in extra_sources[:3])
+    return summary
+
+
+def source_refs_from_lookup(lookup_payload: dict[str, Any]) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    for key in ("evidence_items", "matches"):
+        value = lookup_payload.get(key)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            sources.append(
+                {
+                    "file_name": first_non_empty_text(item.get("file_name"), item.get("source_file"), item.get("document_name")),
+                    "page": first_non_empty_text(item.get("page"), item.get("source_page"), item.get("page_number")),
+                    "section": first_non_empty_text(item.get("section_path"), item.get("section"), item.get("source_section")),
+                }
+            )
+    return unique_source_refs(sources)
+
+
+def source_refs_from_knowledge_items(knowledge_items: list[Any]) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    for item in knowledge_items:
+        if isinstance(item, dict):
+            metadata = knowledge_item_metadata(item)
+            sources.append(
+                {
+                    "file_name": first_non_empty_text(
+                        metadata.get("source"),
+                        metadata.get("file_name"),
+                        metadata.get("document_name"),
+                        item.get("title"),
+                        item.get("name"),
+                    ),
+                    "page": first_non_empty_text(metadata.get("page"), metadata.get("page_number"), item.get("page")),
+                    "section": first_non_empty_text(metadata.get("section"), metadata.get("section_path"), item.get("section")),
+                }
+            )
+    return unique_source_refs(sources)
+
+
+def unique_source_refs(sources: list[dict[str, str]]) -> list[dict[str, str]]:
+    unique: list[dict[str, str]] = []
+    seen = set()
+    for source in sources:
+        normalized = {
+            "file_name": clean_cell(source.get("file_name", "")),
+            "page": clean_cell(source.get("page", "")),
+            "section": clean_cell(source.get("section", "")),
+        }
+        if not normalized["file_name"] and not normalized["page"] and not normalized["section"]:
+            continue
+        key = source_ref_key(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(normalized)
+    return unique
+
+
+def source_ref_key(source: dict[str, str]) -> tuple[str, str, str]:
+    return (
+        normalize_for_match(source.get("file_name", "")),
+        normalize_for_match(source.get("page", "")),
+        normalize_for_match(source.get("section", "")),
+    )
+
+
+def format_source_ref(source: dict[str, str]) -> str:
+    file_name = clean_cell(source.get("file_name", "")) or "문서명 미상"
+    details = []
+    page = clean_cell(source.get("page", ""))
+    section = clean_cell(source.get("section", ""))
+    if page:
+        details.append(f"p.{page}")
+    if section:
+        details.append(section)
+    return f"{file_name} ({', '.join(details)})" if details else file_name
+
+
 def first_non_empty_text(*values: Any) -> str:
     for value in values:
         text = clean_cell(value)
@@ -4223,10 +4372,12 @@ def trim_text(text: str, limit: int) -> str:
 
 def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, Any]:
     evidence_text = evidence_to_text(evidence)
+    answer_is_abstention = is_abstention_answer(answer)
+    has_evidence = bool(evidence_text.strip())
     issues = []
     if not answer.strip():
         issues.append({"type": "empty_answer", "message": "Answer is empty."})
-    if not evidence_text.strip():
+    if not has_evidence and not answer_is_abstention:
         issues.append({"type": "missing_evidence", "message": "No evidence was provided."})
 
     query_type = classify_query_type(question)
@@ -4237,7 +4388,7 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
     answer_identifiers = extract_identifier_values(answer)
     evidence_identifiers = extract_identifier_values(evidence_text)
 
-    if query_type == "number_lookup" and not answer_numbers:
+    if query_type == "number_lookup" and not answer_numbers and not answer_is_abstention:
         issues.append({"type": "missing_number", "message": "The question asks for a numeric answer, but the answer has no number."})
     for number in answer_numbers:
         if not number_value_supported(number, evidence_numbers):
@@ -4248,7 +4399,7 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
                 }
             )
 
-    if query_type == "date_lookup" and not answer_dates:
+    if query_type == "date_lookup" and not answer_dates and not answer_is_abstention:
         issues.append({"type": "missing_date", "message": "The question asks for a date or period, but the answer has no date."})
     for date in answer_dates:
         if not date_value_supported(date, evidence_dates):
@@ -4300,7 +4451,7 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
                 }
             )
 
-    if looks_like_inverse_value_question(question) and not is_abstention_answer(answer):
+    if looks_like_inverse_value_question(question) and not answer_is_abstention:
         missing_query_constraints = [
             value
             for value in extract_scalar_constraints(question, query_type)
@@ -4325,7 +4476,7 @@ def verify_answer(question: str, answer: str, evidence: list[Any]) -> dict[str, 
             }
         )
 
-    if is_abstention_answer(answer) and evidence_has_answer_candidate(question, evidence_text, query_type):
+    if answer_is_abstention and evidence_has_answer_candidate(question, evidence_text, query_type):
         issues.append(
             {
                 "type": "unnecessary_abstention",

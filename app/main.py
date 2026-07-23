@@ -157,6 +157,7 @@ class MergeEvidenceResponse(BaseModel):
     knowledge_context: str = ""
     evidence_context: str = ""
     evidence_priority: str = ""
+    source_summary: str = ""
     answer_contract: str = ""
     answer_contract_text: str = ""
     lookup_diagnostics: str = ""
