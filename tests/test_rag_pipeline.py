@@ -1024,12 +1024,12 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertNotIn("10. 2.(금)", result["direct_answer"])
         self.assertNotIn("10. 10.(토)", result["direct_answer"])
 
-    def test_scalar_lookup_keeps_tied_values_from_multiple_documents(self):
+    def test_schedule_lookup_prefers_latest_academic_year_document(self):
         older = build_rag_artifact(
             """
 --- Page 5 ---
 
-# 전형일정
+# 2026학년도 전형일정
 
 | 구분 | 항목 | 수시1차 |
 | --- | --- | --- |
@@ -1042,7 +1042,7 @@ AUTH_401 오류는 Reissue API key로 해결한다.
             """
 --- Page 5 ---
 
-# 전형일정
+# 2027학년도 전형일정
 
 | 구분 | 항목 | 수시1차 |
 | --- | --- | --- |
@@ -1059,10 +1059,203 @@ AUTH_401 오류는 Reissue API key로 해결한다.
             limit=8,
         )
 
-        self.assertIn("document.pdf", result["direct_answer"])
-        self.assertIn("2027_admission.pdf", result["direct_answer"])
-        self.assertIn("2026. 2. 3.(화) 09:00 ~ 2. 5.(목) 16:00까지", result["direct_answer"])
+        self.assertNotIn("document.pdf", result["direct_answer"])
+        self.assertNotIn("2026. 2. 3.(화)", result["direct_answer"])
         self.assertIn("2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지", result["direct_answer"])
+
+    def test_versioned_product_docs_prefer_latest_year_when_query_has_no_year(self):
+        older = build_rag_artifact(
+            """
+--- Page 2 ---
+
+# Product Pricing Guide 2024
+
+| Plan | Monthly Price | Included Users |
+| --- | --- | --- |
+| Basic | $29 | 5 users |
+| Pro | $79 | 20 users |
+""",
+            "product_pricing_2024.pdf",
+            document_id="doc_product_2024",
+        )
+        current = build_rag_artifact(
+            """
+--- Page 2 ---
+
+# Product Pricing Guide 2025
+
+| Plan | Monthly Price | Included Users |
+| --- | --- | --- |
+| Basic | $39 | 8 users |
+| Pro | $89 | 25 users |
+""",
+            "product_pricing_2025.pdf",
+            document_id="doc_product_2025",
+        )
+
+        result = lookup_matches(
+            query="Basic plan monthly price?",
+            records=[*older.records, *current.records],
+            chunks=[*older.chunks, *current.chunks],
+            limit=8,
+        )
+
+        self.assertEqual(result["direct_answer"], "Monthly Price: $39")
+        self.assertNotIn("$29", result["direct_answer"])
+        self.assertIn("product_pricing_2025.pdf", merge_evidence_context(result, [])["source_summary"])
+
+    def test_explicit_year_query_does_not_force_latest_versioned_source(self):
+        older = build_rag_artifact(
+            """
+--- Page 2 ---
+
+# Product Pricing Guide 2024
+
+| Plan | Monthly Price | Included Users |
+| --- | --- | --- |
+| Basic | $29 | 5 users |
+""",
+            "product_pricing_2024.pdf",
+            document_id="doc_product_2024",
+        )
+        current = build_rag_artifact(
+            """
+--- Page 2 ---
+
+# Product Pricing Guide 2025
+
+| Plan | Monthly Price | Included Users |
+| --- | --- | --- |
+| Basic | $39 | 8 users |
+""",
+            "product_pricing_2025.pdf",
+            document_id="doc_product_2025",
+        )
+
+        result = lookup_matches(
+            query="2024 Basic plan monthly price?",
+            records=[*older.records, *current.records],
+            chunks=[*older.chunks, *current.chunks],
+            limit=8,
+        )
+
+        self.assertIn("$29", result["direct_answer"])
+        self.assertNotIn("$39", result["direct_answer"])
+
+    def test_versioned_runbooks_prefer_latest_semver_when_query_has_no_version(self):
+        older = build_rag_artifact(
+            """
+--- Page 4 ---
+
+# API Runbook v1.4
+
+| Error Code | Cause | Resolution |
+| --- | --- | --- |
+| AUTH_401 | Expired API token | Reissue API key |
+""",
+            "api_runbook_v1.4.md",
+            document_id="doc_runbook_v14",
+        )
+        current = build_rag_artifact(
+            """
+--- Page 4 ---
+
+# API Runbook v2.1
+
+| Error Code | Cause | Resolution |
+| --- | --- | --- |
+| AUTH_401 | Expired OAuth client secret | Rotate OAuth client secret |
+""",
+            "api_runbook_v2.1.md",
+            document_id="doc_runbook_v21",
+        )
+
+        result = lookup_matches(
+            query="AUTH_401 resolution?",
+            records=[*older.records, *current.records],
+            chunks=[*older.chunks, *current.chunks],
+            limit=8,
+        )
+
+        self.assertIn("Rotate OAuth client secret", result["context"])
+        self.assertNotIn("Reissue API key", result["direct_answer"])
+
+    def test_duplicate_scalar_value_from_multiple_documents_is_required_once(self):
+        older = build_rag_artifact(
+            """
+--- Page 26 ---
+
+# 2026학년도 모집인원
+
+| 모집단위 | 모집 정원 |
+| --- | --- |
+| 컴퓨터정보공학과 | 93 |
+""",
+            "document.pdf",
+            document_id="doc_visual",
+        )
+        current = build_rag_artifact(
+            """
+--- Page 26 ---
+
+# 2027학년도 모집인원
+
+| 모집단위 | 모집 정원 |
+| --- | --- |
+| 컴퓨터정보공학과 ♣ | 93 |
+""",
+            "2027_admission.pdf",
+            document_id="doc_admission",
+        )
+
+        result = lookup_matches(
+            query="컴퓨터정보공학과 정원내 모집정원은 몇 명이야?",
+            records=[*older.records, *current.records],
+            chunks=[*older.chunks, *current.chunks],
+            limit=8,
+        )
+
+        self.assertEqual(result["direct_answer"], "모집 정원: 93")
+        self.assertNotIn("document.pdf", result["direct_answer"])
+        self.assertNotIn("2027_admission.pdf", result["direct_answer"])
+        self.assertEqual([item["value"] for item in result["answer_items"]], ["93"])
+
+        merged = merge_evidence_context(result, [])
+        self.assertIn("complete_values:\n- 93", merged["evidence_context"])
+        verification = verify_answer(
+            "컴퓨터정보공학과 정원내 모집정원은 몇 명이야?",
+            "컴퓨터정보공학과의 정원내 모집정원은 93명입니다.",
+            [merged["evidence_context"]],
+        )
+        self.assertTrue(verification["valid"])
+
+    def test_merge_evidence_ignores_zero_score_knowledge_sources(self):
+        lookup = {
+            "query": "기숙사 비용과 신청기간 알려줘",
+            "query_type": "date_lookup",
+            "direct_answer": "",
+            "answer_items": [],
+            "context": "",
+            "diagnostics": {"answerability": {"answerable": False}},
+        }
+        knowledge_result = {
+            "data": {
+                "records": [
+                    {
+                        "segment": {
+                            "content": "기숙사와 무관한 검색 결과입니다.",
+                            "metadata": {"file_name": "admission.pdf", "page": 1},
+                        },
+                        "score": 0.0,
+                    }
+                ]
+            }
+        }
+
+        merged = merge_evidence_context(lookup, knowledge_result)
+
+        self.assertEqual(merged["knowledge_context"], "")
+        self.assertEqual(merged["source_summary"], "참조 문서: 제공된 근거 없음")
 
     def test_verify_accepts_abstention_when_evidence_is_missing(self):
         result = verify_answer(

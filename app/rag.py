@@ -2621,7 +2621,7 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
         if marker_meaning["direct_answer"]:
             return marker_meaning
 
-    top_group = top_structured_group(structured)
+    top_group = top_structured_group(structured, query=query, query_type=query_type)
     query_keywords = meaningful_answer_terms([*extract_keywords(query, limit=16), *entities])
     if not query_keywords:
         return empty
@@ -2726,9 +2726,13 @@ def build_marker_meaning_answer(query: str, matches: list[dict[str, Any]]) -> di
     }
 
 
-def top_structured_group(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def top_structured_group(matches: list[dict[str, Any]], *, query: str = "", query_type: str = "") -> list[dict[str, Any]]:
     if not matches:
         return []
+    latest_group = latest_versioned_source_group(matches, query=query, query_type=query_type)
+    if latest_group:
+        return latest_group
+
     first = matches[0]
     first_key = (first.get("document_id"), first.get("chunk_id"), first.get("section_path"))
     grouped = [
@@ -2748,6 +2752,112 @@ def top_structured_group(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if len({str(match.get("document_id") or "") for match in tied if match.get("document_id")}) > 1:
             return tied
     return grouped or matches
+
+
+def latest_versioned_source_group(matches: list[dict[str, Any]], *, query: str, query_type: str) -> list[dict[str, Any]]:
+    if query_type not in STRUCTURED_LOOKUP_TYPES:
+        return []
+    if query_has_explicit_version_reference(query):
+        return []
+
+    groups: dict[tuple[Any, Any, Any], list[dict[str, Any]]] = {}
+    for match in matches:
+        key = (match.get("document_id"), match.get("chunk_id"), match.get("section_path"))
+        groups.setdefault(key, []).append(match)
+
+    scored_groups = []
+    for group in groups.values():
+        rank = max((match_source_version_rank(match) for match in group), default=())
+        if not rank:
+            continue
+        score = max(float(match.get("score") or 0) for match in group)
+        coverage = max(float(match.get("coverage") or 0) for match in group)
+        scored_groups.append({"rank": rank, "score": score, "coverage": coverage, "group": group})
+
+    if len(scored_groups) < 2:
+        return []
+
+    top_category = max(item["rank"][0] for item in scored_groups)
+    same_category_groups = [item for item in scored_groups if item["rank"][0] == top_category]
+    if len(same_category_groups) < 2:
+        return []
+
+    top_score = max(item["score"] for item in same_category_groups)
+    top_coverage = max(item["coverage"] for item in same_category_groups)
+    comparable = [
+        item
+        for item in same_category_groups
+        if item["score"] >= max(0.0, top_score * 0.55)
+        and item["coverage"] >= max(0.0, top_coverage - 0.25)
+    ]
+    if len(comparable) < 2:
+        return []
+
+    latest = max(comparable, key=lambda item: (item["rank"], item["score"], item["coverage"]))
+    if latest["rank"] <= max(item["rank"] for item in comparable if item is not latest):
+        return []
+    return latest["group"]
+
+
+def query_has_explicit_version_reference(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?<!\d)20\d{2}(?:\s*학년도|\s*년|\s*edition|\s*manual|\s*policy|\s*report)?"
+            r"|\bFY[-\s]?20\d{2}\b"
+            r"|\b(?:v|ver\.?|version|edition|release)\s*\d+(?:\.\d+){0,3}\b",
+            text or "",
+            re.IGNORECASE,
+        )
+    )
+
+
+def match_source_version_rank(match: dict[str, Any]) -> tuple[int, int, int, int]:
+    text = version_source_text(match)
+    ranks = extract_version_ranks(text)
+    return max(ranks) if ranks else ()
+
+
+def version_source_text(match: dict[str, Any]) -> str:
+    return " ".join(
+        [
+            str(match.get("file_name") or ""),
+            str(match.get("section_path") or ""),
+        ]
+    )
+
+
+def extract_version_ranks(text: str) -> list[tuple[int, int, int, int]]:
+    text = clean_cell(text)
+    if not text:
+        return []
+    ranks: list[tuple[int, int, int, int]] = []
+
+    for match in re.finditer(r"(?<!\d)(20\d{2})\s*(?:학년도|年度|년판|edition|Edition)", text, re.IGNORECASE):
+        ranks.append((2, int(match.group(1)), 0, 0))
+    for match in re.finditer(r"\bFY[-\s]?(20\d{2})\b", text, re.IGNORECASE):
+        ranks.append((2, int(match.group(1)), 0, 0))
+    if source_has_version_context(text):
+        for match in re.finditer(r"(?<!\d)(20\d{2})(?!\d)", text):
+            ranks.append((2, int(match.group(1)), 0, 0))
+
+    for match in re.finditer(r"\b(?:v|ver\.?|version|edition|release)\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?\b", text, re.IGNORECASE):
+        major = int(match.group(1))
+        minor = int(match.group(2) or 0)
+        patch = int(match.group(3) or 0)
+        ranks.append((1, major, minor, patch))
+    return ranks
+
+
+def source_has_version_context(text: str) -> bool:
+    return bool(
+        re.search(
+            r"학년도|年度|연도|년판|fy|annual|edition|version|ver\.?|release|changelog|"
+            r"manual|handbook|guide|policy|report|runbook|pricing|price|catalog|"
+            r"요강|매뉴얼|핸드북|가이드|정책|규정|보고서|런북|릴리스|개정|가격표|요금표|카탈로그|운영|안내",
+            text,
+            re.IGNORECASE,
+        )
+    )
 
 
 def meaningful_answer_terms(terms: list[str]) -> list[str]:
@@ -3123,7 +3233,8 @@ def build_field_value_answer(
 
     values = []
     answer_items = []
-    include_source = len({match_source_label(match) for match in filtered_matches if match_source_label(match)}) > 1
+    has_conflicting_answer_values = len(target_value_norms_for_matches(filtered_matches, target_keys, query_type, detect_attribute_concepts(query))) > 1
+    include_source = has_conflicting_answer_values and len({match_source_label(match) for match in filtered_matches if match_source_label(match)}) > 1
     for match in sorted(filtered_matches, key=match_document_order_key):
         fields = match.get("fields") or {}
         subject_key = choose_subject_answer_field(fields, query_terms, exclude_keys=target_key_set)
@@ -3138,7 +3249,7 @@ def build_field_value_answer(
                 subject_value=subject_value,
                 field_name=target_key,
                 value=value,
-                include_subject=bool(subject_value and len(filtered_matches) > 1),
+                include_subject=bool(subject_value and has_conflicting_answer_values and len(filtered_matches) > 1),
                 include_field_name=len(target_keys) > 1,
                 source_label=match_source_label(match) if include_source else "",
             )
@@ -3150,6 +3261,8 @@ def build_field_value_answer(
                     "value": display_value,
                     "field": target_key,
                     "record_id": match.get("record_id", ""),
+                    "document_id": match.get("document_id", ""),
+                    "file_name": match.get("file_name", ""),
                     "page": match.get("page"),
                     "section_path": match.get("section_path", ""),
                     "fields": fields,
@@ -3272,6 +3385,27 @@ def format_field_value_display(
 
 def match_source_label(match: dict[str, Any]) -> str:
     return clean_cell(match.get("file_name") or match.get("document_id") or "")
+
+
+def target_value_norms_for_matches(
+    matches: list[dict[str, Any]],
+    target_keys: list[str],
+    query_type: str,
+    query_attrs: set[str],
+) -> set[str]:
+    norms: set[str] = set()
+    for match in matches:
+        fields = match.get("fields") or {}
+        for target_key in target_keys:
+            value = clean_cell(fields.get(target_key, ""))
+            if not value:
+                continue
+            if query_type in {"number_lookup", "date_lookup"} and not value_matches_scalar_query(value, query_type, query_attrs):
+                continue
+            norm = normalize_for_match(value)
+            if norm:
+                norms.add(norm)
+    return norms
 
 
 def multi_value_answer_field(query: str, query_type: str) -> str:
@@ -4032,7 +4166,7 @@ def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result
 
     answer_contract = answer_contract_from_lookup(lookup_payload, diagnostics)
     answer_contract_block = format_answer_contract_context(answer_contract)
-    knowledge_items = extract_knowledge_items(knowledge_result)
+    knowledge_items = filter_relevant_knowledge_items(extract_knowledge_items(knowledge_result))
 
     knowledge_blocks = []
     for index, item in enumerate(knowledge_items[:12], start=1):
@@ -4145,6 +4279,40 @@ def extract_knowledge_items(value: Any, *, limit: int = 12) -> list[Any]:
     return items[:limit]
 
 
+def filter_relevant_knowledge_items(items: list[Any], *, min_score: float = 0.01) -> list[Any]:
+    filtered = []
+    for item in items:
+        score = knowledge_item_score(item)
+        if score is not None and score < min_score:
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def knowledge_item_score(item: Any) -> float | None:
+    if not isinstance(item, dict):
+        return None
+    for key in ("score", "similarity", "rerank_score"):
+        value = item.get(key)
+        try:
+            if value is not None and str(value).strip() != "":
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    for nested_key in ("segment", "document", "data", "metadata"):
+        nested = item.get(nested_key)
+        if not isinstance(nested, dict):
+            continue
+        for key in ("score", "similarity", "rerank_score"):
+            value = nested.get(key)
+            try:
+                if value is not None and str(value).strip() != "":
+                    return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def knowledge_item_has_content(item: dict[str, Any]) -> bool:
     return bool(knowledge_item_content(item))
 
@@ -4229,6 +4397,25 @@ def build_source_summary(lookup_payload: dict[str, Any], knowledge_items: list[A
 
 
 def source_refs_from_lookup(lookup_payload: dict[str, Any]) -> list[dict[str, str]]:
+    match_sources_by_record_id = lookup_match_sources_by_record_id(lookup_payload)
+    answer_sources: list[dict[str, str]] = []
+    answer_items = lookup_payload.get("answer_items")
+    if isinstance(answer_items, list):
+        for item in answer_items:
+            if not isinstance(item, dict):
+                continue
+            record_source = match_sources_by_record_id.get(str(item.get("record_id") or ""), {})
+            answer_sources.append(
+                {
+                    "file_name": first_non_empty_text(item.get("file_name"), record_source.get("file_name")),
+                    "page": first_non_empty_text(item.get("page"), record_source.get("page")),
+                    "section": first_non_empty_text(item.get("section_path"), item.get("section"), record_source.get("section")),
+                }
+            )
+    answer_sources = unique_source_refs(answer_sources)
+    if answer_sources:
+        return answer_sources
+
     sources: list[dict[str, str]] = []
     for key in ("evidence_items", "matches"):
         value = lookup_payload.get(key)
@@ -4245,6 +4432,26 @@ def source_refs_from_lookup(lookup_payload: dict[str, Any]) -> list[dict[str, st
                 }
             )
     return unique_source_refs(sources)
+
+
+def lookup_match_sources_by_record_id(lookup_payload: dict[str, Any]) -> dict[str, dict[str, str]]:
+    by_record_id: dict[str, dict[str, str]] = {}
+    for key in ("evidence_items", "matches"):
+        value = lookup_payload.get(key)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            record_id = str(item.get("record_id") or "")
+            if not record_id or record_id in by_record_id:
+                continue
+            by_record_id[record_id] = {
+                "file_name": first_non_empty_text(item.get("file_name"), item.get("source_file"), item.get("document_name")),
+                "page": first_non_empty_text(item.get("page"), item.get("source_page"), item.get("page_number")),
+                "section": first_non_empty_text(item.get("section_path"), item.get("section"), item.get("source_section")),
+            }
+    return by_record_id
 
 
 def source_refs_from_knowledge_items(knowledge_items: list[Any]) -> list[dict[str, str]]:
