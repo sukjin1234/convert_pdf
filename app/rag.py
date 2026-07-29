@@ -86,6 +86,11 @@ IDENTIFIER_RE = re.compile(
 )
 EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9._%+-])")
 PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)\d{3,4}[-.\s]?\d{4}(?!\d)")
+NUMBER_WITH_UNIT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*"
+    r"(?:명|개|건|회|원|만원|억원|달러|USD|KRW|%|점|학점|초|분|시간|일|개월|년|ms|s|KB|MB|GB|TB|req/s|rpm)",
+    re.IGNORECASE,
+)
 
 ABSTENTION_RE = re.compile(
     r"충분한\s*근거|근거가\s*(?:부족|충분하지)|정보가\s*(?:없|부족)|"
@@ -665,6 +670,10 @@ QUERY_TYPE_TERMS = {
         "뭐야",
         "설명",
         "용어",
+        "제도",
+        "인증제도",
+        "프로그램",
+        "소개",
         "definition",
         "meaning",
         "concept",
@@ -2260,12 +2269,32 @@ def classify_query_type(query: str) -> str:
         query_type: sum(1 for term in terms if query_type_term_matches(term, lower))
         for query_type, terms in QUERY_TYPE_TERMS.items()
     }
-    if NUMBER_RE.search(query) and scores["date_lookup"] == 0:
+    if query_has_numeric_value_signal(query) and scores["date_lookup"] == 0:
         scores["number_lookup"] += 1
     if DATE_RE.search(query):
         scores["date_lookup"] += 2
     best_type, best_score = max(scores.items(), key=lambda item: item[1])
     return best_type if best_score > 0 else "semantic"
+
+
+def query_has_numeric_value_signal(query: str) -> bool:
+    if NUMBER_WITH_UNIT_RE.search(query):
+        return True
+    for match in NUMBER_RE.finditer(query or ""):
+        value = match.group(0).strip()
+        if not value or not re.search(r"\d", value):
+            continue
+        start, end = match.span()
+        previous_char = query[start - 1] if start > 0 else ""
+        next_char = query[end] if end < len(query) else ""
+        if previous_char and re.match(r"[A-Za-z0-9_-]", previous_char):
+            continue
+        if next_char and re.match(r"[A-Za-z_-]", next_char):
+            continue
+        if next_char and next_char in {".", "/"}:
+            continue
+        return True
+    return False
 
 
 def query_type_term_matches(term: str, lower_query: str) -> bool:
@@ -3918,7 +3947,7 @@ def score_record(record: StructuredRecord, terms: list[str], query_type: str) ->
         "troubleshooting": {"troubleshooting"},
         "contact_lookup": {"contact"},
         "dependency_lookup": {"dependency"},
-        "definition": {"key_value", "table_row", "policy"},
+        "definition": {"key_value", "policy"},
         "comparison": TABLE_RECORD_TYPES,
     }
     if has_term_signal and record.record_type in query_record_bonus.get(query_type, set()):

@@ -90,6 +90,60 @@ class RagPipelineTest(unittest.TestCase):
         self.assertFalse(rejected["valid"])
         self.assertTrue(any(issue["type"] == "unsupported_number" for issue in rejected["issues"]))
 
+    def test_identifier_number_does_not_force_number_lookup(self):
+        self.assertEqual(plan_query("3-IN 인증제도 알려줘")["query_type"], "definition")
+        self.assertEqual(plan_query("3-IN 인증제도는 뭐야")["query_type"], "definition")
+        self.assertNotEqual(plan_query("v2.1 릴리스 알려줘")["query_type"], "number_lookup")
+        self.assertEqual(plan_query("3개 알려줘")["query_type"], "number_lookup")
+
+    def test_definition_query_uses_section_overview_not_numeric_identifier_row(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 15 ---
+
+## 학생 3-IN 인증제도
+
+체계적인 프로그램으로 학습을 지원합니다.
+
+학생 3-In 인증 프로그램 소개
+
+| 인증단계 | 프로그램 | 내용 |
+| --- | --- | --- |
+| 1-In | 핵심역량진단(필수) | 학생의 역량 진단 및 분석 |
+| 2-In | Shoot! POM 나는 경진대회 | 프레젠테이션 능력 향상 |
+| 3-In | TOC 튜터 멘토링 | 교수님과 학생이 함께 학습 |
+
+--- Page 16 ---
+
+항공안전훈련실습실(1) 항공안전훈련실습실(2)
+
+비행실습장(1) 비행실습장(2)
+""",
+            "document.pdf",
+            document_id="doc_3in",
+        )
+
+        question = "3-IN 인증제도 알려줘"
+        plan = plan_query(question)
+        result = lookup_matches(
+            query=question,
+            records=artifact.records,
+            chunks=artifact.chunks,
+            entities=plan["entities"],
+            query_type=plan["query_type"],
+            limit=8,
+        )
+        merged = merge_evidence_context(result, [])
+
+        self.assertEqual(plan["query_type"], "definition")
+        self.assertEqual(result["direct_answer"], "")
+        self.assertNotIn("[Direct Answer - complete structured result]", result["context"])
+        self.assertIn("체계적인 프로그램으로 학습을 지원합니다", result["context"])
+        self.assertIn("1-In", result["context"])
+        self.assertIn("2-In", result["context"])
+        self.assertIn("3-In", result["context"])
+        self.assertIn("document.pdf (p.15, 학생 3-IN 인증제도)", merged["source_summary"])
+
     def test_scalar_lookup_prefers_requested_numeric_field_over_subject_field(self):
         artifact = build_rag_artifact(
             """
