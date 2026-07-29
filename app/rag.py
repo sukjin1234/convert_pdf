@@ -20,6 +20,25 @@ logger = logging.getLogger(__name__)
 
 PAGE_RE = re.compile(r"(?m)^\s*---\s*Page\s+(\d+)\s*---\s*$")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+OUTLINE_MAJOR_RE = re.compile(
+    r"^(?:"
+    r"[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+|"
+    r"[IVXLCDM]+|"
+    r"(?:chapter|part)\s+(?:\d+|[IVXLCDM]+)|"
+    r"제\s*\d+\s*장"
+    r")\s*(?:[.．、:：)\]-]|\s)",
+    re.IGNORECASE,
+)
+OUTLINE_SECTION_RE = re.compile(
+    r"^(?:"
+    r"(?:section|절)\s*(?:\d+|[IVXLCDM]+)|"
+    r"제\s*\d+\s*(?:절|조)|"
+    r"\d+\s*[.．]\s+"
+    r")",
+    re.IGNORECASE,
+)
+OUTLINE_SUBSECTION_RE = re.compile(r"^(?:\(\s*\d+\s*\)|\d+\s*\))\s*")
+OUTLINE_DECIMAL_RE = re.compile(r"^(?P<number>\d+(?:\.\d+)+)\s*(?:[.．、:：)\]-]|\s)")
 
 DATE_RE = re.compile(
     r"(?:(?:19|20)\d{2}\s*[.\-/년]\s*)?"
@@ -294,8 +313,12 @@ STOPWORDS = {
     "무엇",
     "무엇인가",
     "무엇인지",
+    "무엇을",
     "어떻게",
     "어떤",
+    "하는지",
+    "해줘",
+    "알려",
     "얼마",
     "얼마야",
     "몇",
@@ -1262,7 +1285,7 @@ def iter_section_blocks(markdown: str) -> Iterable[dict[str, Any]]:
             text = normalize_markdown("\n".join(current_lines))
             if not text:
                 return None
-            section_path = resolve_block_section_path(current_section, text)
+            section_path = resolve_block_section_path(current_section, text, page=page)
             if should_skip_section_block(text, section_path):
                 return None
             return {
@@ -1282,8 +1305,7 @@ def iter_section_blocks(markdown: str) -> Iterable[dict[str, Any]]:
                 if block:
                     yield block
                 level = len(match.group(1))
-                section_stack = [(item_level, item_title) for item_level, item_title in section_stack if item_level < level]
-                section_stack.append((level, title))
+                section_stack = update_section_stack(section_stack, level, title)
                 current_section = " > ".join(item_title for _, item_title in section_stack)
                 current_title = title
                 current_lines = [line]
@@ -1323,12 +1345,71 @@ def should_reset_section_stack_for_page(section_stack: list[tuple[int, str]], pa
     return False
 
 
-def resolve_block_section_path(current_section: str, text: str) -> str:
+def update_section_stack(
+    section_stack: list[tuple[int, str]],
+    declared_level: int,
+    title: str,
+) -> list[tuple[int, str]]:
+    """Merge parser heading levels with numbering semantics from the document outline."""
+    title = clean_cell(title)
+    outline_depth = heading_outline_depth(title)
+    if outline_depth is None:
+        parent_items = [(level, item_title) for level, item_title in section_stack if level < declared_level]
+        return [*parent_items, (declared_level, title)]
+
+    same_depth_index: int | None = None
+    parent_index: int | None = None
+    for index in range(len(section_stack) - 1, -1, -1):
+        item_depth = heading_outline_depth(section_stack[index][1])
+        if item_depth is None:
+            continue
+        if item_depth == outline_depth:
+            same_depth_index = index
+            break
+        if item_depth < outline_depth:
+            parent_index = index
+            break
+
+    if same_depth_index is not None:
+        parent_items = section_stack[:same_depth_index]
+    elif parent_index is not None:
+        parent_items = section_stack[: parent_index + 1]
+    else:
+        parent_items = [(level, item_title) for level, item_title in section_stack if level < declared_level]
+
+    logical_level = parent_items[-1][0] + 1 if parent_items else 1
+    return [*parent_items, (logical_level, title)]
+
+
+def heading_outline_depth(title: str) -> int | None:
+    text = clean_cell(title)
+    if not text:
+        return None
+    if OUTLINE_MAJOR_RE.match(text):
+        return 1
+
+    decimal_match = OUTLINE_DECIMAL_RE.match(text)
+    if decimal_match:
+        component_count = len(decimal_match.group("number").split("."))
+        return min(component_count + 1, 6)
+
+    if OUTLINE_SECTION_RE.match(text):
+        return 2
+    if OUTLINE_SUBSECTION_RE.match(text):
+        return 3
+    return None
+
+
+def resolve_block_section_path(current_section: str, text: str, *, page: int | None = None) -> str:
     current_section = clean_section_path(current_section)
     if current_section and not is_table_of_contents_title(current_section):
         return current_section
     inferred = infer_section_path_from_block(text)
-    return inferred or ("" if is_table_of_contents_title(current_section) else current_section)
+    if inferred:
+        return inferred
+    if is_table_of_contents_title(current_section):
+        return ""
+    return f"Page {page}" if page is not None else "Document"
 
 
 def clean_section_path(value: str) -> str:
@@ -1388,6 +1469,60 @@ def infer_section_path_from_block(text: str) -> str:
         return "원서접수 비용"
     if "toc" in normalized or "contents" in normalized:
         return ""
+    visual_title = infer_standalone_page_title(text)
+    if visual_title:
+        return visual_title
+    table_section = infer_table_section(text)
+    if table_section:
+        return table_section
+    return ""
+
+
+def infer_standalone_page_title(text: str) -> str:
+    lines = (text or "").splitlines()
+    meaningful = [(index, clean_cell(line)) for index, line in enumerate(lines) if clean_cell(line)]
+    if not meaningful:
+        return ""
+
+    first_index, first = meaningful[0]
+    if first_index > 2 or len(first) < 2 or len(first) > 72:
+        return ""
+    if HEADING_RE.match(lines[first_index].strip()):
+        return ""
+    if first.startswith(("|", ">", "-", "*")) or re.match(r"^\d+[.)]\s+", first):
+        return ""
+    if DATE_RE.search(first) or NUMBER_WITH_UNIT_RE.search(first):
+        return ""
+    if re.search(r"[.!?。！？]\s*$|(?:습니다|입니다|한다|된다|있다|없다)\s*$", first, re.IGNORECASE):
+        return ""
+
+    if len(meaningful) == 1:
+        return first
+
+    _, second = meaningful[1]
+    has_visual_break = any(not line.strip() for line in lines[first_index + 1 : meaningful[1][0]])
+    second_starts_structure = second.startswith("|") or bool(re.match(r"^(?:[-*+]|\d+[.)])\s+", second))
+    if has_visual_break and second_starts_structure:
+        return first
+    if has_visual_break and len(re.findall(r"[0-9A-Za-z가-힣]+", first)) <= 12:
+        return first
+    return ""
+
+
+def infer_table_section(text: str) -> str:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    for index, line in enumerate(lines[:-1]):
+        if not looks_like_table_row(line):
+            continue
+        headers = [cell for cell in split_table_row(line) if cell]
+        if not headers or index + 1 >= len(lines):
+            continue
+        if not is_separator_row(split_table_row(lines[index + 1])):
+            continue
+        useful = [header for header in headers if normalize_for_match(header) not in {"구분", "항목", "내용", "비고"}]
+        selected = (useful or headers)[:3]
+        if selected:
+            return "Table: " + " / ".join(selected)
     return ""
 
 
@@ -2104,6 +2239,7 @@ def is_separator_row(row: list[str]) -> bool:
 
 def clean_cell(value: Any) -> str:
     text = str(value or "")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
     text = text.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
     text = re.sub(r"[*`]+", "", text)
     text = re.sub(r"\s+", " ", text)
@@ -3149,6 +3285,10 @@ def split_compound_answer_value(value: str) -> list[str]:
 
 
 def choose_target_field_key(query: str, query_terms: list[str], matches: list[dict[str, Any]]) -> str:
+    preferred_descriptive_key = choose_descriptive_value_field_for_procedure(query, matches)
+    if preferred_descriptive_key:
+        return preferred_descriptive_key
+
     query_norm = normalize_for_match(query)
     scores: Counter[str] = Counter()
     key_by_norm: dict[str, str] = {}
@@ -3188,6 +3328,48 @@ def choose_target_field_key(query: str, query_terms: list[str], matches: list[di
         return ""
     key_norm, score = scores.most_common(1)[0]
     return key_by_norm.get(key_norm, "") if score >= 3 else ""
+
+
+def choose_descriptive_value_field_for_procedure(query: str, matches: list[dict[str, Any]]) -> str:
+    if not re.search(r"단계|절차|방법|활동|무엇|하는지|프로세스|process|procedure|step|activity|task", query, re.IGNORECASE):
+        return ""
+
+    descriptive_patterns = [
+        r"활동|내용|설명|방법|절차|작업|역할|수행|산출물|결과|"
+        r"activity|activities|description|detail|task|action|step|output|result",
+    ]
+    subject_patterns = [
+        r"단계|구분|항목|유형|종류|분류|이름|명칭|"
+        r"phase|stage|category|type|name|item",
+    ]
+    scores: Counter[str] = Counter()
+    key_by_norm: dict[str, str] = {}
+    query_norm = normalize_for_match(query)
+
+    for match in matches:
+        fields = match.get("fields") or {}
+        for key, value in fields.items():
+            key = clean_cell(key)
+            value = clean_cell(value)
+            if not key or not value or key in MARKER_METADATA_FIELDS:
+                continue
+            key_norm = normalize_for_match(key)
+            if not key_norm:
+                continue
+            key_by_norm[key_norm] = key
+            if any(re.search(pattern, key, re.IGNORECASE) for pattern in descriptive_patterns):
+                scores[key_norm] += 8
+            if any(re.search(pattern, key, re.IGNORECASE) for pattern in subject_patterns):
+                scores[key_norm] -= 6
+            if normalize_for_match(value) and normalize_for_match(value) in query_norm:
+                scores[key_norm] -= 4
+            if len(value) >= 12:
+                scores[key_norm] += 2
+
+    if not scores:
+        return ""
+    key_norm, score = scores.most_common(1)[0]
+    return key_by_norm.get(key_norm, "") if score >= 4 else ""
 
 
 def match_document_order_key(match: dict[str, Any]) -> tuple[Any, ...]:

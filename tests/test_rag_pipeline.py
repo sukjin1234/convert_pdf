@@ -1460,6 +1460,158 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertTrue(any(record.fields.get("모집단위") == "기계공학과" for record in artifact.records))
         self.assertFalse(any("목   차 항목" in record.answer_text for record in artifact.records))
 
+    def test_outline_numbering_corrects_parser_heading_level_across_pages(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 4 ---
+
+# 2027 Admission Guide
+
+##### Ⅰ. 모집인원
+
+###### 2. 정원외 전형 모집인원
+
+| 전형 | 모집인원 |
+| --- | --- |
+| 농어촌 | 12 |
+
+--- Page 5 ---
+
+###### Ⅱ. 전형일정
+
+| 구분 | 수시1차 |
+| --- | --- |
+| 원서접수 | 2026. 9. 7. ~ 9. 30. |
+""",
+            "admission.pdf",
+            document_id="doc_outline_levels",
+        )
+
+        page5_sections = {chunk.section_path for chunk in artifact.chunks if chunk.page_start == 5}
+        self.assertEqual(page5_sections, {"2027 Admission Guide > Ⅱ. 전형일정"})
+        self.assertFalse(any("정원외 전형 모집인원" in section for section in page5_sections))
+
+    def test_chapter_outline_is_rebuilt_for_software_manual_pages(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# API Operations Manual
+
+##### Chapter 1 Platform Architecture
+
+###### 1.1 Request Flow
+
+Requests pass through the gateway and authentication service.
+
+--- Page 2 ---
+
+###### Chapter 2 Incident Response
+
+###### 2.1 Initial Triage
+
+Create an incident ticket and assess customer impact.
+""",
+            "operations.pdf",
+            document_id="doc_software_outline",
+        )
+
+        page2_sections = [chunk.section_path for chunk in artifact.chunks if chunk.page_start == 2]
+        self.assertEqual(
+            page2_sections,
+            ["API Operations Manual > Chapter 2 Incident Response > 2.1 Initial Triage"],
+        )
+        self.assertNotIn("Chapter 1 Platform Architecture", page2_sections[0])
+
+    def test_korean_policy_outline_is_rebuilt_across_pages(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# 정보보호 정책
+
+##### 제1장 접근 통제
+
+###### 제1조 관리자 계정
+
+관리자 계정은 다중 인증을 사용해야 한다.
+
+--- Page 2 ---
+
+###### 제2장 사고 대응
+
+###### 제3조 보고 기한
+
+보안 사고는 발견 후 24시간 이내 보고해야 한다.
+""",
+            "security_policy.pdf",
+            document_id="doc_policy_outline",
+        )
+
+        page2_sections = [chunk.section_path for chunk in artifact.chunks if chunk.page_start == 2]
+        self.assertEqual(page2_sections, ["정보보호 정책 > 제2장 사고 대응 > 제3조 보고 기한"])
+        self.assertNotIn("접근 통제", page2_sections[0])
+
+    def test_headingless_visual_page_uses_page_title_as_section(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 8 ---
+
+서비스 상태 요약
+
+| Service | Availability | Owner |
+| --- | --- | --- |
+| Billing API | 99.9% | Platform |
+""",
+            "service_report.pdf",
+            document_id="doc_visual_page_title",
+        )
+
+        self.assertEqual({chunk.section_path for chunk in artifact.chunks}, {"서비스 상태 요약"})
+        self.assertIn("[section: 서비스 상태 요약]", artifact.dify_markdown)
+
+    def test_headingless_table_uses_domain_neutral_schema_section(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 3 ---
+
+| Error Code | HTTP Status | Resolution |
+| --- | --- | --- |
+| AUTH_401 | 401 | Reissue API key |
+""",
+            "runbook.pdf",
+            document_id="doc_table_section",
+        )
+
+        self.assertEqual(
+            {chunk.section_path for chunk in artifact.chunks},
+            {"Table: Error Code / HTTP Status / Resolution"},
+        )
+
+    def test_single_visual_label_and_unstructured_page_never_use_untitled_section(self):
+        visual = build_rag_artifact(
+            """
+--- Page 9 ---
+
+항공분야
+""",
+            "college_brochure.pdf",
+            document_id="doc_single_visual_label",
+        )
+        fallback = build_rag_artifact(
+            """
+--- Page 4 ---
+
+This paragraph contains general supporting material that continues without a detectable title.
+""",
+            "technical_appendix.pdf",
+            document_id="doc_page_fallback",
+        )
+
+        self.assertEqual({chunk.section_path for chunk in visual.chunks}, {"항공분야"})
+        self.assertEqual({chunk.section_path for chunk in fallback.chunks}, {"Page 4"})
+        self.assertNotIn("[section: Untitled]", visual.dify_markdown + fallback.dify_markdown)
+
     def test_compact_visual_title_content_rows_become_structured_pairs(self):
         artifact = build_rag_artifact(
             """
@@ -1661,9 +1813,77 @@ AK
 
         self.assertEqual(len(artifact.chunks), 1)
         self.assertIn("항공분야", artifact.dify_markdown)
+        self.assertEqual(artifact.chunks[0].section_path, "항공분야")
         self.assertNotIn("이미지/도식 중심 페이지", artifact.dify_markdown)
         self.assertNotIn("Embedded Image OCR", artifact.dify_markdown)
         self.assertNotIn("AK", artifact.dify_markdown)
+
+    def test_mixed_domain_procedure_query_prefers_software_requirements_over_admission_eligibility(self):
+        admission = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# 지원자격
+
+일반전형 지원자격은 고등학교 졸업자입니다.
+
+| 전형 | 지원자격 |
+| --- | --- |
+| 일반고 | 일반고 졸업자 |
+""",
+            "admission.pdf",
+            document_id="admission_doc",
+        )
+        software = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# 요구분석
+
+요구분석 단계에서는 사용자의 요구사항을 수집하고 기능 요구사항과 비기능 요구사항을 분석한다.
+
+| 단계 | 활동 |
+| --- | --- |
+| 요구분석 | 요구사항 수집, 분석, 명세 작성 |
+""",
+            "ch04_요구분석.pdf",
+            document_id="software_doc",
+        )
+
+        question = "요구분석 단계에서 무엇을 하는지 알려줘"
+        plan = plan_query(question)
+        result = lookup_matches(
+            query=question,
+            records=[*admission.records, *software.records],
+            chunks=[*admission.chunks, *software.chunks],
+            entities=plan["entities"],
+            query_type=plan["query_type"],
+            limit=5,
+        )
+
+        self.assertEqual(plan["query_type"], "procedure")
+        self.assertIn("요구사항 수집", result["direct_answer"])
+        self.assertIn("ch04_요구분석.pdf", result["context"])
+        self.assertNotIn("일반고 졸업자", result["direct_answer"])
+
+    def test_control_characters_are_removed_from_rag_markdown_and_records(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 전형일정
+
+| 구분 | 수시1차 |
+| --- | --- |
+| 원서접수 | 2026.\x00 9.\x00 7.(월)\x00 09:00 ~\x00 9.\x00 30.(수)\x00 21:00까지 |
+""",
+            "schedule.pdf",
+            document_id="control_chars",
+        )
+
+        self.assertNotIn("\x00", artifact.dify_markdown)
+        self.assertIn("2026. 9. 7.", artifact.dify_markdown)
+        self.assertTrue(all("\x00" not in record.answer_text for record in artifact.records))
 
 
 if __name__ == "__main__":

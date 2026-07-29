@@ -202,13 +202,21 @@ Start
             -> Merge Evidence Request
             -> Parse Merge Evidence
             -> Final Answer LLM, 답변 끝에 참조 문서 표시
-            -> Save Conversation State
             -> Build Verify Body
             -> Verify Answer
             -> Parse Verify Result
-            -> Build Eval Log Body
-            -> Eval Log
             -> Conditional
+               TRUE  -> Build Conversation State(Final Answer)
+                        -> Variable Assigner
+                        -> Build Eval Log Body
+                        -> Eval Log
+                        -> Answer
+               FALSE -> Rewrite Answer LLM
+                        -> Build Conversation State(Rewrite Answer)
+                        -> Variable Assigner
+                        -> Build Eval Log Body
+                        -> Eval Log
+                        -> Answer
 ```
 
 ### 3.1 Start
@@ -334,7 +342,12 @@ Python:
 import re
 
 def text(value) -> str:
-    return "" if value is None else str(value)
+    if value is None:
+        return ""
+    value = str(value).strip()
+    if value in {"", '""', "''", "null", "None"}:
+        return ""
+    return value
 
 def parse_session_context(raw: str) -> dict:
     raw = text(raw)
@@ -570,7 +583,8 @@ Structured Lookup
 Method: POST
 URL: http://<fastapi-host>:8000/lookup
 Authorization: None
-Body Type: JSON
+Body Type: raw
+Raw Body Type: JSON
 ```
 
 Headers:
@@ -579,19 +593,65 @@ Headers:
 Content-Type: application/json
 ```
 
-JSON Body:
+권장 방식은 `Structured Lookup` 바로 앞에 `Build Lookup Body` Code 노드를 두고 raw JSON 문자열을 만든 뒤 HTTP Request에 연결하는 것이다. Dify JSON 편집기에서 `entities` 배열 변수를 직접 섞으면 배열이 문자열로 전달될 수 있고, 이 경우 `/lookup`의 `entities: list[string]` 계약과 어긋난다.
 
-```json
-{
-  "query": "{{Rewrite Standalone Query.standalone_query}}",
-  "document_id": "{{Parse Query Plan.document_id}}",
-  "entities": "{{Parse Query Plan.entities}}",
-  "query_type": "{{Parse Query Plan.query_type}}",
-  "limit": 8
-}
+#### Code: Build Lookup Body
+
+입력 변수:
+
+```text
+query = {{Rewrite Standalone Query.standalone_query}}
+document_id = {{Parse Query Plan.document_id}}
+entities = {{Parse Query Plan.entities}}
+query_type = {{Parse Query Plan.query_type}}
 ```
 
-만약 Dify JSON 편집기에서 `entities` 배열 변수를 문자열로만 넣는다면, 중간에 Code 노드를 하나 더 두고 raw JSON body를 만든 뒤 HTTP Request의 raw body로 넣는다.
+Python:
+
+```python
+import json
+
+def parse_json_like(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, (list, dict, int, float, bool)):
+        return value
+    text = str(value).strip()
+    if not text:
+        return default
+    try:
+        return json.loads(text)
+    except Exception:
+        return default
+
+def main(query="", document_id="", entities=None, query_type="semantic", **kwargs) -> dict:
+    parsed_entities = parse_json_like(entities, [])
+    if isinstance(parsed_entities, str):
+        parsed_entities = [part.strip() for part in parsed_entities.split(",") if part.strip()]
+    if not isinstance(parsed_entities, list):
+        parsed_entities = []
+
+    body = {
+        "query": str(query or "").strip(),
+        "document_id": str(document_id or "").strip(),
+        "entities": [str(item) for item in parsed_entities if str(item).strip()],
+        "query_type": str(query_type or "semantic").strip(),
+        "limit": 8,
+    }
+    return {"lookup_body_json": json.dumps(body, ensure_ascii=False)}
+```
+
+출력 변수 타입:
+
+```text
+lookup_body_json: string
+```
+
+Structured Lookup Raw Body:
+
+```text
+{{Build Lookup Body.lookup_body_json}}
+```
 
 ### 3.5 Knowledge Retrieval
 
@@ -833,7 +893,9 @@ Answer in Korean unless the user asks for another language.
 
 ### 3.8.1 Save Conversation State
 
-`Final Answer` 뒤에는 conversation variables를 갱신한다. Dify의 Variable Assigner 노드를 사용하고, 노드 입력으로 필요한 값을 만들기 위해 Code 노드를 하나 둔다.
+conversation variables는 `Final Answer` 직후가 아니라 `Parse Verify Result` 뒤의 Conditional 분기에서 최종 출력할 답변이 확정된 뒤 갱신한다. 검증 실패한 `Final Answer.text`를 먼저 저장하면 다음 질문에서 “방금 답변의 출처”를 물었을 때 실패 답변의 상태가 재사용될 수 있다.
+
+정상 분기에서는 `Final Answer.text`를 저장하고, 검증 실패 후 재작성 분기에서는 `Rewrite Answer.text`를 저장한다. Dify의 Variable Assigner 노드를 사용하고, 노드 입력으로 필요한 값을 만들기 위해 Code 노드를 하나 둔다.
 
 노드 이름:
 
@@ -845,7 +907,7 @@ Build Conversation State
 
 ```text
 question = {{sys.query}}
-answer = {{Final Answer.text}}
+answer = {{Final Answer.text}} 또는 {{Rewrite Answer.text}}
 source_summary = {{Parse Merge Evidence.source_summary}}
 ```
 
@@ -855,7 +917,12 @@ Python:
 import re
 
 def text(value) -> str:
-    return "" if value is None else str(value)
+    if value is None:
+        return ""
+    value = str(value).strip()
+    if value in {"", '""', "''", "null", "None"}:
+        return ""
+    return value
 
 def main(question="", answer="", source_summary="") -> dict:
     answer = text(answer).strip()
@@ -1473,3 +1540,245 @@ curl.exe -H "Content-Type: application/json" -d "{\"query\":\"전공심화 개�
 이 구조는 Dify Knowledge Pipeline을 그대로 쓰는 방식이다. 따라서 Knowledge Base 노드는 마지막에 연결되어야 하고, Parent-Child Chunker와 embedding은 Dify가 처리한다.
 
 `/convert/rag`가 반환하는 `dify_markdown`은 Dify에 저장하기 좋은 Markdown이다. 원본 `markdown`은 디버깅과 재처리용이고, `chunks`와 `records`는 FastAPI의 structured lookup과 answer verification을 위한 보조 데이터다.
+
+## 7. API 점검 결과와 필수 수정
+
+2026-07-29 Dify API 기준 점검 결과:
+
+```text
+Knowledge API:
+- dataset: ipsi
+- status: 200
+- document_count: 7
+- documents:
+  - ch01_소프트웨어 공학과 개발 프로세스.pdf: completed/available, enabled=true, segments=116
+  - ch03_계획.pdf: completed/available, enabled=true, segments=106
+  - ch04_요구분석.pdf: completed/available, enabled=true, segments=100
+  - ch05_설계.pdf: completed/available, enabled=true, segments=74
+  - ch06_아키텍처 설계와 클래스 설계.pdf: completed/available, enabled=true, segments=91
+  - 2.  2027학년도 입학전형 수시·정시 모집요강.pdf: completed/available, enabled=true, segments=158
+  - document.pdf: completed/available, enabled=true, segments=270
+
+Knowledge Retrieval API:
+- "수시1차 원서접수 기간 알려줘"는 2027 모집요강이 top result로 검색됨
+- "총 장학금 얼마야"는 top score가 0.1575로 낮고 document.pdf 장학금/등록금 혼합 chunk가 상위에 옴
+- "소프트웨어 개발 프로세스", "요구분석", "아키텍처 설계" 질문은 소프트웨어 문서가 정상 검색됨
+- 활성 문서 7개, segment 915개 전수 점검에서 section/page metadata 문제 135개 검출
+- 2027 모집요강 112개, document.pdf 22개, ch03_계획.pdf 1개에 집중됨
+- 구조화 자식 chunk의 source_page/source_section은 정상 metadata로 인정한 수치임
+- 주요 유형은 Untitled/목차/빈 section 123개와 번호 계층 역전 12개임
+
+Chatflow App API:
+- /chat-messages status=200
+- session conversation_id 재사용 정상
+- conversation variables 조회 정상
+- 혼합 도메인 평가 4/4 통과
+- 입학 문서/연도 평가 8/6 통과
+```
+
+판단:
+
+```text
+1. Knowledge 적재와 Chatflow 실행은 현재 운영 가능한 상태다.
+2. 입학/소프트웨어 혼합 도메인 테스트는 통과했으므로 특정 도메인으로만 쏠리는 문제는 현재 재현되지 않는다.
+3. 남은 실패는 `inputs.document_id`가 Chatflow Start 입력으로 들어가지 않아 특정 문서 모드가 완전히 강제되지 않는 문제다.
+4. 스트리밍 trace에서 `workflow_started.data.inputs`에 `document_id`가 없고 `Query Plan` 응답의 `document_id`도 null이다.
+5. 일부 chunk에 목차/빈 섹션/섹션 경로 ">"가 남아 있어 재적재 전 정규화 상태를 다시 확인해야 한다.
+```
+
+필수 수정:
+
+```text
+1. 모든 Code 노드에서 Output variables를 실제 return dict와 1:1로 등록한다.
+2. Code 노드 입력 변수 목록에 빈 변수 이름 행이 있으면 모두 삭제한다.
+3. `main(..., **kwargs)` 형태를 써서 Dify가 예기치 않은 입력 키를 넘겨도 실행이 죽지 않게 한다.
+4. `document_id`를 Start 입력 변수로 만들고, 특정 문서 테스트/운영에서는 App API `inputs.document_id`로 반드시 전달한다.
+5. `Query Plan` HTTP body와 `Build Lookup Body`가 `Start.document_id`를 받는지 trace에서 확인한다.
+6. Knowledge Retrieval에도 같은 범위 필터를 적용한다. 필터 적용이 어렵다면 `document_id`가 있는 특정 문서 모드에서는 Structured Lookup을 authoritative source로 두고 Knowledge Retrieval은 보조 근거로만 쓴다.
+7. 전체 Knowledge 모드가 아니라면 2026/2027 문서 중 질문 대상이 아닌 문서를 비활성화하거나 dataset을 분리한다.
+8. Knowledge Pipeline에서 최신 `/convert/rag` 산출물로 재적재하고, section이 `>`, `목   차`인 segment가 남는지 Knowledge API로 재확인한다.
+9. `Build Lookup Body`, `Build Merge Evidence Body`, `Build Verify Body`, `Build Eval Log Body`는 모두 HTTP JSON 편집기 대신 raw JSON 문자열을 반환하는 Code 노드로 둔다.
+```
+
+페이지별 section metadata 보정은 `/convert/rag`에서 다음 순서로 처리한다.
+
+```text
+1. PDF parser가 출력한 Markdown heading level을 기본 계층으로 사용한다.
+2. Ⅰ/Ⅱ, Chapter/Part, 제N장/절/조, 1./1.1 번호 체계로 잘못된 heading level을 교정한다.
+3. 제목 태그가 없는 페이지는 상단의 짧은 시각 제목을 section으로 사용한다.
+4. 시각 제목도 없고 표만 있는 페이지는 "Table: <주요 열 이름>"을 범용 section으로 사용한다.
+5. 실제 연속 페이지처럼 새 제목이 없는 페이지는 직전 section을 유지한다.
+6. 목차, Untitled, 빈 section, 제어문자, 하위 번호 뒤에 상위 번호가 오는 경로는 불량으로 판정한다.
+```
+
+배포 및 PDF 재적재 후 다음 명령의 `issues=0`을 확인한다.
+
+```powershell
+python -X utf8 scripts\check_dify_api_state.py --sections-only --timeout 180
+python -X utf8 scripts\check_dify_api_state.py --timeout 180
+```
+
+기존 Knowledge segment는 파서 코드 변경만으로 자동 갱신되지 않는다. 원본 PDF를 Knowledge Pipeline에서 다시 실행해 최신 `/convert/rag`의 `dify_markdown`으로 교체해야 한다. 현재 문서는 `rag-pipeline/local_file` 데이터 소스라 Knowledge API의 ZIP 다운로드 대상이 아니므로, 원본 없이 기존 segment를 직접 덮어쓰지 않는다.
+
+`Not all output parameters are validated` 해결 체크리스트:
+
+```text
+Session Follow-up Guard:
+- is_source_followup: boolean
+- direct_answer: string
+- has_previous_answer: boolean
+- query: string
+- last_question: string
+- last_answer_brief: string
+- last_source_summary: string
+- last_document_names: string
+
+Parse Query Plan:
+- query: string
+- document_id: string
+- query_type: string
+- answer_style: string
+- entities: array[string]
+- keywords: array[string]
+- sub_queries: array[string]
+- expanded_queries: array[string]
+- entities_text: string
+- sub_query_text: string
+- expanded_query_text: string
+
+Build Lookup Body:
+- lookup_body_json: string
+
+Build Merge Evidence Body:
+- merge_body_json: string
+
+Parse Merge Evidence:
+- structured_context: string
+- knowledge_context: string
+- evidence_context: string
+- evidence_priority: string
+- source_summary: string
+- answer_contract: string
+- answer_contract_text: string
+- lookup_diagnostics: string
+- lookup_answerability: string
+
+Build Verify Body:
+- verify_body_json: string
+
+Parse Verify Result:
+- valid: boolean
+- confidence: number
+- query_type: string
+- issues_text: string
+- should_answer: boolean
+- should_rewrite: boolean
+
+Build Eval Log Body:
+- eval_log_body_json: string
+```
+
+목표 품질을 ChatGPT/Claude에 문서 전체를 넣은 답변에 가깝게 만들려면, Dify Knowledge Retrieval만으로 단정하지 않는다. 현재 구조처럼 `Structured Lookup -> Knowledge Retrieval -> Merge Evidence -> Verify -> Rewrite`를 유지하고, API 점검에서 다음 조건을 통과해야 운영 가능 상태로 본다.
+
+```text
+1. /chat-messages가 200을 반환한다.
+2. 모든 답변 끝에 "참조 문서:"가 있다.
+3. GET /messages에서 같은 user/conversation_id의 히스토리가 이어진다.
+4. GET /conversations/{conversation_id}/variables에 last_source_summary가 저장된다.
+5. Knowledge Retrieval top results가 질문 대상 연도/document_id와 일치한다.
+6. /eval/log 집계에서 missing_document_id=0, missing_direct_answer 감소, verify_failed가 실제 근거 부족 케이스로 제한된다.
+```
+
+### 7.1 배포 Chatflow API 품질 평가
+
+배포된 Dify App API만 사용해서 속도, 출처, 연도/문서 혼합을 확인한다. 로컬 FastAPI를 띄우지 않는다.
+
+```powershell
+python -X utf8 scripts\eval_dify_chat_api.py --timeout 300
+python -X utf8 scripts\eval_dify_chat_api.py --suite mixed --timeout 300
+python -X utf8 scripts\eval_dify_chat_api.py --suite all --timeout 300
+```
+
+결과 파일:
+
+```text
+.runtime/dify_chat_api_eval_latest.json
+```
+
+2026-07-29 재점검 결과:
+
+```text
+mixed suite:
+- total/passed/failed: 4/4/0
+- pass_rate: 100.00%
+- avg/max latency: 29.928s / 44.39s
+
+admission suite:
+- total/passed/failed: 8/6/2
+- pass_rate: 75.00%
+- avg/max latency: 48.997s / 57.291s
+```
+
+혼합 도메인 통과:
+
+```text
+mixed_admission_quota
+mixed_software_process
+mixed_software_requirements
+mixed_software_architecture
+```
+
+입학 문서 통과:
+
+```text
+date_default
+date_doc2027_filter
+quota_default
+quota_doc2026_filter
+explicit_2027_query
+scholarship_total_abstains
+```
+
+입학 문서 실패:
+
+```text
+date_doc2026_filter:
+- inputs.document_id를 2026 document.pdf 내부 id로 넣어도 2027학년도 원서접수 날짜를 답함
+
+quota_doc2027_filter:
+- inputs.document_id를 2027 모집요강 내부 id로 넣어도 document.pdf의 93명을 답함
+```
+
+판단:
+
+```text
+1. 혼합 도메인에서는 입학 질문과 소프트웨어 질문이 서로의 문서를 끌고 오지 않는다.
+2. 기본 입학 일정 질문은 최신 2027학년도 모집요강을 선택한다.
+3. 특정 문서 모드만 남은 문제다. App API `inputs.document_id`가 Start 입력에 등록되지 않아 trace에서 빠진다.
+4. `document_id`가 빠지면 Query Plan/Structured Lookup/Knowledge Retrieval이 전체 Knowledge를 대상으로 검색하므로 연도/문서 혼합 위험이 남는다.
+5. 일정 표에서는 "원서접수", "등록금 납부기간", "문서등록", "합격자 발표"가 같은 표 근처에 있어 row/field 선택 검증을 계속 유지해야 한다.
+```
+
+운영 수정 우선순위:
+
+```text
+1. 연도별 Knowledge Base 또는 연도별 App으로 분리한다.
+   - 2026 앱: document.pdf만 enabled
+   - 2027 앱: 2027 모집요강만 enabled
+
+2. 하나의 App에서 여러 연도를 유지해야 하면 Chatflow Start에 academic_year 또는 document_id를 필수 hidden 입력으로 만들고, Knowledge Retrieval에도 같은 범위 필터를 적용한다.
+   - Dify Knowledge Retrieval 노드에서 metadata filtering을 쓸 수 있으면 document_name 또는 academic_year metadata로 필터링한다.
+   - 필터를 Knowledge Retrieval에 적용할 수 없으면 Structured Lookup만으로 답해야 하는 질문에서는 Knowledge Retrieval을 보조 근거로만 쓰고, source_summary도 structured source를 우선한다.
+
+3. 일정 질문은 `/lookup`의 answerability와 answer_field를 Final Answer보다 먼저 검사한다.
+   - 질문에 "원서접수"가 있으면 answer_field 또는 evidence row label에 원서접수가 있어야 한다.
+   - "등록금", "문서등록", "합격자 발표", "면접예약", "면접고사"가 대신 선택되면 answerable=false로 취급한다.
+
+4. 배포 후 아래 명령이 admission 8/8, mixed 4/4를 모두 통과할 때까지 Publish와 API 재테스트를 반복한다.
+```
+
+```powershell
+python -X utf8 scripts\eval_dify_chat_api.py --suite admission --timeout 300
+python -X utf8 scripts\eval_dify_chat_api.py --suite mixed --timeout 300
+python -X utf8 scripts\check_dify_api_state.py --timeout 180
+```
