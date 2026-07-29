@@ -189,20 +189,26 @@ Rerank: 가능하면 활성화
 
 ```text
 Start
--> Query Plan
--> Parse Query Plan
--> Structured Lookup
--> Knowledge Retrieval
--> Build Merge Evidence Body
--> Merge Evidence Request
--> Parse Merge Evidence
--> Final Answer LLM, 답변 끝에 참조 문서 표시
--> Build Verify Body
--> Verify Answer
--> Parse Verify Result
--> Build Eval Log Body
--> Eval Log
--> Conditional
+-> Build Session Context
+-> Session Follow-up Guard
+-> IF Previous Source Follow-up
+   TRUE  -> Previous Source Answer, 답변 출력 후 이 분기는 종료
+   FALSE -> Rewrite Standalone Query
+            -> Query Plan
+            -> Parse Query Plan
+            -> Structured Lookup
+            -> Knowledge Retrieval
+            -> Build Merge Evidence Body
+            -> Merge Evidence Request
+            -> Parse Merge Evidence
+            -> Final Answer LLM, 답변 끝에 참조 문서 표시
+            -> Save Conversation State
+            -> Build Verify Body
+            -> Verify Answer
+            -> Parse Verify Result
+            -> Build Eval Log Body
+            -> Eval Log
+            -> Conditional
 ```
 
 ### 3.1 Start
@@ -225,6 +231,248 @@ document_id: string, optional, hidden/internal
 - 특정 문서 모드인데 Dify App API 호출에서 `inputs.document_id`를 넘겨도 Start 노드에 `document_id` 입력 변수가 없으면 값이 완전히 무시된다.
 - 특정 문서 모드에서 스트리밍 이벤트의 `workflow_started.data.inputs`에 `document_id`가 없고 `Query Plan` 요청 body가 `{"query": ...}`만 포함하면 Chatflow 설정 오류다.
 - 전체 Knowledge 검색 모드라면 `document_id`가 빈 값인 것이 정상이다. 대신 Final Answer에 반드시 `참조 문서:` 줄이 있어야 한다.
+- API 클라이언트는 첫 요청에서 `conversation_id`를 비우고, 응답으로 받은 `conversation_id`를 같은 `user`와 함께 다음 요청에 넣어야 한다. `user`가 바뀌면 같은 `conversation_id`라도 다른 사용자 세션으로 취급되어 히스토리 조회/연결이 깨진다.
+
+### 3.1.1 Session Follow-up Guard
+
+`3.1.1`은 기존 RAG 답변 생성 경로를 바꾸는 본문 검색 노드가 아니라, `Start`와 `Rewrite Standalone Query` 사이에 추가한 세션 보호 분기다. 새로 넣은 이유는 두 가지다.
+
+- Dify 실제 UI에서 Code 노드 입력 변수로 conversation variable이 직접 연결되지 않는 경우가 있어, Template 노드로 먼저 세션 값을 읽어 Code 노드에 넘겨야 한다.
+- 사용자가 “방금 답변에서 참조한 문서 이름만 말해줘”처럼 직전 답변의 출처를 물으면 Knowledge Retrieval을 다시 돌리지 않고 직전 답변에 저장된 출처를 그대로 답해야 한다.
+
+Chatflow API에서 `conversation_id`가 유지되어도, 현재 질문을 그대로 Knowledge Retrieval에 넣으면 “방금 답변에서 참조한 문서 이름만 말해줘” 같은 후속질문이 독립 검색 질의가 된다. 이 경우 Knowledge가 임의의 문서를 높은 점수로 반환하고, 이전 답변의 출처를 잃을 수 있다.
+
+따라서 Chatflow에 다음 conversation variables를 만든다.
+
+```text
+last_question: string
+last_answer_brief: string
+last_source_summary: string
+last_document_names: string
+```
+
+일부 Dify 환경에서는 Code 노드의 입력 변수 선택 UI에서 conversation variable이 직접 연결되지 않는다. 따라서 `Start` 바로 뒤에 Template 노드를 먼저 두고, conversation variable을 하나의 upstream 문자열 출력으로 만든 다음 Code 노드가 그 출력만 받게 한다.
+
+노드 이름:
+
+```text
+Build Session Context
+```
+
+노드 타입:
+
+```text
+Template
+```
+
+입력 변수:
+
+```text
+query               = User Input의 query 변수
+last_question       = conversation.last_question
+last_answer_brief   = conversation.last_answer_brief
+last_source_summary = conversation.last_source_summary
+last_document_names = conversation.last_document_names
+```
+
+Dify 버전에 따라 사용자 질문 변수는 `sys.query`, `userinput.query`, 또는 Start/User Input의 `query`로 보일 수 있다. Template 본문에 `{{sys.query}}`를 직접 쓰지 말고, Template 노드의 입력 변수 `query`에 Dify 변수 선택기로 현재 질문을 먼저 연결한다. 그렇지 않으면 Template 노드의 Jinja 실행 환경에서 `sys`가 정의되지 않아 `'sys' is undefined` 오류가 난다.
+
+`last_question` 같은 값이 변수 선택기에 보이지 않으면, 먼저 Chatflow 캔버스의 Conversation Variables 패널에서 아래 4개 변수를 직접 생성한다. Variable Assigner 노드를 만든다고 conversation variable이 자동 생성되는 것이 아니다.
+
+```text
+last_question: string, default ""
+last_answer_brief: string, default ""
+last_source_summary: string, default ""
+last_document_names: string, default ""
+```
+
+생성 후에도 Template 노드 입력 변수 선택기에 보이지 않으면 화면을 새로고침하거나 앱을 저장한 뒤 다시 연다. 그래도 보이지 않는 Dify 버전에서는 `Build Session Context`와 `Session Follow-up Guard`를 일단 제거하고, `Start -> Rewrite Standalone Query`로 바로 연결한다. 이 경우 “방금 답변의 출처/문서명만 알려줘” 같은 후속질문 최적화만 빠지고, 일반 RAG 답변 흐름은 그대로 동작한다.
+
+Template 본문:
+
+```text
+<<<DIFY_SESSION_FIELD:query>>>
+{{ query | default("") }}
+<<<DIFY_SESSION_FIELD:last_question>>>
+{{ last_question | default("") }}
+<<<DIFY_SESSION_FIELD:last_answer_brief>>>
+{{ last_answer_brief | default("") }}
+<<<DIFY_SESSION_FIELD:last_source_summary>>>
+{{ last_source_summary | default("") }}
+<<<DIFY_SESSION_FIELD:last_document_names>>>
+{{ last_document_names | default("") }}
+<<<DIFY_SESSION_END>>>
+```
+
+위 변수들은 직접 텍스트로 억지 입력하지 말고 Template 노드의 입력 변수 설정에서 Dify 변수 선택기 또는 `/` 입력으로 연결한다. 화면에서 표시되는 변수명이 예시와 다르면, 입력 변수명은 예시처럼 짧게 맞추고 값 쪽에 Dify가 선택한 실제 변수를 연결한다. UI에서 변수 뒤에 `| default("")` 필터를 붙일 수 없으면 필터를 생략해도 된다. Code 노드에서 빈 값을 다시 안전하게 처리한다. Template 노드에서도 conversation variable이 보이지 않으면 Chatflow가 아니거나, Conversation Variables 패널에 `last_question`, `last_answer_brief`, `last_source_summary`, `last_document_names`가 생성되지 않은 상태다.
+
+출력 변수:
+
+```text
+output: string
+```
+
+그 바로 뒤에 Code 노드를 둔다.
+
+노드 이름:
+
+```text
+Session Follow-up Guard
+```
+
+입력 변수:
+
+```text
+session_context = {{Build Session Context.output}}
+```
+
+Code 노드의 입력 변수 목록에는 위 한 줄만 있어야 한다. 변수 이름이 비어 있는 행이 하나라도 남아 있으면 Dify가 `main`에 빈 keyword argument를 넘겨 `TypeError: main() got an unexpected keyword argument ''` 오류가 난다. 빈 입력 변수 행은 휴지통 아이콘으로 삭제한다.
+
+Python:
+
+```python
+import re
+
+def text(value) -> str:
+    return "" if value is None else str(value)
+
+def parse_session_context(raw: str) -> dict:
+    raw = text(raw)
+    fields = {}
+    pattern = re.compile(
+        r"<<<DIFY_SESSION_FIELD:([a-zA-Z0-9_]+)>>>\s*(.*?)\s*(?=<<<DIFY_SESSION_FIELD:|<<<DIFY_SESSION_END>>>|\Z)",
+        re.S,
+    )
+    for key, value in pattern.findall(raw):
+        fields[key] = value.strip()
+    return fields
+
+def contains_any(value: str, terms) -> bool:
+    value = value.lower()
+    return any(term in value for term in terms)
+
+def main(session_context="", **kwargs) -> dict:
+    if not text(session_context).strip():
+        session_context = kwargs.get("", "")
+    data = parse_session_context(session_context)
+    q = text(data.get("query")).strip()
+    q_lower = q.lower()
+    last_question = text(data.get("last_question")).strip()
+    last_answer_brief = text(data.get("last_answer_brief")).strip()
+    last_source_summary = text(data.get("last_source_summary")).strip()
+    last_document_names = text(data.get("last_document_names")).strip()
+
+    asks_source = contains_any(q_lower, ("참조", "출처", "문서", "파일", "페이지", "근거", "source", "document", "file", "page"))
+    refers_previous = contains_any(q_lower, ("방금", "이전", "위 답변", "앞서", "그 답변", "저 답변", "last", "previous", "above", "that"))
+    is_source_followup = asks_source and refers_previous and bool(last_source_summary)
+
+    direct_answer = ""
+    if is_source_followup:
+        if contains_any(q_lower, ("이름", "문서명", "파일명", "name")) and last_document_names:
+            direct_answer = last_document_names
+        else:
+            direct_answer = last_source_summary
+
+    return {
+        "is_source_followup": is_source_followup,
+        "direct_answer": direct_answer,
+        "has_previous_answer": bool(last_answer_brief),
+        "query": q,
+        "last_question": last_question,
+        "last_answer_brief": last_answer_brief,
+        "last_source_summary": last_source_summary,
+        "last_document_names": last_document_names,
+    }
+```
+
+출력 변수 타입:
+
+```text
+is_source_followup: boolean
+direct_answer: string
+has_previous_answer: boolean
+query: string
+last_question: string
+last_answer_brief: string
+last_source_summary: string
+last_document_names: string
+```
+
+바로 뒤에 Conditional 노드를 둔다. 이 노드는 RAG 검색으로 보낼지, 직전 답변 출처만 바로 답할지 나누는 분기다.
+
+노드 이름:
+
+```text
+IF Previous Source Follow-up
+```
+
+분기:
+
+```text
+IF Session Follow-up Guard.is_source_followup == true
+  -> Previous Source Answer
+ELSE
+  -> Rewrite Standalone Query
+```
+
+`true` 쪽에는 Answer 노드를 하나 만들고 이름을 `Previous Source Answer`로 둔다.
+
+Answer 내용:
+
+```text
+{{Session Follow-up Guard.direct_answer}}
+```
+
+`Previous Source Answer` 뒤에는 다른 노드를 연결하지 않는다. 이 분기는 여기서 답변을 내고 끝난다. `Save Conversation State`에도 연결하지 않는다. 이 분기는 새 검색 답변이 아니라 직전 답변의 출처를 다시 보여주는 용도이기 때문이다.
+
+`false` 쪽은 기존 RAG 경로인 `Rewrite Standalone Query`로 연결한다. 일반 질문, 새 질문, “그럼 수시2차는?” 같은 맥락 후속질문은 모두 이 경로로 간다.
+
+이 분기를 넣으면 출처/문서명/페이지를 묻는 후속질문은 Knowledge Retrieval을 다시 타지 않고 직전 답변의 출처 상태에서 즉시 답한다.
+
+### 3.1.2 Rewrite Standalone Query
+
+출처 확인이 아닌 일반 후속질문은 검색 전에 독립 질문으로 바꾼다. 예를 들어 “그럼 수시2차는?”은 “직전 질문의 주제와 같은 항목에서 수시2차 값은?”처럼 검색 가능한 질문이어야 한다.
+
+노드 이름:
+
+```text
+Rewrite Standalone Query
+```
+
+LLM System Prompt:
+
+```text
+Rewrite the user's current Korean question into a standalone retrieval query.
+Use the previous answer only to resolve pronouns and omitted subjects.
+Do not answer the question.
+Keep exact document names, years, departments, dates, and fields if mentioned.
+If the current question is already standalone, return it unchanged.
+Return only the rewritten query.
+```
+
+LLM User Prompt:
+
+```text
+Previous user question:
+{{Session Follow-up Guard.last_question}}
+
+Previous answer:
+{{Session Follow-up Guard.last_answer_brief}}
+
+Previous source summary:
+{{Session Follow-up Guard.last_source_summary}}
+
+Current question:
+{{sys.query}}
+```
+
+출력 변수:
+
+```text
+standalone_query: string
+```
+
+이후 `Query Plan`, `Structured Lookup`, `Knowledge Retrieval`, `Final Answer`에서 검색용 질문은 `{{Rewrite Standalone Query.standalone_query}}`를 사용한다. 최종 답변 프롬프트에는 원 질문과 검색용 질문을 둘 다 넣어 사용자의 실제 의도를 유지한다.
 
 ### 3.2 HTTP Request: Query Plan
 
@@ -253,7 +501,7 @@ JSON Body:
 
 ```json
 {
-  "query": "{{sys.query}}",
+  "query": "{{Rewrite Standalone Query.standalone_query}}",
   "document_id": "{{Start.document_id}}"
 }
 ```
@@ -335,7 +583,7 @@ JSON Body:
 
 ```json
 {
-  "query": "{{sys.query}}",
+  "query": "{{Rewrite Standalone Query.standalone_query}}",
   "document_id": "{{Parse Query Plan.document_id}}",
   "entities": "{{Parse Query Plan.entities}}",
   "query_type": "{{Parse Query Plan.query_type}}",
@@ -356,7 +604,7 @@ JSON Body:
 대체 질의:
 
 ```text
-{{sys.query}}
+{{Rewrite Standalone Query.standalone_query}}
 ```
 
 권장 설정:
@@ -538,6 +786,9 @@ User Prompt:
 Question:
 {{sys.query}}
 
+Standalone retrieval question:
+{{Rewrite Standalone Query.standalone_query}}
+
 Query type:
 {{Parse Query Plan.query_type}}
 
@@ -578,6 +829,70 @@ End the answer with one short line that starts with "참조 문서:" and uses So
 If structured lookup answerability says answerable=false and the remaining evidence does not directly answer the requested attribute, say that the provided document does not contain enough evidence.
 If the evidence is insufficient, say that the provided document does not contain enough evidence.
 Answer in Korean unless the user asks for another language.
+```
+
+### 3.8.1 Save Conversation State
+
+`Final Answer` 뒤에는 conversation variables를 갱신한다. Dify의 Variable Assigner 노드를 사용하고, 노드 입력으로 필요한 값을 만들기 위해 Code 노드를 하나 둔다.
+
+노드 이름:
+
+```text
+Build Conversation State
+```
+
+입력 변수:
+
+```text
+question = {{sys.query}}
+answer = {{Final Answer.text}}
+source_summary = {{Parse Merge Evidence.source_summary}}
+```
+
+Python:
+
+```python
+import re
+
+def text(value) -> str:
+    return "" if value is None else str(value)
+
+def main(question="", answer="", source_summary="") -> dict:
+    answer = text(answer).strip()
+    source_summary = text(source_summary).strip()
+    document_names = []
+    for part in re.split(r"[,;]\s*", source_summary.replace("참조 문서:", "")):
+        name = part.strip()
+        if not name or "제공된 근거 없음" in name:
+            continue
+        name = re.sub(r"\s*\(.*?\)\s*$", "", name).strip()
+        if name and name not in document_names:
+            document_names.append(name)
+
+    return {
+        "last_question": text(question).strip()[:1000],
+        "last_answer_brief": answer[:2000],
+        "last_source_summary": source_summary[:2000],
+        "last_document_names": ", ".join(document_names)[:1000],
+    }
+```
+
+Variable Assigner에서 다음처럼 저장한다.
+
+```text
+last_question       <- Build Conversation State.last_question
+last_answer_brief   <- Build Conversation State.last_answer_brief
+last_source_summary <- Build Conversation State.last_source_summary
+last_document_names <- Build Conversation State.last_document_names
+```
+
+API 점검 기준:
+
+```text
+1차 요청: conversation_id = ""
+2차 요청: conversation_id = 1차 응답 conversation_id
+GET /messages?conversation_id=<id>&user=<same-user> 결과에 두 메시지가 있어야 한다.
+GET /conversations/<id>/variables?user=<same-user> 결과에 last_source_summary가 있어야 한다.
 ```
 
 ### 3.9 Code: Build Verify Body

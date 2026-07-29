@@ -231,7 +231,21 @@ ATTRIBUTE_CONCEPT_TERMS = {
         "usd",
         "krw",
     ],
-    "capacity": ["수용인원", "수용 인원", "정원", "모집정원", "모집 정원", "capacity", "quota", "limit"],
+    "capacity": [
+        "수용인원",
+        "수용 인원",
+        "정원",
+        "모집정원",
+        "모집 정원",
+        "모집인원",
+        "모집 인원",
+        "선발인원",
+        "선발 인원",
+        "capacity",
+        "quota",
+        "limit",
+        "headcount",
+    ],
     "schedule": [
         "일정",
         "기간",
@@ -2381,7 +2395,12 @@ def lookup_matches(
             continue
         chunk = chunk_by_id.get(record.chunk_id)
         evidence = format_record_evidence(record)
-        supporting_context = format_supporting_context(chunk, chunks, chunk_order) if chunk else ""
+        supporting_context = format_supporting_context(
+            chunk,
+            chunks,
+            chunk_order,
+            include_neighbors=active_query_type != "definition",
+        ) if chunk else ""
         coverage_text = " ".join([record.section_path, evidence, supporting_context])
         record_matches.append(
             {
@@ -2445,7 +2464,7 @@ def lookup_matches(
     direct_candidates = select_evidence_matches(ranked, max(limit * 6, 40)) if answerability["answerable"] else []
     direct_answer = build_direct_answer(query, active_query_type, active_entities, direct_candidates)
     context_source_matches = merge_match_lists(direct_candidates, combined)
-    context_matches = filter_context_matches_for_direct_answer(context_source_matches, direct_answer)
+    context_matches = filter_context_matches_for_answer(context_source_matches, direct_answer, active_query_type)
     answer_contract = build_answer_contract(
         query=query,
         query_type=active_query_type,
@@ -2502,7 +2521,13 @@ def format_record_evidence(record: StructuredRecord) -> str:
     )
 
 
-def format_supporting_context(chunk: RagChunk, chunks: list[RagChunk], chunk_order: dict[str, int]) -> str:
+def format_supporting_context(
+    chunk: RagChunk,
+    chunks: list[RagChunk],
+    chunk_order: dict[str, int],
+    *,
+    include_neighbors: bool = True,
+) -> str:
     index = chunk_order.get(chunk.chunk_id)
     if index is None:
         return trim_text(chunk.text, SUPPORTING_CONTEXT_CHAR_LIMIT)
@@ -2511,6 +2536,8 @@ def format_supporting_context(chunk: RagChunk, chunks: list[RagChunk], chunk_ord
     for neighbor_index in range(max(0, index - 1), min(len(chunks), index + 2)):
         neighbor = chunks[neighbor_index]
         if neighbor.document_id != chunk.document_id:
+            continue
+        if not include_neighbors and neighbor_index != index:
             continue
         if neighbor_index != index and neighbor.section_path != chunk.section_path and neighbor.page_start != chunk.page_start:
             continue
@@ -2598,7 +2625,7 @@ def build_evidence_items(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def filter_context_matches_for_direct_answer(matches: list[dict[str, Any]], direct_answer: dict[str, Any]) -> list[dict[str, Any]]:
+def filter_context_matches_for_answer(matches: list[dict[str, Any]], direct_answer: dict[str, Any], query_type: str) -> list[dict[str, Any]]:
     items = direct_answer.get("answer_items") or []
     record_ids = {
         str(item.get("record_id"))
@@ -2606,9 +2633,33 @@ def filter_context_matches_for_direct_answer(matches: list[dict[str, Any]], dire
         if isinstance(item, dict) and item.get("record_id")
     }
     if not record_ids:
-        return matches
+        return filter_context_matches_for_query_type(matches, query_type)
     filtered = [match for match in matches if str(match.get("record_id") or "") in record_ids]
     return filtered or matches
+
+
+def filter_context_matches_for_query_type(matches: list[dict[str, Any]], query_type: str) -> list[dict[str, Any]]:
+    if query_type != "definition" or not matches:
+        return matches
+    first = matches[0]
+    key = (
+        first.get("document_id") or "",
+        first.get("page"),
+        clean_cell(first.get("section_path") or ""),
+    )
+    if not any(key):
+        return matches
+    filtered = [
+        match
+        for match in matches
+        if (
+            (match.get("document_id") or ""),
+            match.get("page"),
+            clean_cell(match.get("section_path") or ""),
+        )
+        == key
+    ]
+    return filtered or matches[: min(len(matches), 3)]
 
 
 def build_direct_answer(query: str, query_type: str, entities: list[str], matches: list[dict[str, Any]]) -> dict[str, Any]:
@@ -4445,12 +4496,27 @@ def source_refs_from_lookup(lookup_payload: dict[str, Any]) -> list[dict[str, st
     if answer_sources:
         return answer_sources
 
-    sources: list[dict[str, str]] = []
-    for key in ("evidence_items", "matches"):
-        value = lookup_payload.get(key)
-        if not isinstance(value, list):
-            continue
-        for item in value:
+    evidence_items = lookup_payload.get("evidence_items")
+    if isinstance(evidence_items, list) and evidence_items:
+        sources: list[dict[str, str]] = []
+        for item in evidence_items:
+            if not isinstance(item, dict):
+                continue
+            sources.append(
+                {
+                    "file_name": first_non_empty_text(item.get("file_name"), item.get("source_file"), item.get("document_name")),
+                    "page": first_non_empty_text(item.get("page"), item.get("source_page"), item.get("page_number")),
+                    "section": first_non_empty_text(item.get("section_path"), item.get("section"), item.get("source_section")),
+                }
+            )
+        sources = unique_source_refs(sources)
+        if sources:
+            return sources
+
+    match_items = lookup_payload.get("matches")
+    sources = []
+    if isinstance(match_items, list):
+        for item in match_items:
             if not isinstance(item, dict):
                 continue
             sources.append(

@@ -142,7 +142,9 @@ class RagPipelineTest(unittest.TestCase):
         self.assertIn("1-In", result["context"])
         self.assertIn("2-In", result["context"])
         self.assertIn("3-In", result["context"])
+        self.assertNotIn("항공안전훈련실습실", result["context"])
         self.assertIn("document.pdf (p.15, 학생 3-IN 인증제도)", merged["source_summary"])
+        self.assertNotIn("document.pdf (p.16", merged["source_summary"])
 
     def test_scalar_lookup_prefers_requested_numeric_field_over_subject_field(self):
         artifact = build_rag_artifact(
@@ -175,6 +177,37 @@ class RagPipelineTest(unittest.TestCase):
         self.assertIn("정원내 모집정원: 93", result["direct_answer"])
         self.assertNotIn("기계공학과", result["direct_answer"])
         self.assertEqual(result["answer_items"][0]["field"], "정원내 모집정원")
+
+    def test_admission_headcount_query_prefers_capacity_over_study_duration(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 26 ---
+
+# 2026학년도 모집인원
+
+| 계열 | 모집단위 | 수업 연한 | 모집 정원 | 수시1차 일반고 |
+| --- | --- | --- | --- | --- |
+| 공학 | 컴퓨터정보공학과 | 3 | 93 | 55 |
+""",
+            "document.pdf",
+            document_id="doc_capacity_plain",
+        )
+
+        question = "컴퓨터정보공학과 모집인원 알려줘"
+        plan = plan_query(question)
+        result = lookup_matches(
+            query=question,
+            records=artifact.records,
+            chunks=artifact.chunks,
+            entities=plan["entities"],
+            query_type=plan["query_type"],
+            limit=8,
+        )
+
+        self.assertEqual(plan["query_type"], "number_lookup")
+        self.assertEqual(result["direct_answer"], "모집 정원: 93")
+        self.assertEqual(result["answer_field"], "모집 정원")
+        self.assertNotIn("수업 연한: 3", result["direct_answer"])
 
     def test_money_lookup_returns_all_money_fields_for_subject_row(self):
         artifact = build_rag_artifact(
@@ -1116,6 +1149,48 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertNotIn("document.pdf", result["direct_answer"])
         self.assertNotIn("2026. 2. 3.(화)", result["direct_answer"])
         self.assertIn("2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지", result["direct_answer"])
+
+    def test_schedule_lookup_keeps_row_topic_when_payment_period_competes(self):
+        older = build_rag_artifact(
+            """
+--- Page 28 ---
+
+# 2026학년도 전형일정
+
+| 구분 | Column 2 | 수시1차 | 수시2차 | 정시 |
+| --- | --- | --- | --- | --- |
+| 접수 | 원서접수 서류제출 | 2025. 9. 8.(월) ~ 9. 30.(화) 21:00까지 | 2025. 11. 7.(금) ~ 11. 21.(금) 21:00까지 | 2025. 12. 29.(월) ~ 2026. 1. 14.(수) 21:00까지 |
+| 발표 및 등록 | 최종(전액) 등록기간 | 2026. 2. 3.(화) 09:00 ~ 2. 5.(목) 16:00까지 | 2026. 2. 3.(화) 09:00 ~ 2. 5.(목) 16:00까지 | 2026. 2. 3.(화) 09:00 ~ 2. 5.(목) 16:00까지 |
+""",
+            "document.pdf",
+            document_id="doc_schedule_2026",
+        )
+        current = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 2027학년도 전형일정
+
+| 구분 | Column 2 | 수시1차 | 수시2차 | 정시 |
+| --- | --- | --- | --- | --- |
+| 접수 | 원서접수 | 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지 | 2026. 11. 11.(수) 09:00 ~ 11. 25.(수) 21:00까지 | 2027. 1. 4.(월) 09:00 ~ 1. 20.(수) 21:00까지 |
+| 발표 및 등록 | 등록금 납부기간 | 2027. 2. 10.(수) 09:00 ~ 2. 12.(금) 16:00까지 | 2027. 2. 10.(수) 09:00 ~ 2. 12.(금) 16:00까지 | 2027. 2. 10.(수) 09:00 ~ 2. 12.(금) 16:00까지 |
+""",
+            "2027_admission.pdf",
+            document_id="doc_schedule_2027",
+        )
+
+        result = lookup_matches(
+            query="수시1차 원서접수 기간 알려줘",
+            records=[*older.records, *current.records],
+            chunks=[*older.chunks, *current.chunks],
+            limit=8,
+        )
+
+        self.assertEqual(result["direct_answer"], "수시1차: 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지")
+        self.assertIn("2027_admission.pdf", merge_evidence_context(result, [])["source_summary"])
+        self.assertNotIn("2026. 2. 3.(화)", result["direct_answer"])
+        self.assertNotIn("2027. 2. 10.(수)", result["direct_answer"])
 
     def test_versioned_product_docs_prefer_latest_year_when_query_has_no_year(self):
         older = build_rag_artifact(
