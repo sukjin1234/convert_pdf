@@ -3,6 +3,7 @@ import unittest
 from scripts.dify_knowledge_segment_audit import (
     audit_document_segments,
     clean_metadata_text,
+    evaluate_gates,
     extract_page,
     extract_section,
     outline_depth_inversion,
@@ -62,6 +63,49 @@ class DifyKnowledgeSegmentAuditTest(unittest.TestCase):
         self.assertEqual(summary["documents_checked"], 1)
         self.assertEqual(summary["segments_checked"], 2)
         self.assertEqual(summary["issue_count"], 1)
+        self.assertEqual(summary["issue_rate"], 0.5)
+
+    def test_evaluate_gates_flags_issue_and_request_thresholds(self):
+        summary = {
+            "issue_count": 3,
+            "issue_rate": 0.15,
+            "failed_requests": [{"document_id": "doc-1", "error": "HTTP 500"}],
+        }
+
+        failures = evaluate_gates(
+            summary,
+            fail_on_issues=True,
+            max_issue_rate=0.1,
+            max_issues=2,
+            max_failed_requests=0,
+        )
+
+        self.assertEqual(
+            failures,
+            [
+                "audit contains 3 issue(s) and 1 failed request(s)",
+                "issue_rate 15.00% > 10.00%",
+                "issue_count 3 > 2",
+                "failed_requests 1 > 0",
+            ],
+        )
+
+    def test_evaluate_gates_allows_disabled_thresholds(self):
+        summary = {
+            "issue_count": 3,
+            "issue_rate": 0.15,
+            "failed_requests": [{"document_id": "doc-1", "error": "HTTP 500"}],
+        }
+
+        failures = evaluate_gates(
+            summary,
+            fail_on_issues=False,
+            max_issue_rate=-1,
+            max_issues=-1,
+            max_failed_requests=-1,
+        )
+
+        self.assertEqual(failures, [])
 
     def test_clean_metadata_text_removes_control_characters_and_normalizes_separator(self):
         self.assertEqual(clean_metadata_text("A\x00>B"), "A > B")

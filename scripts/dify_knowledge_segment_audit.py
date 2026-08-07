@@ -37,6 +37,24 @@ def main() -> int:
     parser.add_argument("--document-limit", type=int, default=0, help="0 means all documents.")
     parser.add_argument("--segment-limit", type=int, default=0, help="Maximum segments per document. 0 means all.")
     parser.add_argument("--fail-on-issues", action="store_true")
+    parser.add_argument(
+        "--max-issue-rate",
+        type=float,
+        default=-1.0,
+        help="Fail if issue_rate exceeds this ratio. Use 0 for a strict zero-issue gate; negative disables.",
+    )
+    parser.add_argument(
+        "--max-issues",
+        type=int,
+        default=-1,
+        help="Fail if issue_count exceeds this value. Use 0 for a strict zero-issue gate; negative disables.",
+    )
+    parser.add_argument(
+        "--max-failed-requests",
+        type=int,
+        default=-1,
+        help="Fail if failed segment-list requests exceed this value. Use 0 for a strict request gate; negative disables.",
+    )
     parser.add_argument("--out", default=str(ROOT / ".runtime" / "dify_knowledge_segment_audit_latest.json"))
     parser.add_argument("--json", action="store_true", help="Print the full JSON report.")
     args = parser.parse_args()
@@ -76,6 +94,13 @@ def main() -> int:
         audits.append(audit_document_segments(document, segments, fetch_error=fetch_error))
 
     summary = summarize_audits(audits)
+    gate_failures = evaluate_gates(
+        summary,
+        fail_on_issues=args.fail_on_issues,
+        max_issue_rate=args.max_issue_rate,
+        max_issues=args.max_issues,
+        max_failed_requests=args.max_failed_requests,
+    )
     report = {
         "base_url_host": urllib.parse.urlparse(base_url).netloc,
         "dataset_id": dataset_id,
@@ -84,6 +109,7 @@ def main() -> int:
         "summary": summary,
         "documents": audits,
         "failed": bool(summary["failed_requests"] or summary["issue_count"]),
+        "gate_failures": gate_failures,
     }
 
     out_path = Path(args.out)
@@ -94,7 +120,7 @@ def main() -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         print_human(report, out_path)
-    return 1 if args.fail_on_issues and report["failed"] else 0
+    return 1 if gate_failures else 0
 
 
 def resolve_dataset_id(base_url: str, api_key: str, dataset_name: str, *, timeout: float) -> str:
@@ -212,6 +238,32 @@ def summarize_audits(audits: list[dict[str, Any]]) -> dict[str, Any]:
         "reason_counts": dict(sorted(reason_counts.items())),
         "failed_requests": failed_requests,
     }
+
+
+def evaluate_gates(
+    summary: dict[str, Any],
+    *,
+    fail_on_issues: bool,
+    max_issue_rate: float,
+    max_issues: int,
+    max_failed_requests: int,
+) -> list[str]:
+    issue_count = safe_int(summary.get("issue_count"))
+    issue_rate = float(summary.get("issue_rate") or 0)
+    failed_request_count = len(summary.get("failed_requests") or [])
+    failures: list[str] = []
+
+    if fail_on_issues and (issue_count or failed_request_count):
+        failures.append(
+            f"audit contains {issue_count} issue(s) and {failed_request_count} failed request(s)"
+        )
+    if max_issue_rate >= 0 and issue_rate > max_issue_rate:
+        failures.append(f"issue_rate {issue_rate:.2%} > {max_issue_rate:.2%}")
+    if max_issues >= 0 and issue_count > max_issues:
+        failures.append(f"issue_count {issue_count} > {max_issues}")
+    if max_failed_requests >= 0 and failed_request_count > max_failed_requests:
+        failures.append(f"failed_requests {failed_request_count} > {max_failed_requests}")
+    return failures
 
 
 def segment_issue_reasons(content: str, section: str, page: str) -> list[str]:
@@ -357,6 +409,10 @@ def print_human(report: dict[str, Any], out_path: Path) -> None:
     print(f"- issue_rate: {summary.get('issue_rate'):.2%}")
     print(f"- reason_counts: {summary.get('reason_counts')}")
     print(f"- failed_requests: {len(summary.get('failed_requests') or [])}")
+    if report.get("gate_failures"):
+        print("- gate_failures:")
+        for failure in report["gate_failures"]:
+            print(f"  - {failure}")
     print(f"- saved: {out_path}")
 
 
