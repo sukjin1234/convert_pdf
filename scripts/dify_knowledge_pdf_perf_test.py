@@ -24,6 +24,8 @@ class KnowledgeConfig:
     base_url: str
     api_key: str
     dataset_id: str
+    doc_form: str = ""
+    indexing_technique: str = "high_quality"
 
 
 def main() -> int:
@@ -140,7 +142,14 @@ def build_config(args: argparse.Namespace) -> KnowledgeConfig:
         dataset_id = resolve_dataset_id(base_url, api_key, args.dataset_name, timeout=args.timeout)
     if not dataset_id:
         raise RuntimeError("Knowledge dataset id was not found. Pass --dataset-id or set DIFY_KNOWLEDGE_DATASET_ID.")
-    return KnowledgeConfig(base_url=base_url, api_key=api_key, dataset_id=dataset_id)
+    dataset = request_json("GET", f"{base_url}/datasets/{dataset_id}", api_key, timeout=args.timeout)
+    return KnowledgeConfig(
+        base_url=base_url,
+        api_key=api_key,
+        dataset_id=dataset_id,
+        doc_form=str(dataset.get("doc_form") or ""),
+        indexing_technique=str(dataset.get("indexing_technique") or "high_quality"),
+    )
 
 
 def resolve_dataset_id(base_url: str, api_key: str, dataset_name: str, *, timeout: float) -> str:
@@ -194,11 +203,12 @@ def sample_pdf_bytes() -> bytes:
 
 def create_document_by_file(config: KnowledgeConfig, path: Path, *, query: str, timeout: float) -> dict[str, Any]:
     data = {
-        "indexing_technique": "high_quality",
-        "doc_form": "text_model",
+        "indexing_technique": config.indexing_technique or "high_quality",
         "doc_language": "English",
         "process_rule": {"mode": "automatic"},
     }
+    if config.doc_form:
+        data["doc_form"] = config.doc_form
     fields = {"data": json.dumps(data, ensure_ascii=False)}
     files = {"file": (path.name, path.read_bytes(), "application/pdf")}
     body, content_type = encode_multipart(fields, files)
