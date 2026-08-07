@@ -409,9 +409,12 @@ def _read_pdf_embedded_images(pdf_path: Path, settings: Settings) -> list[Embedd
 
     try:
         fitz = _load_pymupdf()
-        doc = fitz.open(str(pdf_path))
+        pdf_bytes = pdf_path.read_bytes()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     except ConversionError as exc:
         raise ConversionError("PyMuPDF is required for PDF image extraction.") from exc
+    except OSError as exc:
+        raise ConversionError("Could not read PDF for image extraction.") from exc
     except Exception as exc:
         raise ConversionError("Could not open PDF for image extraction.") from exc
 
