@@ -1,6 +1,8 @@
 import unittest
 
 from scripts.dify_knowledge_pdf_perf_test import (
+    KnowledgeConfig,
+    build_process_rule,
     encode_multipart,
     extract_created_document_id,
     extract_indexed_document_id,
@@ -76,6 +78,20 @@ class DifyKnowledgePdfPerfScriptTest(unittest.TestCase):
         self.assertEqual(items[0]["segment_id"], "seg-1")
         self.assertEqual(items[0]["word_count"], 8)
         self.assertIn("smoke test", items[0]["content_preview"])
+
+    def test_hierarchical_dataset_uses_parent_child_process_rule(self):
+        rule = build_process_rule(
+            KnowledgeConfig(
+                base_url="https://example.test/v1",
+                api_key="test-key",
+                dataset_id="dataset",
+                doc_form="hierarchical_model",
+            )
+        )
+
+        self.assertEqual(rule["mode"], "hierarchical")
+        self.assertEqual(rule["rules"]["parent_mode"], "paragraph")
+        self.assertIn("subchunk_segmentation", rule["rules"])
 
 
 if __name__ == "__main__":

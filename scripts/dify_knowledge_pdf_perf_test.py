@@ -243,7 +243,7 @@ def create_document_by_file(config: KnowledgeConfig, path: Path, *, query: str, 
     data = {
         "indexing_technique": config.indexing_technique or "high_quality",
         "doc_language": "English",
-        "process_rule": {"mode": "automatic"},
+        "process_rule": build_process_rule(config),
     }
     if config.doc_form:
         data["doc_form"] = config.doc_form
@@ -258,6 +258,23 @@ def create_document_by_file(config: KnowledgeConfig, path: Path, *, query: str, 
         content_type=content_type,
         timeout=timeout,
     )
+
+
+def build_process_rule(config: KnowledgeConfig) -> dict[str, Any]:
+    if config.doc_form == "hierarchical_model":
+        return {
+            "mode": "hierarchical",
+            "rules": {
+                "pre_processing_rules": [
+                    {"id": "remove_extra_spaces", "enabled": True},
+                    {"id": "remove_urls_emails", "enabled": False},
+                ],
+                "parent_mode": "paragraph",
+                "segmentation": {"separator": "\n\n", "max_tokens": 800},
+                "subchunk_segmentation": {"separator": "\n", "max_tokens": 300},
+            },
+        }
+    return {"mode": "automatic"}
 
 
 def poll_indexing_status(
