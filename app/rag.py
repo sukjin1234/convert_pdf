@@ -840,7 +840,7 @@ class RagStore:
         with self._lock:
             self._ensure_loaded_locked()
             self._documents[artifact.document_id] = artifact
-            payload = json.dumps(artifact.to_dict(), ensure_ascii=False, indent=2)
+            payload = json.dumps(artifact.to_dict(), ensure_ascii=False, separators=(",", ":"))
             last_error = ""
             for _ in range(len(self._store_dir_candidates)):
                 store_dir = self._resolve_writable_store_dir_locked()
@@ -849,7 +849,7 @@ class RagStore:
 
                 path = store_dir / f"{_safe_id(artifact.document_id)}.json"
                 try:
-                    path.write_text(payload, encoding="utf-8")
+                    _write_text_atomic(path, payload)
                     return
                 except OSError as exc:
                     last_error = f"path={path} error={exc}"
@@ -964,6 +964,27 @@ def _rag_store_dir_candidates(store_dir: Path | None = None) -> list[Path]:
 def _assert_writable_dir(path: Path) -> None:
     with tempfile.NamedTemporaryFile("w", dir=path, prefix=".write-test-", encoding="utf-8", delete=True) as probe:
         probe.write("")
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_file:
+            tmp_path = tmp_file.name
+            tmp_file.write(content)
+        os.replace(tmp_path, path)
+    except OSError:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 def _unique_paths(paths: Iterable[Path]) -> list[Path]:

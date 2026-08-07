@@ -162,6 +162,27 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
             document_ids = {item["document_id"] for item in store.list_documents()}
             self.assertIn("doc_store_fallback", document_ids)
 
+    def test_rag_store_writes_artifact_atomically(self):
+        artifact = build_rag_artifact(
+            "--- Page 1 ---\n\n# Manual\n\n| Item | Value |\n| --- | --- |\n| SLA | 99.9% |",
+            "manual.md",
+            document_id="doc_atomic_store",
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            store_dir = Path(temp_dir)
+            store = RagStore(store_dir)
+            store.upsert(artifact)
+
+            stored_path = store_dir / "doc_atomic_store.json"
+            self.assertTrue(stored_path.exists())
+            self.assertFalse(list(store_dir.glob("*.tmp")))
+            self.assertNotIn("\n", stored_path.read_text(encoding="utf-8"))
+
+            reloaded = RagStore(store_dir)
+            document_ids = {item["document_id"] for item in reloaded.list_documents()}
+            self.assertIn("doc_atomic_store", document_ids)
+
     async def test_chatflow_debug_uses_structured_lookup_without_knowledge_retrieval(self):
         await rag_ingest_markdown(
             MarkdownIngestRequest(
