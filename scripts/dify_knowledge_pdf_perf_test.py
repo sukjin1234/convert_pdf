@@ -186,6 +186,33 @@ def resolve_pdf_source(file_path: str) -> tuple[Path, bool]:
 
 
 def sample_pdf_bytes() -> bytes:
+    try:
+        return sample_pdf_bytes_with_pymupdf()
+    except Exception:
+        return minimal_sample_pdf_bytes()
+
+
+def sample_pdf_bytes_with_pymupdf() -> bytes:
+    import fitz
+
+    query = "Codex Knowledge PDF performance smoke test"
+    paragraph = (
+        f"{query}. This generated PDF verifies Dify Knowledge file upload, PDF parsing, "
+        "text extraction, chunk splitting, indexing, and retrieval timing. "
+        "The text intentionally repeats the smoke test phrase so the uploaded document segment "
+        "can be checked directly after indexing. "
+    )
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=612, height=792)
+        rect = fitz.Rect(72, 72, 540, 720)
+        page.insert_textbox(rect, "\n\n".join([paragraph] * 8), fontsize=11, fontname="helv", align=0)
+        return doc.tobytes(garbage=4, deflate=True)
+    finally:
+        doc.close()
+
+
+def minimal_sample_pdf_bytes() -> bytes:
     body = b"BT /F1 18 Tf 72 720 Td (Codex Knowledge PDF performance smoke test) Tj ET"
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",

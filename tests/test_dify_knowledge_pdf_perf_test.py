@@ -15,8 +15,14 @@ class DifyKnowledgePdfPerfScriptTest(unittest.TestCase):
         content = sample_pdf_bytes()
 
         self.assertTrue(content.startswith(b"%PDF-"))
-        self.assertIn(b"Codex Knowledge PDF performance smoke test", content)
         self.assertTrue(content.rstrip().endswith(b"%%EOF"))
+        import fitz
+
+        doc = fitz.open(stream=content, filetype="pdf")
+        try:
+            self.assertIn("Codex Knowledge PDF performance smoke test", doc[0].get_text())
+        finally:
+            doc.close()
 
     def test_encode_multipart_includes_json_data_and_pdf_file(self):
         body, content_type = encode_multipart(
