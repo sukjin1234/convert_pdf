@@ -394,16 +394,21 @@ async def convert_rag_batch(
 @app.post("/rag/ingest-markdown", response_model=ConvertRagResponse)
 async def rag_ingest_markdown(request: MarkdownIngestRequest) -> ConvertRagResponse:
     try:
-        artifact = build_rag_artifact(
-            request.markdown,
-            request.file_name or "document.md",
-            document_id=request.document_id,
-        )
-        STORE.upsert(artifact)
+        artifact = await asyncio.to_thread(_build_and_store_markdown_artifact, request)
         return ConvertRagResponse(**artifact.to_dict())
     except Exception as exc:
         logger.exception("Markdown RAG ingestion failed")
         return ConvertRagResponse(success=False, error=str(exc))
+
+
+def _build_and_store_markdown_artifact(request: MarkdownIngestRequest):
+    artifact = build_rag_artifact(
+        request.markdown,
+        request.file_name or "document.md",
+        document_id=request.document_id,
+    )
+    STORE.upsert(artifact)
+    return artifact
 
 
 @app.post("/query/plan", response_model=QueryPlanResponse)
@@ -414,7 +419,12 @@ async def query_plan(request: QueryPlanRequest) -> QueryPlanResponse:
 @app.post("/lookup", response_model=LookupResponse)
 async def lookup(request: LookupRequest) -> LookupResponse:
     limit = max(1, min(request.limit, 30))
-    result = lookup_matches(
+    result = await asyncio.to_thread(_lookup_from_store, request, limit)
+    return LookupResponse(**result)
+
+
+def _lookup_from_store(request: LookupRequest, limit: int) -> dict[str, Any]:
+    return lookup_matches(
         query=request.query,
         records=STORE.records(request.document_id),
         chunks=STORE.chunks(request.document_id),
@@ -422,12 +432,12 @@ async def lookup(request: LookupRequest) -> LookupResponse:
         query_type=request.query_type,
         limit=limit,
     )
-    return LookupResponse(**result)
 
 
 @app.post("/answer/verify", response_model=VerifyResponse)
 async def answer_verify(request: VerifyRequest) -> VerifyResponse:
-    return VerifyResponse(**verify_answer(request.question, request.answer, request.evidence))
+    result = await asyncio.to_thread(verify_answer, request.question, request.answer, request.evidence)
+    return VerifyResponse(**result)
 
 
 @app.post("/chatflow/merge-evidence", response_model=MergeEvidenceResponse)
@@ -438,7 +448,8 @@ async def chatflow_merge_evidence(request_body: Any = Body(None)) -> MergeEviden
         knowledge_source = request.knowledge_context
     if knowledge_source is None:
         knowledge_source = request.knowledge_body
-    return MergeEvidenceResponse(**merge_evidence_context(request.lookup_body, knowledge_source))
+    result = await asyncio.to_thread(merge_evidence_context, request.lookup_body, knowledge_source)
+    return MergeEvidenceResponse(**result)
 
 
 def normalize_merge_evidence_request(request_body: Any) -> MergeEvidenceRequest:
@@ -456,6 +467,11 @@ def normalize_merge_evidence_request(request_body: Any) -> MergeEvidenceRequest:
 @app.post("/chatflow/debug", response_model=ChatflowDebugResponse)
 async def chatflow_debug(request: ChatflowDebugRequest) -> ChatflowDebugResponse:
     limit = max(1, min(request.limit, 30))
+    payload = await asyncio.to_thread(_build_chatflow_debug_payload, request, limit)
+    return ChatflowDebugResponse(**payload)
+
+
+def _build_chatflow_debug_payload(request: ChatflowDebugRequest, limit: int) -> dict[str, Any]:
     plan = plan_query(request.query, request.document_id)
     lookup_result = lookup_matches(
         query=request.query,
@@ -472,21 +488,21 @@ async def chatflow_debug(request: ChatflowDebugRequest) -> ChatflowDebugResponse
     if request.answer is not None:
         supplied_verification = verify_answer(request.query, request.answer, [merged["evidence_context"]])
 
-    return ChatflowDebugResponse(
-        query_plan=plan,
-        structured_lookup=lookup_result,
-        merge_evidence=merged,
-        answer_contract=lookup_result.get("answer_contract") or {},
-        draft_answer=draft_answer,
-        draft_verification=draft_verification,
-        supplied_answer_verification=supplied_verification,
-        node_status={
+    return {
+        "query_plan": plan,
+        "structured_lookup": lookup_result,
+        "merge_evidence": merged,
+        "answer_contract": lookup_result.get("answer_contract") or {},
+        "draft_answer": draft_answer,
+        "draft_verification": draft_verification,
+        "supplied_answer_verification": supplied_verification,
+        "node_status": {
             "structured_lookup_has_context": bool(lookup_result.get("context")),
             "knowledge_retrieval_supplied": bool(request.knowledge_result),
             "evidence_context_has_structured_lookup": "[Structured Lookup" in merged["evidence_context"],
             "draft_answer_valid": bool(draft_verification.get("valid")),
         },
-    )
+    }
 
 
 @app.post("/eval/log")
