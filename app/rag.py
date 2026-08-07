@@ -834,12 +834,14 @@ class RagStore:
         self._persistence_warning_logged = False
         self._documents: dict[str, RagArtifact] = {}
         self._loaded = False
+        self._revision = 0
         self._lock = threading.Lock()
 
     def upsert(self, artifact: RagArtifact) -> None:
         with self._lock:
             self._ensure_loaded_locked()
             self._documents[artifact.document_id] = artifact
+            self._revision += 1
             payload = json.dumps(artifact.to_dict(), ensure_ascii=False, separators=(",", ":"))
             last_error = ""
             for _ in range(len(self._store_dir_candidates)):
@@ -885,6 +887,16 @@ class RagStore:
             artifacts = self._selected_artifacts(document_id)
             return [chunk for artifact in artifacts for chunk in artifact.chunks]
 
+    def cache_token(self, document_id: str | None = None) -> str:
+        with self._lock:
+            self._ensure_loaded_locked()
+            artifacts = self._selected_artifacts(document_id)
+            parts = [
+                f"{artifact.document_id}:{len(artifact.chunks)}:{len(artifact.records)}"
+                for artifact in sorted(artifacts, key=lambda item: item.document_id)
+            ]
+            return f"{self._revision}:" + "|".join(parts)
+
     def _selected_artifacts(self, document_id: str | None) -> list[RagArtifact]:
         if document_id:
             artifact = self._documents.get(document_id)
@@ -895,6 +907,7 @@ class RagStore:
         if self._loaded:
             return
         self._loaded = True
+        loaded_any = False
         for root in self._store_dir_candidates:
             if not root.exists():
                 continue
@@ -911,8 +924,11 @@ class RagStore:
                     continue
                 if artifact.document_id:
                     self._documents[artifact.document_id] = artifact
+                    loaded_any = True
                     if artifact.to_dict() != payload:
                         self._rewrite_migrated_artifact(path, artifact)
+        if loaded_any:
+            self._revision += 1
 
     def _resolve_writable_store_dir_locked(self) -> Path | None:
         if self._writable_store_dir is not None:

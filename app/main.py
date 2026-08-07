@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -424,12 +425,39 @@ async def lookup(request: LookupRequest) -> LookupResponse:
 
 
 def _lookup_from_store(request: LookupRequest, limit: int) -> dict[str, Any]:
+    document_id = request.document_id or ""
+    query_type = request.query_type or ""
+    entities = tuple(request.entities or [])
+    store_token = STORE.cache_token(document_id or None)
+    return _lookup_from_store_cached(
+        id(STORE),
+        store_token,
+        request.query,
+        document_id,
+        entities,
+        query_type,
+        limit,
+    )
+
+
+@lru_cache(maxsize=512)
+def _lookup_from_store_cached(
+    store_identity: int,
+    store_token: str,
+    query: str,
+    document_id: str,
+    entities: tuple[str, ...],
+    query_type: str,
+    limit: int,
+) -> dict[str, Any]:
+    del store_identity, store_token
+    active_document_id = document_id or None
     return lookup_matches(
-        query=request.query,
-        records=STORE.records(request.document_id),
-        chunks=STORE.chunks(request.document_id),
-        entities=request.entities,
-        query_type=request.query_type,
+        query=query,
+        records=STORE.records(active_document_id),
+        chunks=STORE.chunks(active_document_id),
+        entities=list(entities),
+        query_type=query_type or None,
         limit=limit,
     )
 

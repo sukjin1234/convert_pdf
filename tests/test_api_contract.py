@@ -9,11 +9,23 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import app.main as main_module
 from fastapi import UploadFile
 from fastapi.testclient import TestClient
 
 from app.eval_logs import EvalLogStore
-from app.main import app, ChatflowDebugRequest, ConvertResponse, MarkdownIngestRequest, chatflow_debug, convert, convert_batch, convert_rag, rag_ingest_markdown
+from app.main import (
+    LookupRequest,
+    app,
+    ChatflowDebugRequest,
+    ConvertResponse,
+    MarkdownIngestRequest,
+    chatflow_debug,
+    convert,
+    convert_batch,
+    convert_rag,
+    rag_ingest_markdown,
+)
 from app.rag import RagStore, build_rag_artifact
 
 
@@ -223,6 +235,43 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("\x00", joined)
             self.assertEqual(records[0].fields["Item"], "SLA")
             self.assertNotIn("\\u0000", stored_path.read_text(encoding="utf-8"))
+
+    def test_lookup_cache_reuses_results_until_store_changes(self):
+        first = build_rag_artifact(
+            "--- Page 1 ---\n\n# Manual\n\n| Item | Value |\n| --- | --- |\n| SLA | 99.9% |",
+            "manual.md",
+            document_id="doc_cached",
+        )
+        second = build_rag_artifact(
+            "--- Page 1 ---\n\n# Manual\n\n| Item | Value |\n| --- | --- |\n| SLA | 99.95% |",
+            "manual.md",
+            document_id="doc_cached",
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            store = RagStore(Path(temp_dir))
+            store.upsert(first)
+            request = LookupRequest(
+                query="SLA 값 알려줘",
+                document_id="doc_cached",
+                entities=["SLA", "Value"],
+                query_type="number_lookup",
+                limit=8,
+            )
+            main_module._lookup_from_store_cached.cache_clear()
+            with (
+                patch.object(main_module, "STORE", store),
+                patch.object(main_module, "lookup_matches", wraps=main_module.lookup_matches) as lookup_spy,
+            ):
+                first_result = main_module._lookup_from_store(request, 8)
+                second_result = main_module._lookup_from_store(request, 8)
+                self.assertEqual(lookup_spy.call_count, 1)
+                self.assertEqual(first_result["direct_answer"], second_result["direct_answer"])
+
+                store.upsert(second)
+                third_result = main_module._lookup_from_store(request, 8)
+                self.assertEqual(lookup_spy.call_count, 2)
+                self.assertIn("99.95", third_result["direct_answer"])
 
     async def test_chatflow_debug_uses_structured_lookup_without_knowledge_retrieval(self):
         await rag_ingest_markdown(
