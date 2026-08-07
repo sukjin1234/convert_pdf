@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import threading
 import time
@@ -182,6 +183,46 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
             reloaded = RagStore(store_dir)
             document_ids = {item["document_id"] for item in reloaded.list_documents()}
             self.assertIn("doc_atomic_store", document_ids)
+
+    def test_rag_store_migrates_legacy_control_characters_on_load(self):
+        artifact = build_rag_artifact(
+            "--- Page 1 ---\n\n# Manual\n\n| Item | Value |\n| --- | --- |\n| SLA | 99.9% |",
+            "manual.md",
+            document_id="doc_legacy_control",
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            store_dir = Path(temp_dir)
+            payload = artifact.to_dict()
+            payload["markdown"] = "# Manual\x00\n\n| Item | Value |"
+            payload["dify_markdown"] = payload["dify_markdown"].replace("SLA", "S\x00LA")
+            payload["chunks"][0]["section_path"] = "Manual\x00 > Table"
+            payload["chunks"][0]["text"] = payload["chunks"][0]["text"].replace("SLA", "S\x00LA")
+            payload["records"][0]["fields"] = {"I\x00tem": "S\x00LA", "Value": "99.9\x00%"}
+            payload["records"][0]["answer_text"] = "S\x00LA의 Value은/는 99.9\x00%입니다."
+            payload["document_map"][0]["section_path"] = "Manual\x00 > Table"
+
+            stored_path = store_dir / "doc_legacy_control.json"
+            stored_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            reloaded = RagStore(store_dir)
+            records = reloaded.records("doc_legacy_control")
+            chunks = reloaded.chunks("doc_legacy_control")
+
+            self.assertTrue(records)
+            self.assertTrue(chunks)
+            joined = "\n".join(
+                [
+                    chunks[0].section_path,
+                    chunks[0].text,
+                    records[0].answer_text,
+                    *records[0].fields.keys(),
+                    *records[0].fields.values(),
+                ]
+            )
+            self.assertNotIn("\x00", joined)
+            self.assertEqual(records[0].fields["Item"], "SLA")
+            self.assertNotIn("\\u0000", stored_path.read_text(encoding="utf-8"))
 
     async def test_chatflow_debug_uses_structured_lookup_without_knowledge_retrieval(self):
         await rag_ingest_markdown(

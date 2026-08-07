@@ -809,15 +809,15 @@ class RagArtifact:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RagArtifact":
-        chunks = [RagChunk(**item) for item in payload.get("chunks", [])]
-        records = [StructuredRecord(**item) for item in payload.get("records", [])]
-        document_map = [DocumentMapItem(**item) for item in payload.get("document_map", [])]
+        chunks = [_load_rag_chunk(item) for item in payload.get("chunks", []) if isinstance(item, dict)]
+        records = [_load_structured_record(item) for item in payload.get("records", []) if isinstance(item, dict)]
+        document_map = [_load_document_map_item(item) for item in payload.get("document_map", []) if isinstance(item, dict)]
         return cls(
             success=bool(payload.get("success", False)),
-            document_id=str(payload.get("document_id", "")),
-            file_name=str(payload.get("file_name", "")),
-            markdown=str(payload.get("markdown", "")),
-            dify_markdown=str(payload.get("dify_markdown", "")),
+            document_id=clean_cell(payload.get("document_id", "")),
+            file_name=clean_cell(payload.get("file_name", "")),
+            markdown=clean_stored_text(payload.get("markdown", "")),
+            dify_markdown=clean_stored_text(payload.get("dify_markdown", "")),
             chunks=chunks,
             records=records,
             document_map=document_map,
@@ -911,6 +911,8 @@ class RagStore:
                     continue
                 if artifact.document_id:
                     self._documents[artifact.document_id] = artifact
+                    if artifact.to_dict() != payload:
+                        self._rewrite_migrated_artifact(path, artifact)
 
     def _resolve_writable_store_dir_locked(self) -> Path | None:
         if self._writable_store_dir is not None:
@@ -938,6 +940,84 @@ class RagStore:
             return
         self._persistence_warning_logged = True
         logger.warning(message)
+
+    def _rewrite_migrated_artifact(self, path: Path, artifact: RagArtifact) -> None:
+        try:
+            payload = json.dumps(artifact.to_dict(), ensure_ascii=False, separators=(",", ":"))
+            _write_text_atomic(path, payload)
+        except OSError as exc:
+            logger.debug("Could not rewrite migrated RAG artifact. path=%s error=%s", path, exc)
+
+
+def _load_rag_chunk(item: dict[str, Any]) -> RagChunk:
+    return RagChunk(
+        chunk_id=clean_cell(item.get("chunk_id", "")),
+        document_id=clean_cell(item.get("document_id", "")),
+        file_name=clean_cell(item.get("file_name", "")),
+        page_start=item.get("page_start") if isinstance(item.get("page_start"), int) else None,
+        page_end=item.get("page_end") if isinstance(item.get("page_end"), int) else None,
+        section_path=clean_cell(item.get("section_path", "")),
+        title=clean_cell(item.get("title", "")),
+        text=clean_stored_text(item.get("text", "")),
+        metadata_text=clean_stored_text(item.get("metadata_text", "")),
+        keywords=clean_text_list(item.get("keywords", [])),
+        record_types=clean_text_list(item.get("record_types", [])),
+        text_hash=clean_cell(item.get("text_hash", "")),
+    )
+
+
+def _load_structured_record(item: dict[str, Any]) -> StructuredRecord:
+    return StructuredRecord(
+        record_id=clean_cell(item.get("record_id", "")),
+        record_type=clean_cell(item.get("record_type", "")),
+        document_id=clean_cell(item.get("document_id", "")),
+        file_name=clean_cell(item.get("file_name", "")),
+        chunk_id=clean_cell(item.get("chunk_id", "")),
+        page=item.get("page") if isinstance(item.get("page"), int) else None,
+        section_path=clean_cell(item.get("section_path", "")),
+        fields=clean_fields_dict(item.get("fields", {})),
+        source_text=clean_stored_text(item.get("source_text", "")),
+        answer_text=clean_cell(item.get("answer_text", "")),
+        keywords=clean_text_list(item.get("keywords", [])),
+    )
+
+
+def _load_document_map_item(item: dict[str, Any]) -> DocumentMapItem:
+    return DocumentMapItem(
+        section_path=clean_cell(item.get("section_path", "")),
+        page_start=item.get("page_start") if isinstance(item.get("page_start"), int) else None,
+        page_end=item.get("page_end") if isinstance(item.get("page_end"), int) else None,
+        keywords=clean_text_list(item.get("keywords", [])),
+        chunk_ids=clean_text_list(item.get("chunk_ids", [])),
+        record_count=int(item.get("record_count") or 0),
+    )
+
+
+def clean_fields_dict(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    fields: dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        key = clean_cell(raw_key)
+        cell = clean_cell(raw_value)
+        if key:
+            fields[key] = cell
+    return fields
+
+
+def clean_text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in (clean_cell(item) for item in value) if item]
+
+
+def clean_stored_text(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return text.strip()
 
 
 def _rag_store_dir_candidates(store_dir: Path | None = None) -> list[Path]:
@@ -2269,7 +2349,7 @@ def is_separator_row(row: list[str]) -> bool:
 
 def clean_cell(value: Any) -> str:
     text = str(value or "")
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     text = text.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
     text = re.sub(r"[*`]+", "", text)
     text = re.sub(r"\s+", " ", text)
