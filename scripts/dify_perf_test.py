@@ -36,6 +36,17 @@ class SendResult:
     latency_seconds: float
     conversation_id: str
     error: str
+    workflow_run_id: str = ""
+    time_to_first_token_seconds: float = 0
+    total_tokens: int = 0
+
+
+@dataclass
+class ResponseStats:
+    conversation_id: str = ""
+    workflow_run_id: str = ""
+    time_to_first_token_seconds: float = 0
+    total_tokens: int = 0
 
 
 def main() -> int:
@@ -234,17 +245,28 @@ def send_chat_message(
     started = time.perf_counter()
     status_code: int | None = None
     response_conversation_id = ""
+    workflow_run_id = ""
+    time_to_first_token_seconds = 0.0
+    total_tokens = 0
     error = ""
 
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status_code = response.status
             if response_mode == "streaming":
-                response_conversation_id = drain_sse_response(response)
+                stats = drain_sse_response(response, started_at=started)
+                response_conversation_id = stats.conversation_id
+                workflow_run_id = stats.workflow_run_id
+                time_to_first_token_seconds = stats.time_to_first_token_seconds
+                total_tokens = stats.total_tokens
             else:
                 response_body = response.read().decode("utf-8")
                 data = json.loads(response_body) if response_body else {}
-                response_conversation_id = str(data.get("conversation_id") or "")
+                stats = response_stats_from_json(data)
+                response_conversation_id = stats.conversation_id
+                workflow_run_id = stats.workflow_run_id
+                time_to_first_token_seconds = stats.time_to_first_token_seconds
+                total_tokens = stats.total_tokens
     except urllib.error.HTTPError as exc:
         status_code = exc.code
         error_body = exc.read().decode("utf-8", errors="replace")
@@ -268,11 +290,14 @@ def send_chat_message(
         latency_seconds=round(latency_seconds, 6),
         conversation_id=response_conversation_id,
         error=error,
+        workflow_run_id=workflow_run_id,
+        time_to_first_token_seconds=round(time_to_first_token_seconds, 6),
+        total_tokens=total_tokens,
     )
 
 
-def drain_sse_response(response: Any) -> str:
-    conversation_id = ""
+def drain_sse_response(response: Any, *, started_at: float) -> ResponseStats:
+    stats = ResponseStats()
 
     for raw_line in response:
         line = raw_line.decode("utf-8", errors="replace").strip()
@@ -287,9 +312,38 @@ def drain_sse_response(response: Any) -> str:
             continue
 
         if data.get("conversation_id"):
-            conversation_id = str(data.get("conversation_id"))
+            stats.conversation_id = str(data.get("conversation_id"))
+        if data.get("workflow_run_id"):
+            stats.workflow_run_id = str(data.get("workflow_run_id"))
+        if data.get("event") in {"message", "agent_message"} and data.get("answer") and not stats.time_to_first_token_seconds:
+            stats.time_to_first_token_seconds = time.perf_counter() - started_at
+        apply_usage_stats(stats, data)
 
-    return conversation_id
+    return stats
+
+
+def response_stats_from_json(data: dict[str, Any]) -> ResponseStats:
+    stats = ResponseStats(
+        conversation_id=str(data.get("conversation_id") or ""),
+        workflow_run_id=str(data.get("workflow_run_id") or ""),
+    )
+    apply_usage_stats(stats, data)
+    return stats
+
+
+def apply_usage_stats(stats: ResponseStats, data: dict[str, Any]) -> None:
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else data.get("usage")
+    if not isinstance(usage, dict):
+        return
+    if not stats.total_tokens:
+        stats.total_tokens = safe_int(usage.get("total_tokens"))
+    usage_ttft = usage.get("time_to_first_token")
+    if not stats.time_to_first_token_seconds and usage_ttft is not None:
+        try:
+            stats.time_to_first_token_seconds = float(usage_ttft)
+        except (TypeError, ValueError):
+            pass
 
 
 def load_env_file(path: Path) -> None:
@@ -382,6 +436,8 @@ def summarize_results(results: list[SendResult], elapsed_seconds: float) -> dict
     failed = [result for result in results if not result.ok]
     throughput = len(results) / elapsed_seconds if elapsed_seconds > 0 else 0
     latencies = sorted(result.latency_seconds for result in results if result.ok)
+    ttfts = sorted(result.time_to_first_token_seconds for result in results if result.ok and result.time_to_first_token_seconds > 0)
+    token_counts = [result.total_tokens for result in results if result.ok and result.total_tokens > 0]
     return {
         "total": len(results),
         "success": success_count,
@@ -393,6 +449,12 @@ def summarize_results(results: list[SendResult], elapsed_seconds: float) -> dict
         "latency_p50_seconds": percentile(latencies, 50),
         "latency_p95_seconds": percentile(latencies, 95),
         "latency_max_seconds": max(latencies) if latencies else 0,
+        "ttft_avg_seconds": round(sum(ttfts) / len(ttfts), 6) if ttfts else 0,
+        "ttft_p50_seconds": percentile(ttfts, 50),
+        "ttft_p95_seconds": percentile(ttfts, 95),
+        "ttft_max_seconds": max(ttfts) if ttfts else 0,
+        "total_tokens": sum(token_counts),
+        "tokens_avg": round(sum(token_counts) / len(token_counts), 3) if token_counts else 0,
     }
 
 
@@ -408,6 +470,13 @@ def percentile(values: list[float], percentile_value: int) -> float:
     return round(values[lower] * (1 - weight) + values[upper] * weight, 6)
 
 
+def safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def print_summary(summary: dict[str, Any], results: list[SendResult], out_path: Path | None) -> None:
     failed = [result for result in results if not result.ok]
     print("")
@@ -421,6 +490,14 @@ def print_summary(summary: dict[str, Any], results: list[SendResult], out_path: 
         f"{summary['latency_p50_seconds']:.3f}s/{summary['latency_p95_seconds']:.3f}s/"
         f"{summary['latency_max_seconds']:.3f}s"
     )
+    if summary.get("ttft_avg_seconds"):
+        print(
+            f"- TTFT avg/p50/p95/max: {summary['ttft_avg_seconds']:.3f}s/"
+            f"{summary['ttft_p50_seconds']:.3f}s/{summary['ttft_p95_seconds']:.3f}s/"
+            f"{summary['ttft_max_seconds']:.3f}s"
+        )
+    if summary.get("total_tokens"):
+        print(f"- tokens total/avg: {summary['total_tokens']}/{summary['tokens_avg']:.1f}")
     if out_path:
         print(f"- saved: {out_path}")
     if failed:
