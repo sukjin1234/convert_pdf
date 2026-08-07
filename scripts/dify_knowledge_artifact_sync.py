@@ -20,6 +20,7 @@ from app.rag import RagArtifact  # noqa: E402
 from scripts.dify_knowledge_pdf_perf_test import (  # noqa: E402
     KnowledgeConfig,
     build_process_rule,
+    delete_document,
     encode_multipart,
     extract_created_document_id,
     extract_indexed_document_id,
@@ -41,6 +42,7 @@ class ArtifactSyncItem:
     chunk_count: int
     record_count: int
     status: str = "ready"
+    existing_document_ids: list[str] | None = None
     batch: str = ""
     uploaded_document_id: str = ""
     indexing_statuses: list[str] | None = None
@@ -62,6 +64,17 @@ def main() -> int:
     parser.add_argument("--poll-interval", type=float, default=5.0)
     parser.add_argument("--doc-language", default="Korean")
     parser.add_argument("--upload", action="store_true", help="Actually create Knowledge documents. Default is dry-run.")
+    parser.add_argument(
+        "--check-existing",
+        action="store_true",
+        help="Resolve the Knowledge dataset during dry-run and mark artifacts whose upload file already exists.",
+    )
+    parser.add_argument(
+        "--duplicate-action",
+        choices=["skip", "replace", "upload"],
+        default="skip",
+        help="What to do when an upload_file_name already exists in Knowledge. replace deletes matching docs first.",
+    )
     parser.add_argument("--out", default=str(ROOT / ".runtime" / "dify_knowledge_artifact_sync_latest.json"))
     parser.add_argument("--json", action="store_true", help="Print the full JSON report.")
     args = parser.parse_args()
@@ -77,9 +90,23 @@ def main() -> int:
     failed = not items or any(item.status != "ready" for item in items)
     config: KnowledgeConfig | None = None
 
-    if args.upload:
+    if args.upload or args.check_existing:
         config = build_config(args)
+        existing_by_name = existing_documents_by_name(
+            list_existing_knowledge_documents(config, timeout=args.timeout)
+        )
+        apply_duplicate_policy(items, existing_by_name, duplicate_action=args.duplicate_action, upload=args.upload)
+
+    if args.upload:
         for item, artifact in zip(items, artifacts, strict=False):
+            if item.status == "skipped_existing":
+                continue
+            if item.status == "replace_pending":
+                replace_existing_documents(config, item, timeout=args.timeout)
+                if item.error:
+                    failed = True
+                    continue
+                item.status = "ready"
             if item.status != "ready":
                 continue
             upload_item(config, item, artifact, args)
@@ -187,6 +214,102 @@ def resolve_dataset_id(base_url: str, api_key: str, dataset_name: str, *, timeou
     return ""
 
 
+def list_existing_knowledge_documents(config: KnowledgeConfig, *, timeout: float) -> list[dict[str, Any]]:
+    documents: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        query = urllib.parse.urlencode({"page": page, "limit": 100})
+        payload = request_json(
+            "GET",
+            f"{config.base_url}/datasets/{config.dataset_id}/documents?{query}",
+            config.api_key,
+            timeout=timeout,
+        )
+        items = [item for item in payload_items(payload) if isinstance(item, dict)]
+        documents.extend(items)
+        total = safe_int(payload.get("total")) if isinstance(payload, dict) else 0
+        if not items or len(items) < 100 or (total and len(documents) >= total):
+            return documents
+        page += 1
+
+
+def existing_documents_by_name(documents: list[dict[str, Any]]) -> dict[str, list[str]]:
+    by_name: dict[str, list[str]] = {}
+    for document in documents:
+        document_id = str(document.get("id") or "")
+        if not document_id:
+            continue
+        for name in existing_document_names(document):
+            by_name.setdefault(name, []).append(document_id)
+    return by_name
+
+
+def existing_document_names(document: dict[str, Any]) -> set[str]:
+    names = {
+        clean_document_name(document.get("name")),
+        clean_document_name(document.get("document_name")),
+    }
+    for key in ("data_source_info", "data_source_detail_dict", "data_source_detail"):
+        value = document.get(key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = {}
+        if not isinstance(value, dict):
+            continue
+        names.add(clean_document_name(value.get("upload_file_name")))
+        names.add(clean_document_name(value.get("file_name")))
+        upload_file = value.get("upload_file") if isinstance(value.get("upload_file"), dict) else {}
+        names.add(clean_document_name(upload_file.get("name")))
+        names.add(clean_document_name(upload_file.get("filename")))
+    return {name for name in names if name}
+
+
+def clean_document_name(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def apply_duplicate_policy(
+    items: list[ArtifactSyncItem],
+    existing_by_name: dict[str, list[str]],
+    *,
+    duplicate_action: str,
+    upload: bool,
+) -> None:
+    for item in items:
+        if item.status != "ready":
+            continue
+        existing_ids = existing_by_name.get(item.upload_file_name, [])
+        if not existing_ids:
+            continue
+        item.existing_document_ids = existing_ids
+        if duplicate_action == "upload":
+            continue
+        if duplicate_action == "replace":
+            item.status = "replace_pending" if upload else "would_replace_existing"
+            continue
+        item.status = "skipped_existing" if upload else "would_skip_existing"
+
+
+def replace_existing_documents(config: KnowledgeConfig, item: ArtifactSyncItem, *, timeout: float) -> None:
+    errors = []
+    for document_id in item.existing_document_ids or []:
+        error = delete_document(config, document_id, timeout=timeout)
+        if error:
+            errors.append(f"{document_id}: {error}")
+    if errors:
+        item.status = "error"
+        item.error = "; ".join(errors)
+
+
 def upload_item(config: KnowledgeConfig, item: ArtifactSyncItem, artifact: RagArtifact, args: argparse.Namespace) -> None:
     try:
         create_payload = create_document_from_artifact(
@@ -270,7 +393,8 @@ def summarize_items(items: list[ArtifactSyncItem]) -> dict[str, Any]:
         "total": len(items),
         "ready": sum(1 for item in items if item.status == "ready"),
         "uploaded": sum(1 for item in items if item.status == "uploaded"),
-        "skipped": sum(1 for item in items if item.status.startswith("skipped")),
+        "skipped": sum(1 for item in items if item.status.startswith("skipped") or item.status.startswith("would_skip")),
+        "replace_pending": sum(1 for item in items if item.status in {"replace_pending", "would_replace_existing"}),
         "errors": sum(1 for item in items if item.status == "error"),
         "markdown_chars": sum(item.markdown_chars for item in items),
     }
@@ -284,14 +408,16 @@ def print_human(report: dict[str, Any], out_path: Path) -> None:
     print(f"- store_dir: {report.get('store_dir')}")
     print(f"- dataset_id: {report.get('dataset_id') or '(not resolved in dry-run)'}")
     print(
-        f"- total/ready/uploaded/skipped/errors: {summary.get('total')}/"
-        f"{summary.get('ready')}/{summary.get('uploaded')}/{summary.get('skipped')}/{summary.get('errors')}"
+        f"- total/ready/uploaded/skipped/replace/errors: {summary.get('total')}/"
+        f"{summary.get('ready')}/{summary.get('uploaded')}/{summary.get('skipped')}/"
+        f"{summary.get('replace_pending')}/{summary.get('errors')}"
     )
     print(f"- markdown_chars: {summary.get('markdown_chars')}")
     for item in report.get("documents", [])[:10]:
         print(
             f"  - {item.get('document_id')} -> {item.get('upload_file_name')} "
-            f"{item.get('status')} chars={item.get('markdown_chars')}"
+            f"{item.get('status')} chars={item.get('markdown_chars')} "
+            f"existing={len(item.get('existing_document_ids') or [])}"
         )
     print(f"- saved: {out_path}")
 
