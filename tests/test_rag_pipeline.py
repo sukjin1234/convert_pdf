@@ -1632,6 +1632,38 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertIn("컴퓨터정보공학과: 예", positive["direct_answer"])
         self.assertIn("산업디자인학과: 아니오", negative["direct_answer"])
 
+    def test_condition_lookup_prefers_requirement_detail_content(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 3 ---
+
+# 지원 자격
+
+일반전형 지원자는 고등학교 졸업자 또는 2026년 2월 졸업예정자여야 한다. 특별전형 지원자는 산업체 재직 경력 2년 이상을 증빙해야 한다.
+
+## 제출 서류
+
+| 대상 | 필수 서류 | 제출 방식 |
+| --- | --- | --- |
+| 특별전형 | 재직증명서, 경력증명서 | 원본 우편 제출 |
+""",
+            "admission.md",
+            document_id="doc_requirement_detail",
+        )
+
+        plan = plan_query("특별전형 지원 자격 조건은 뭐야?")
+        result = lookup_matches(
+            query="특별전형 지원 자격 조건은 뭐야?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            entities=plan["entities"],
+            query_type=plan["query_type"],
+            limit=8,
+        )
+
+        self.assertIn("산업체 재직 경력 2년 이상", result["context"])
+        self.assertNotEqual(result["direct_answer"], "전형: 특별전형: 예")
+
     def test_toc_section_does_not_carry_into_next_page_table(self):
         artifact = build_rag_artifact(
             """

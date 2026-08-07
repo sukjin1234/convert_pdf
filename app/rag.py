@@ -3013,7 +3013,11 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
         if inverse["direct_answer"]:
             return inverse
 
-    if looks_like_membership_question(query) and (should_build_keyed_list or should_build_boolean_matrix):
+    if (
+        looks_like_membership_question(query)
+        and not looks_like_condition_detail_question(query)
+        and (should_build_keyed_list or should_build_boolean_matrix)
+    ):
         membership = build_membership_answer(query, query_type, query_keywords, top_group)
         if membership["direct_answer"]:
             return membership
@@ -3367,6 +3371,10 @@ def looks_like_membership_question(query: str) -> bool:
             re.IGNORECASE,
         )
     )
+
+
+def looks_like_condition_detail_question(query: str) -> bool:
+    return bool(re.search(r"조건|자격|요건|필요|승인|requirement|condition|eligib|approval", query, re.IGNORECASE))
 
 
 def build_membership_answer(
@@ -3728,7 +3736,9 @@ def build_field_value_answer(
     scalar_target_keys = choose_scalar_value_field_keys(query, query_type, matches)
     target_keys = scalar_target_keys[:]
     if not target_keys:
-        target_key = choose_target_field_key(query, query_terms, matches)
+        target_key = choose_condition_detail_field(query, query_terms, matches) if query_type == "condition_lookup" else ""
+        if not target_key:
+            target_key = choose_target_field_key(query, query_terms, matches)
         if not target_key:
             target_key = choose_value_field_from_query(query, query_type, matches)
         target_keys = [target_key] if target_key else []
@@ -3881,6 +3891,37 @@ def choose_scalar_value_field_keys(query: str, query_type: str, matches: list[di
 
     best_key_norm, best_score = scores.most_common(1)[0]
     return [key_by_norm[best_key_norm]] if best_score >= 3.0 else []
+
+
+def choose_condition_detail_field(query: str, query_terms: list[str], matches: list[dict[str, Any]]) -> str:
+    if not looks_like_condition_detail_question(query):
+        return ""
+
+    scores: Counter[str] = Counter()
+    key_by_norm: dict[str, str] = {}
+    for match in matches:
+        fields = match.get("fields") or {}
+        for key, value in fields.items():
+            key = clean_cell(key)
+            value = clean_cell(value)
+            if not key or not value or key in MARKER_METADATA_FIELDS:
+                continue
+            key_norm = normalize_for_match(key)
+            if not key_norm:
+                continue
+            key_by_norm[key_norm] = key
+            if re.search(r"내용|설명|자격|조건|요건|필수|승인|requirement|condition|eligib|approval", key, re.IGNORECASE):
+                scores[key_norm] += 8
+            if re.search(r"지원자|지원\s*자격|조건|요건|필요|증빙|승인|required|eligible|approval", value, re.IGNORECASE):
+                scores[key_norm] += 4
+            scores[key_norm] += term_coverage(value, query_terms) * 10
+            if len(value) >= 20:
+                scores[key_norm] += 2
+
+    if not scores:
+        return ""
+    key_norm, score = scores.most_common(1)[0]
+    return key_by_norm.get(key_norm, "") if score >= 6 else ""
 
 
 def value_matches_scalar_query(value: str, query_type: str, query_attrs: set[str]) -> bool:
