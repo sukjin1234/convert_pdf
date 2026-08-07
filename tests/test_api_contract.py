@@ -208,6 +208,14 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
             payload = artifact.to_dict()
             payload["markdown"] = "# Manual\x00\n\n| Item | Value |"
             payload["dify_markdown"] = payload["dify_markdown"].replace("SLA", "S\x00LA")
+            payload["dify_markdown"] = payload["dify_markdown"].replace(
+                "[section: Manual]",
+                "[section: Guide\x00 > 2. 정원외 전형 모집인원 > Ⅱ. 전형일정]",
+            )
+            payload["dify_markdown"] = payload["dify_markdown"].replace(
+                "source_section: Manual",
+                "source_section: Guide\x00 > 2. 정원외 전형 모집인원 > Ⅱ. 전형일정",
+            )
             payload["chunks"][0]["section_path"] = "Guide\x00 > 2. 정원외 전형 모집인원 > Ⅱ. 전형일정"
             payload["chunks"][0]["text"] = payload["chunks"][0]["text"].replace("SLA", "S\x00LA")
             payload["records"][0]["section_path"] = "Guide\x00 > 2. 정원외 전형 모집인원 > Ⅱ. 전형일정"
@@ -237,7 +245,11 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(chunks[0].section_path, "Guide > Ⅱ. 전형일정")
             self.assertEqual(records[0].section_path, "Guide > Ⅱ. 전형일정")
             self.assertEqual(records[0].fields["Item"], "SLA")
-            self.assertNotIn("\\u0000", stored_path.read_text(encoding="utf-8"))
+            migrated_text = stored_path.read_text(encoding="utf-8")
+            self.assertNotIn("\\u0000", migrated_text)
+            self.assertIn("[section: Guide > Ⅱ. 전형일정]", migrated_text)
+            self.assertIn("source_section: Guide > Ⅱ. 전형일정", migrated_text)
+            self.assertNotIn("source_section: Guide > 2. 정원외 전형 모집인원", migrated_text)
 
     def test_lookup_cache_reuses_results_until_store_changes(self):
         first = build_rag_artifact(

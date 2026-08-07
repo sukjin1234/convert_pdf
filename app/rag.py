@@ -817,7 +817,7 @@ class RagArtifact:
             document_id=clean_cell(payload.get("document_id", "")),
             file_name=clean_cell(payload.get("file_name", "")),
             markdown=clean_stored_text(payload.get("markdown", "")),
-            dify_markdown=clean_stored_text(payload.get("dify_markdown", "")),
+            dify_markdown=clean_dify_markdown_metadata(clean_stored_text(payload.get("dify_markdown", ""))),
             chunks=chunks,
             records=records,
             document_map=document_map,
@@ -1034,6 +1034,25 @@ def clean_stored_text(value: Any) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     return text.strip()
+
+
+def clean_dify_markdown_metadata(markdown: str) -> str:
+    cleaned_lines: list[str] = []
+    for line in str(markdown or "").splitlines():
+        section_marker = re.match(r"^(\s*\[section:\s*)(.*?)(\]\s*)$", line)
+        if section_marker:
+            section = clean_section_path(section_marker.group(2)) or "Untitled"
+            cleaned_lines.append(f"{section_marker.group(1)}{section}{section_marker.group(3)}")
+            continue
+
+        source_section = re.match(r"^(\s*source_section:\s*)(.*?)\s*$", line)
+        if source_section:
+            section = clean_section_path(source_section.group(2)) or "Untitled"
+            cleaned_lines.append(f"{source_section.group(1)}{section}")
+            continue
+
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
 
 
 def _rag_store_dir_candidates(store_dir: Path | None = None) -> list[Path]:
