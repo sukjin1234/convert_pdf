@@ -88,6 +88,18 @@ def main() -> int:
         default=0.0,
         help="Fail if average latency exceeds this many seconds. 0 disables this gate.",
     )
+    parser.add_argument(
+        "--max-p95-ttft",
+        type=float,
+        default=0.0,
+        help="Fail if p95 time-to-first-token exceeds this many seconds. 0 disables this gate.",
+    )
+    parser.add_argument(
+        "--max-avg-ttft",
+        type=float,
+        default=0.0,
+        help="Fail if average time-to-first-token exceeds this many seconds. 0 disables this gate.",
+    )
     parser.add_argument("--quiet", action="store_true", help="Print only the final send summary.")
     args = parser.parse_args()
 
@@ -203,12 +215,17 @@ def main() -> int:
     else:
         print_summary(summary, results, Path(args.out) if args.out else None)
 
-    failed_gate = bool(
-        (args.fail_under_success_rate > 0 and summary["success_rate"] < args.fail_under_success_rate)
-        or (args.max_p95_latency > 0 and summary["latency_p95_seconds"] > args.max_p95_latency)
-        or (args.max_avg_latency > 0 and summary["latency_avg_seconds"] > args.max_avg_latency)
+    failed_gates = evaluate_gates(
+        summary,
+        fail_under_success_rate=args.fail_under_success_rate,
+        max_p95_latency=args.max_p95_latency,
+        max_avg_latency=args.max_avg_latency,
+        max_p95_ttft=args.max_p95_ttft,
+        max_avg_ttft=args.max_avg_ttft,
     )
-    return 1 if failed_gate else 0
+    if failed_gates:
+        print_gate_failures(failed_gates)
+    return 1 if failed_gates else 0
 
 
 def send_chat_message(
@@ -446,10 +463,12 @@ def summarize_results(results: list[SendResult], elapsed_seconds: float) -> dict
         "elapsed_seconds": round(elapsed_seconds, 6),
         "throughput_requests_per_second": round(throughput, 6),
         "latency_avg_seconds": round(sum(latencies) / len(latencies), 6) if latencies else 0,
+        "latency_samples": len(latencies),
         "latency_p50_seconds": percentile(latencies, 50),
         "latency_p95_seconds": percentile(latencies, 95),
         "latency_max_seconds": max(latencies) if latencies else 0,
         "ttft_avg_seconds": round(sum(ttfts) / len(ttfts), 6) if ttfts else 0,
+        "ttft_samples": len(ttfts),
         "ttft_p50_seconds": percentile(ttfts, 50),
         "ttft_p95_seconds": percentile(ttfts, 95),
         "ttft_max_seconds": max(ttfts) if ttfts else 0,
@@ -475,6 +494,44 @@ def safe_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def evaluate_gates(
+    summary: dict[str, Any],
+    *,
+    fail_under_success_rate: float,
+    max_p95_latency: float,
+    max_avg_latency: float,
+    max_p95_ttft: float,
+    max_avg_ttft: float,
+) -> list[str]:
+    failures: list[str] = []
+    if fail_under_success_rate > 0 and summary["success_rate"] < fail_under_success_rate:
+        failures.append(f"success_rate {summary['success_rate']:.2%} < {fail_under_success_rate:.2%}")
+    if max_p95_latency > 0 and summary["latency_p95_seconds"] > max_p95_latency:
+        failures.append(f"latency_p95_seconds {summary['latency_p95_seconds']:.3f}s > {max_p95_latency:.3f}s")
+    if max_avg_latency > 0 and summary["latency_avg_seconds"] > max_avg_latency:
+        failures.append(f"latency_avg_seconds {summary['latency_avg_seconds']:.3f}s > {max_avg_latency:.3f}s")
+
+    ttft_samples = int(summary.get("ttft_samples") or 0)
+    if max_p95_ttft > 0:
+        if ttft_samples <= 0:
+            failures.append("ttft_p95_seconds unavailable: no TTFT samples were captured")
+        elif summary["ttft_p95_seconds"] > max_p95_ttft:
+            failures.append(f"ttft_p95_seconds {summary['ttft_p95_seconds']:.3f}s > {max_p95_ttft:.3f}s")
+    if max_avg_ttft > 0:
+        if ttft_samples <= 0:
+            failures.append("ttft_avg_seconds unavailable: no TTFT samples were captured")
+        elif summary["ttft_avg_seconds"] > max_avg_ttft:
+            failures.append(f"ttft_avg_seconds {summary['ttft_avg_seconds']:.3f}s > {max_avg_ttft:.3f}s")
+    return failures
+
+
+def print_gate_failures(failures: list[str]) -> None:
+    print("")
+    print("Dify performance gates failed")
+    for failure in failures:
+        print(f"- {failure}")
 
 
 def print_summary(summary: dict[str, Any], results: list[SendResult], out_path: Path | None) -> None:
