@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +56,26 @@ def main() -> int:
         "--reuse-conversation",
         action="store_true",
         help="Reuse one conversation_id per concurrency slot. Default sends each request as a new conversation.",
+    )
+    parser.add_argument("--out", default="", help="Optional path for a JSON performance report.")
+    parser.add_argument("--json", action="store_true", help="Print the JSON performance report.")
+    parser.add_argument(
+        "--fail-under-success-rate",
+        type=float,
+        default=1.0,
+        help="Fail if successful request ratio is below this value. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--max-p95-latency",
+        type=float,
+        default=0.0,
+        help="Fail if p95 latency exceeds this many seconds. 0 disables this gate.",
+    )
+    parser.add_argument(
+        "--max-avg-latency",
+        type=float,
+        default=0.0,
+        help="Fail if average latency exceeds this many seconds. 0 disables this gate.",
     )
     parser.add_argument("--quiet", action="store_true", help="Print only the final send summary.")
     args = parser.parse_args()
@@ -151,9 +171,33 @@ def main() -> int:
 
     elapsed = time.perf_counter() - started
     results.sort(key=lambda item: item.index)
-    print_summary(results, elapsed)
+    summary = summarize_results(results, elapsed)
+    report = {
+        "base_url_host": base_url.split("//")[-1].split("/")[0],
+        "question_file": str(Path(args.questions)),
+        "repeat": repeat,
+        "concurrency": concurrency,
+        "response_mode": args.response_mode,
+        "reuse_conversation": bool(args.reuse_conversation),
+        "summary": summary,
+        "results": [asdict(result) for result in results],
+    }
 
-    return 0 if all(result.ok for result in results) else 1
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print_summary(summary, results, Path(args.out) if args.out else None)
+
+    failed_gate = bool(
+        (args.fail_under_success_rate > 0 and summary["success_rate"] < args.fail_under_success_rate)
+        or (args.max_p95_latency > 0 and summary["latency_p95_seconds"] > args.max_p95_latency)
+        or (args.max_avg_latency > 0 and summary["latency_avg_seconds"] > args.max_avg_latency)
+    )
+    return 1 if failed_gate else 0
 
 
 def send_chat_message(
@@ -333,15 +377,52 @@ def questions_from_markdown(markdown: str) -> list[Question]:
     return questions
 
 
-def print_summary(results: list[SendResult], elapsed_seconds: float) -> None:
+def summarize_results(results: list[SendResult], elapsed_seconds: float) -> dict[str, Any]:
     success_count = sum(1 for result in results if result.ok)
     failed = [result for result in results if not result.ok]
     throughput = len(results) / elapsed_seconds if elapsed_seconds > 0 else 0
+    latencies = sorted(result.latency_seconds for result in results if result.ok)
+    return {
+        "total": len(results),
+        "success": success_count,
+        "failed": len(failed),
+        "success_rate": round(success_count / len(results), 4) if results else 0,
+        "elapsed_seconds": round(elapsed_seconds, 6),
+        "throughput_requests_per_second": round(throughput, 6),
+        "latency_avg_seconds": round(sum(latencies) / len(latencies), 6) if latencies else 0,
+        "latency_p50_seconds": percentile(latencies, 50),
+        "latency_p95_seconds": percentile(latencies, 95),
+        "latency_max_seconds": max(latencies) if latencies else 0,
+    }
+
+
+def percentile(values: list[float], percentile_value: int) -> float:
+    if not values:
+        return 0
+    if len(values) == 1:
+        return values[0]
+    rank = (len(values) - 1) * percentile_value / 100
+    lower = int(rank)
+    upper = min(lower + 1, len(values) - 1)
+    weight = rank - lower
+    return round(values[lower] * (1 - weight) + values[upper] * weight, 6)
+
+
+def print_summary(summary: dict[str, Any], results: list[SendResult], out_path: Path | None) -> None:
+    failed = [result for result in results if not result.ok]
     print("")
     print("Dify question send summary")
-    print(f"- total/success/failed: {len(results)}/{success_count}/{len(failed)}")
-    print(f"- elapsed: {elapsed_seconds:.3f}s")
-    print(f"- send throughput: {throughput:.3f} req/s")
+    print(f"- total/success/failed: {summary['total']}/{summary['success']}/{summary['failed']}")
+    print(f"- success rate: {summary['success_rate']:.2%}")
+    print(f"- elapsed: {summary['elapsed_seconds']:.3f}s")
+    print(f"- send throughput: {summary['throughput_requests_per_second']:.3f} req/s")
+    print(
+        f"- latency avg/p50/p95/max: {summary['latency_avg_seconds']:.3f}s/"
+        f"{summary['latency_p50_seconds']:.3f}s/{summary['latency_p95_seconds']:.3f}s/"
+        f"{summary['latency_max_seconds']:.3f}s"
+    )
+    if out_path:
+        print(f"- saved: {out_path}")
     if failed:
         print("- error samples:")
         for result in failed[:10]:
