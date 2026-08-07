@@ -972,7 +972,7 @@ def _load_rag_chunk(item: dict[str, Any]) -> RagChunk:
         file_name=clean_cell(item.get("file_name", "")),
         page_start=item.get("page_start") if isinstance(item.get("page_start"), int) else None,
         page_end=item.get("page_end") if isinstance(item.get("page_end"), int) else None,
-        section_path=clean_cell(item.get("section_path", "")),
+        section_path=clean_section_path(item.get("section_path", "")),
         title=clean_cell(item.get("title", "")),
         text=clean_stored_text(item.get("text", "")),
         metadata_text=clean_stored_text(item.get("metadata_text", "")),
@@ -990,7 +990,7 @@ def _load_structured_record(item: dict[str, Any]) -> StructuredRecord:
         file_name=clean_cell(item.get("file_name", "")),
         chunk_id=clean_cell(item.get("chunk_id", "")),
         page=item.get("page") if isinstance(item.get("page"), int) else None,
-        section_path=clean_cell(item.get("section_path", "")),
+        section_path=clean_section_path(item.get("section_path", "")),
         fields=clean_fields_dict(item.get("fields", {})),
         source_text=clean_stored_text(item.get("source_text", "")),
         answer_text=clean_cell(item.get("answer_text", "")),
@@ -1000,7 +1000,7 @@ def _load_structured_record(item: dict[str, Any]) -> StructuredRecord:
 
 def _load_document_map_item(item: dict[str, Any]) -> DocumentMapItem:
     return DocumentMapItem(
-        section_path=clean_cell(item.get("section_path", "")),
+        section_path=clean_section_path(item.get("section_path", "")),
         page_start=item.get("page_start") if isinstance(item.get("page_start"), int) else None,
         page_end=item.get("page_end") if isinstance(item.get("page_end"), int) else None,
         keywords=clean_text_list(item.get("keywords", [])),
@@ -1541,7 +1541,22 @@ def resolve_block_section_path(current_section: str, text: str, *, page: int | N
 def clean_section_path(value: str) -> str:
     parts = [clean_cell(part) for part in str(value or "").split(">")]
     parts = [part for part in parts if part and not re.fullmatch(r"(?:>|\\s)+", part)]
+    parts = repair_outline_section_parts(parts)
     return " > ".join(parts)
+
+
+def repair_outline_section_parts(parts: list[str]) -> list[str]:
+    repaired: list[str] = []
+    depths: list[int | None] = []
+    for part in parts:
+        depth = heading_outline_depth(part)
+        if depth is not None:
+            while repaired and depths[-1] is not None and depths[-1] >= depth:
+                repaired.pop()
+                depths.pop()
+        repaired.append(part)
+        depths.append(depth)
+    return repaired
 
 
 def should_skip_section_block(text: str, section_path: str) -> bool:

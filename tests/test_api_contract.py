@@ -208,11 +208,12 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
             payload = artifact.to_dict()
             payload["markdown"] = "# Manual\x00\n\n| Item | Value |"
             payload["dify_markdown"] = payload["dify_markdown"].replace("SLA", "S\x00LA")
-            payload["chunks"][0]["section_path"] = "Manual\x00 > Table"
+            payload["chunks"][0]["section_path"] = "Guide\x00 > 2. 정원외 전형 모집인원 > Ⅱ. 전형일정"
             payload["chunks"][0]["text"] = payload["chunks"][0]["text"].replace("SLA", "S\x00LA")
+            payload["records"][0]["section_path"] = "Guide\x00 > 2. 정원외 전형 모집인원 > Ⅱ. 전형일정"
             payload["records"][0]["fields"] = {"I\x00tem": "S\x00LA", "Value": "99.9\x00%"}
             payload["records"][0]["answer_text"] = "S\x00LA의 Value은/는 99.9\x00%입니다."
-            payload["document_map"][0]["section_path"] = "Manual\x00 > Table"
+            payload["document_map"][0]["section_path"] = "Guide\x00 > 2. 정원외 전형 모집인원 > Ⅱ. 전형일정"
 
             stored_path = store_dir / "doc_legacy_control.json"
             stored_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -233,6 +234,8 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             self.assertNotIn("\x00", joined)
+            self.assertEqual(chunks[0].section_path, "Guide > Ⅱ. 전형일정")
+            self.assertEqual(records[0].section_path, "Guide > Ⅱ. 전형일정")
             self.assertEqual(records[0].fields["Item"], "SLA")
             self.assertNotIn("\\u0000", stored_path.read_text(encoding="utf-8"))
 
