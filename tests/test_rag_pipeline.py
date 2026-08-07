@@ -358,6 +358,60 @@ class RagPipelineTest(unittest.TestCase):
         self.assertGreaterEqual(len(result["matches"]), 1)
         self.assertIn("99.9%", result["context"])
 
+    def test_scalar_lookup_does_not_join_entity_and_attribute_from_different_rows(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# Service Metrics
+
+| Service | Metric | Value |
+| --- | --- | --- |
+| Billing API | Availability | 99.9% |
+| Search API | Owner | Platform |
+""",
+            "metrics.md",
+            document_id="doc_metric_gap",
+        )
+
+        result = lookup_matches(
+            query="Search API Availability 얼마야?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+
+        self.assertEqual(result["direct_answer"], "")
+        self.assertEqual(result["matches"], [])
+        self.assertFalse(result["diagnostics"]["answerability"]["answerable"])
+        self.assertEqual(result["diagnostics"]["answerability"]["reason"], "no single structured row supports the required query terms")
+
+    def test_scalar_lookup_accepts_entity_and_attribute_in_same_wide_row(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# Service Metrics
+
+| Service | Availability | Owner |
+| --- | --- | --- |
+| Search API | 99.5% | Platform |
+| Billing API | 99.9% | FinOps |
+""",
+            "metrics.md",
+            document_id="doc_metric_wide",
+        )
+
+        result = lookup_matches(
+            query="Search API Availability 얼마야?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+
+        self.assertEqual(result["direct_answer"], "Availability: 99.5%")
+        self.assertNotIn("99.9%", result["direct_answer"])
+
     def test_contact_owner_table_lookup(self):
         artifact = build_rag_artifact(
             """

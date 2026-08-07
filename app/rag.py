@@ -63,6 +63,13 @@ STRUCTURED_LOOKUP_TYPES = {
     "contact_lookup",
     "dependency_lookup",
 }
+ROW_SCOPED_QUERY_TYPES = {
+    "number_lookup",
+    "date_lookup",
+    "contact_lookup",
+    "troubleshooting",
+    "dependency_lookup",
+}
 
 CONTEXT_CHAR_BUDGET = 12_000
 MATCH_EVIDENCE_CHAR_LIMIT = 1_800
@@ -3974,6 +3981,7 @@ def assess_answerability(
     missing_required_terms = missing_required_query_terms(query, entities, evidence_text)
     average_coverage = sum(float(match.get("coverage") or 0) for match in matches) / len(matches)
     top_score = max(float(match.get("score") or 0) for match in matches)
+    row_scope_supported, row_scope_terms = structured_row_scope_support(query, query_type, entities, matches)
 
     if missing_strict_concepts:
         return {
@@ -4012,6 +4020,20 @@ def assess_answerability(
             "reason": "evidence is missing a required query entity",
         }
 
+    if not row_scope_supported:
+        return {
+            "answerable": False,
+            "confidence": 0.3,
+            "query_concepts": sorted(query_concepts),
+            "evidence_concepts": sorted(evidence_concepts),
+            "query_attributes": sorted(query_attributes),
+            "evidence_attributes": sorted(evidence_attributes),
+            "missing_strict_concepts": missing_strict_concepts,
+            "missing_strict_attributes": missing_strict_attributes,
+            "row_scope_terms": row_scope_terms,
+            "reason": "no single structured row supports the required query terms",
+        }
+
     weak_signal = average_coverage < 0.12 and top_score < 6.0 and query_type in STRUCTURED_LOOKUP_TYPES
     if weak_signal:
         return {
@@ -4034,6 +4056,51 @@ def assess_answerability(
         "missing_strict_attributes": [],
         "reason": "evidence passed answerability checks",
     }
+
+
+def structured_row_scope_support(
+    query: str,
+    query_type: str,
+    entities: list[str],
+    matches: list[dict[str, Any]],
+) -> tuple[bool, list[str]]:
+    if query_type not in ROW_SCOPED_QUERY_TYPES:
+        return True, []
+
+    structured = [
+        match
+        for match in matches
+        if match.get("match_type") == "structured_record" and isinstance(match.get("fields"), dict)
+    ]
+    if not structured:
+        return True, []
+
+    row_texts = [structured_match_row_text(match) for match in structured]
+    terms = salient_query_terms_for_answerability(query, entities)
+    if not terms:
+        return True, []
+    if any(all(row_text_supports_term(term, row_text) for term in terms) for row_text in row_texts):
+        return True, terms
+    return False, terms
+
+
+def structured_match_row_text(match: dict[str, Any]) -> str:
+    fields = match.get("fields") or {}
+    parts = []
+    for key, value in fields.items():
+        if key in MARKER_METADATA_FIELDS:
+            continue
+        parts.append(str(key))
+        parts.append(str(value))
+    return " ".join(parts)
+
+
+def row_text_supports_term(term: str, row_text: str) -> bool:
+    if term_in_text(term, row_text):
+        return True
+    row_norm = normalize_for_match(row_text)
+    tokens = [token for token in normalize_for_match(term).split() if len(token) >= 2]
+    return len(tokens) >= 2 and all(token in row_norm for token in tokens)
 
 
 def detect_concepts(text: str) -> set[str]:
