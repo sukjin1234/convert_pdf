@@ -9,6 +9,7 @@ import tempfile
 import threading
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -74,6 +75,7 @@ ROW_SCOPED_QUERY_TYPES = {
 CONTEXT_CHAR_BUDGET = 12_000
 MATCH_EVIDENCE_CHAR_LIMIT = 1_800
 SUPPORTING_CONTEXT_CHAR_LIMIT = 1_400
+NORMALIZE_CACHE_CHAR_LIMIT = 2_048
 
 NUMBER_RECORD_TYPES = {"quantity", "quota", "money", "metric", "table_row", "key_value"}
 TABLE_RECORD_TYPES = {
@@ -3085,14 +3087,16 @@ def source_has_version_context(text: str) -> bool:
 
 def meaningful_answer_terms(terms: list[str]) -> list[str]:
     result = []
+    stopword_norms = normalized_stopwords()
+    generic_list_term_norms = normalized_generic_list_terms()
     for term in unique_keep_order(terms):
         cleaned = strip_query_particle(clean_cell(term))
         norm = normalize_for_match(cleaned)
         if len(norm) < 2:
             continue
-        if norm in {normalize_for_match(item) for item in STOPWORDS}:
+        if norm in stopword_norms:
             continue
-        if norm in {normalize_for_match(item) for item in GENERIC_LIST_TERMS}:
+        if norm in generic_list_term_norms:
             continue
         result.append(cleaned)
     return result
@@ -4145,15 +4149,17 @@ def missing_required_query_terms(query: str, entities: list[str], evidence_text:
 def salient_query_terms_for_answerability(query: str, entities: list[str]) -> list[str]:
     raw_terms = [*entities, *extract_keywords(query, limit=12)]
     terms = []
+    stopword_norms = normalized_stopwords()
+    generic_list_term_norms = normalized_generic_list_terms()
     for raw_term in raw_terms:
         term = strip_query_particle(clean_cell(raw_term))
         norm = normalize_for_match(term)
         compact = norm.replace(" ", "")
         if len(compact) < 2:
             continue
-        if norm in {normalize_for_match(item) for item in STOPWORDS}:
+        if norm in stopword_norms:
             continue
-        if norm in {normalize_for_match(item) for item in GENERIC_LIST_TERMS}:
+        if norm in generic_list_term_norms:
             continue
         if is_attribute_only_query_term(term):
             continue
@@ -5376,9 +5382,30 @@ def strip_query_particle(value: str) -> str:
 
 
 def normalize_for_match(value: str) -> str:
-    value = clean_cell(value).lower()
-    value = re.sub(r"[^0-9a-z가-힣._/-]+", " ", value)
+    cleaned = clean_cell(value).lower()
+    if len(cleaned) <= NORMALIZE_CACHE_CHAR_LIMIT:
+        return _normalize_for_match_cached(cleaned)
+    return _normalize_for_match_uncached(cleaned)
+
+
+@lru_cache(maxsize=20_000)
+def _normalize_for_match_cached(cleaned_lower_value: str) -> str:
+    return _normalize_for_match_uncached(cleaned_lower_value)
+
+
+def _normalize_for_match_uncached(cleaned_lower_value: str) -> str:
+    value = re.sub(r"[^0-9a-z가-힣._/-]+", " ", cleaned_lower_value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+@lru_cache(maxsize=1)
+def normalized_stopwords() -> frozenset[str]:
+    return frozenset(normalize_for_match(item) for item in STOPWORDS)
+
+
+@lru_cache(maxsize=1)
+def normalized_generic_list_terms() -> frozenset[str]:
+    return frozenset(normalize_for_match(item) for item in GENERIC_LIST_TERMS)
 
 
 def short_hash(value: str, length: int = 12) -> str:
