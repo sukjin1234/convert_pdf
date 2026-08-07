@@ -133,6 +133,41 @@ class MarkdownRendererTest(unittest.TestCase):
         self.assertIn("| 글로컬캠퍼스 | - 메카트로닉스공학과<br>- 컴퓨터공학과 |", markdown)
         self.assertIn("| 세종캠퍼스 | - 컴퓨터융합소프트웨어학과<br>- 신소재화학과 |", markdown)
 
+    def test_single_column_page_uses_visual_reading_order(self):
+        doc = {
+            "kids": [
+                {"type": "paragraph", "page number": 1, "bounding box": [72, 610, 520, 635], "content": "Second paragraph."},
+                {"type": "heading", "heading level": 2, "page number": 1, "bounding box": [70, 720, 520, 750], "content": "Deployment Rules"},
+                {"type": "paragraph", "page number": 1, "bounding box": [72, 670, 520, 700], "content": "First paragraph."},
+            ]
+        }
+
+        markdown = render_document_pages_to_markdown(doc)
+
+        self.assertLess(markdown.index("## Deployment Rules"), markdown.index("First paragraph."))
+        self.assertLess(markdown.index("First paragraph."), markdown.index("Second paragraph."))
+
+    def test_renders_flat_table_cells_with_row_and_column_numbers(self):
+        doc = {
+            "kids": [
+                {
+                    "type": "table",
+                    "page number": 1,
+                    "cells": [
+                        {"type": "table cell", "row number": 2, "column number": 2, "content": "99.9%"},
+                        {"type": "table cell", "row number": 1, "column number": 1, "content": "Service"},
+                        {"type": "table cell", "row number": 1, "column number": 2, "content": "Availability"},
+                        {"type": "table cell", "row number": 2, "column number": 1, "content": "Billing API"},
+                    ],
+                }
+            ]
+        }
+
+        markdown = render_document_pages_to_markdown(doc)
+
+        self.assertIn("| Service | Availability |", markdown)
+        self.assertIn("| Billing API | 99.9% |", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

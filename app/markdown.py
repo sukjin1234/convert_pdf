@@ -121,11 +121,7 @@ def _render_list_item(element: dict[str, Any], list_depth: int) -> str:
 
 
 def _render_table(element: dict[str, Any]) -> str:
-    rows = element.get("rows") or []
-    if not isinstance(rows, list):
-        return ""
-
-    matrix = [_table_row_to_cells(row) for row in rows if isinstance(row, dict)]
+    matrix = _table_matrix(element)
     matrix = [row for row in matrix if any(cell.strip() for cell in row)]
     if not matrix:
         return ""
@@ -146,6 +142,51 @@ def _render_table(element: dict[str, Any]) -> str:
     for row in body:
         lines.append("| " + " | ".join(_escape_table_cell(cell) for cell in row) + " |")
     return "\n".join(lines)
+
+
+def _table_matrix(element: dict[str, Any]) -> list[list[str]]:
+    rows = _table_row_elements(element)
+    if rows:
+        return [_table_row_to_cells(row) for row in rows]
+
+    cells = _table_cell_elements(element)
+    if cells:
+        return _flat_table_cells_to_matrix(cells)
+
+    return []
+
+
+def _table_row_elements(element: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = element.get("rows") or []
+    if isinstance(rows, list):
+        row_items = [row for row in rows if isinstance(row, dict)]
+        if row_items:
+            return row_items
+
+    children = _children(element)
+    row_items = [
+        child
+        for child in children
+        if _element_type(child) in {"table row", "row", "tr"} or isinstance(child.get("cells"), list)
+    ]
+    return row_items
+
+
+def _table_cell_elements(element: dict[str, Any]) -> list[dict[str, Any]]:
+    cells = element.get("cells") or []
+    if isinstance(cells, list):
+        cell_items = [cell for cell in cells if isinstance(cell, dict)]
+        if cell_items:
+            return cell_items
+
+    children = _children(element)
+    return [
+        child
+        for child in children
+        if _element_type(child) in {"table cell", "cell", "td", "th"}
+        or "row number" in child
+        or "column number" in child
+    ]
 
 
 def _table_row_to_cells(row: dict[str, Any]) -> list[str]:
@@ -170,6 +211,46 @@ def _table_row_to_cells(row: dict[str, Any]) -> list[str]:
     return rendered
 
 
+def _flat_table_cells_to_matrix(cells: list[dict[str, Any]]) -> list[list[str]]:
+    numbered = [
+        cell
+        for cell in cells
+        if _safe_int(cell.get("row number"), 0) > 0 or _safe_int(cell.get("column number"), 0) > 0
+    ]
+    if numbered:
+        rows_by_number: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for cell in numbered:
+            rows_by_number[max(_safe_int(cell.get("row number"), 1), 1)].append(cell)
+        return [
+            _table_row_to_cells({"cells": row_cells})
+            for _, row_cells in sorted(rows_by_number.items(), key=lambda item: item[0])
+        ]
+
+    positioned = [(cell, _bounding_box(cell)) for cell in cells]
+    positioned = [(cell, bbox) for cell, bbox in positioned if bbox]
+    if not positioned:
+        return [[_render_table_cell(cell)] for cell in cells]
+
+    median_height = _median([max(bbox[3] - bbox[1], 1.0) for _, bbox in positioned], default=12.0)
+    row_tolerance = max(6.0, median_height * 0.75)
+    row_groups: list[list[tuple[dict[str, Any], list[float]]]] = []
+    for cell, bbox in sorted(positioned, key=lambda item: -_bbox_center_y(item[1])):
+        center_y = _bbox_center_y(bbox)
+        for row in row_groups:
+            row_center = sum(_bbox_center_y(item_bbox) for _, item_bbox in row) / len(row)
+            if abs(row_center - center_y) <= row_tolerance:
+                row.append((cell, bbox))
+                break
+        else:
+            row_groups.append([(cell, bbox)])
+
+    matrix = []
+    for row in row_groups:
+        sorted_row = sorted(row, key=lambda item: item[1][0])
+        matrix.append([_render_table_cell(cell) for cell, _ in sorted_row])
+    return matrix
+
+
 def _render_table_cell(cell: dict[str, Any]) -> str:
     content = _clean_text(cell.get("content", ""))
     child_parts = []
@@ -190,6 +271,7 @@ def _render_image(element: dict[str, Any]) -> str:
 def _render_page(elements: list[dict[str, Any]]) -> str:
     has_visual_only_content = any(_element_has_image(element) and not _element_has_text(element) for element in elements)
     elements = [element for element in elements if _is_page_content_element(element)]
+    elements = _sort_single_column_page_elements(elements)
 
     timeline = _render_timeline_page(elements)
     if timeline:
@@ -218,6 +300,38 @@ def _render_page(elements: list[dict[str, Any]]) -> str:
     if has_visual_only_content and len(_content_fingerprint("\n".join(blocks))) < 40:
         blocks.append("> \uc774\ubbf8\uc9c0/\ub3c4\uc2dd \uc911\uc2ec \ud398\uc774\uc9c0\ub85c, PDF \ud14d\uc2a4\ud2b8 \ub808\uc774\uc5b4\uc5d0\uc11c \ud655\uc778\ub418\ub294 \ubb38\uad6c\ub9cc \ud3ec\ud568\ud588\uc2b5\ub2c8\ub2e4.")
     return "\n\n".join(blocks)
+
+
+def _sort_single_column_page_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    positioned = [(index, element, _bounding_box(element)) for index, element in enumerate(elements)]
+    positioned = [(index, element, bbox) for index, element, bbox in positioned if bbox]
+    if len(positioned) < 2:
+        return elements
+    if not _looks_like_single_column(positioned):
+        return elements
+
+    element_ids = {id(element) for _, element, _ in positioned}
+    sorted_positioned = sorted(positioned, key=lambda item: (-item[2][3], item[2][0], item[0]))
+    remaining_sorted = iter(sorted_positioned)
+    reordered = []
+    for element in elements:
+        if id(element) not in element_ids:
+            reordered.append(element)
+            continue
+        reordered.append(next(remaining_sorted)[1])
+    return reordered
+
+
+def _looks_like_single_column(positioned: list[tuple[int, dict[str, Any], list[float]]]) -> bool:
+    left_edges = [bbox[0] for _, _, bbox in positioned]
+    centers = [(bbox[0] + bbox[2]) / 2 for _, _, bbox in positioned]
+    page_width = max(bbox[2] for _, _, bbox in positioned) - min(bbox[0] for _, _, bbox in positioned)
+    if page_width <= 0:
+        return False
+    return (
+        max(left_edges) - min(left_edges) <= max(100.0, page_width * 0.22)
+        or max(centers) - min(centers) <= max(120.0, page_width * 0.28)
+    )
 
 
 def _is_page_content_element(element: dict[str, Any]) -> bool:
@@ -485,6 +599,10 @@ def _item_height(item: dict[str, Any]) -> float:
     return max(item["y1"] - item["y0"], 1.0)
 
 
+def _bbox_center_y(bbox: list[float]) -> float:
+    return (bbox[1] + bbox[3]) / 2
+
+
 def _render_timeline_page(elements: list[dict[str, Any]]) -> str:
     items = _text_items(elements)
     years = [item for item in items if _is_year(item["text"])]
@@ -723,6 +841,16 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _median(values: list[float], *, default: float) -> float:
+    if not values:
+        return default
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
 
 
 def _clean_text(value: Any) -> str:
