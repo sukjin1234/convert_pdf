@@ -1586,6 +1586,17 @@ Chatflow App API:
 5. 일부 chunk에 목차/빈 섹션/섹션 경로 ">"가 남아 있어 재적재 전 정규화 상태를 다시 확인해야 한다.
 ```
 
+2026-08-07 재점검 판단:
+
+```text
+1. App API 키는 /info, /parameters, /meta 조회와 /chat-messages 실행에는 유효하다.
+2. 같은 App API 키로 /console/api/apps, /console/api/apps/{app_id}, /console/api/apps/{app_id}/workflows/draft를 GET 조회하면 모두 401 Invalid token이다.
+3. 따라서 현재 제공된 App API Key와 Knowledge API Key만으로는 Dify 캔버스 노드 구조를 직접 수정할 수 없다.
+4. document_id 입력을 보낸 진단에서도 workflow_started.inputs에 document_id가 없고 Query Plan document_id가 null이다.
+5. 배포 Chatflow 품질 평가는 12개 중 5개 통과, 7개 실패다. 주요 실패는 document_id 필터 누락, 2026/2027 문서 혼합, 일부 소프트웨어 문서 출처 불일치다.
+6. 코드 커밋 15b320d는 중복 적재된 최신 학년도 문서가 여러 document_id로 잡혀도 최신 학년도 후보만 direct answer에 쓰도록 보정했다. 이 효과는 배포 서버 FastAPI에 최신 코드를 반영해야 Chatflow에서 나타난다.
+```
+
 필수 수정:
 
 ```text
@@ -1694,15 +1705,44 @@ Build Eval Log Body:
 배포된 Dify App API만 사용해서 속도, 출처, 연도/문서 혼합을 확인한다. 로컬 FastAPI를 띄우지 않는다.
 
 ```powershell
+python -X utf8 scripts\dify_app_api_diagnostics.py --document-id c7b1cb1b-91a3-4a6e-a64b-a90837445f3f --out .runtime\dify_app_api_diagnostics_doc2027_latest.json
 python -X utf8 scripts\eval_dify_chat_api.py --timeout 300
 python -X utf8 scripts\eval_dify_chat_api.py --suite mixed --timeout 300
 python -X utf8 scripts\eval_dify_chat_api.py --suite all --timeout 300
+```
+
+`dify_app_api_diagnostics.py`는 다음 값을 반드시 확인한다.
+
+```text
+workflow_edit_available: false이면 API 키만으로 노드 편집 불가
+document_id_in_workflow_inputs: true여야 특정 문서 모드 정상
+query_plan_document_id: App API inputs.document_id와 같아야 정상
+structured_direct_answer: document_id 모드에서는 지정 문서 값만 포함되어야 정상
+verify_valid: true여도 structured_direct_answer가 문서를 섞으면 운영 불합격
 ```
 
 결과 파일:
 
 ```text
 .runtime/dify_chat_api_eval_latest.json
+.runtime/dify_app_api_diagnostics_doc2027_latest.json
+```
+
+2026-08-07 재점검 결과:
+
+```text
+Dify App API diagnostics:
+- workflow_edit_available: False
+- document_id_in_workflow_inputs: False
+- query_plan_document_id: None
+- console draft workflow probe: 401 Invalid token
+- doc2027 입력 진단 elapsed: 22.499s, events=186
+- structured_direct_answer가 2027 모집요강과 document.pdf 값을 함께 포함함
+
+Chatflow quality suite all:
+- total/passed/failed: 12/5/7
+- pass_rate: 41.67%
+- avg/max latency: 16.496s / 25.724s
 ```
 
 2026-07-29 재점검 결과:
