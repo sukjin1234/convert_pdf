@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,13 +24,33 @@ from scripts.eval_rag_quality import (
 )
 
 
+@dataclass
+class TimedCaseResult:
+    index: int
+    result: CaseResult
+    latency_seconds: float
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self.result.to_dict()
+        payload["index"] = self.index
+        payload["latency_seconds"] = self.latency_seconds
+        payload["error"] = self.error
+        return payload
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate RAG quality through the running FastAPI HTTP API.")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--cases", default=str(ROOT / "evaluation" / "rag_quality_cases.json"))
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--fail-under", type=float, default=0.95)
+    parser.add_argument("--repeat", type=int, default=1, help="Repeat the case set N times for latency/concurrency smoke tests.")
+    parser.add_argument("--concurrency", type=int, default=1, help="Concurrent HTTP evaluation workers.")
+    parser.add_argument("--max-p95-latency", type=float, default=0.0, help="Fail if p95 case latency exceeds this many seconds. 0 disables.")
+    parser.add_argument("--max-avg-latency", type=float, default=0.0, help="Fail if average case latency exceeds this many seconds. 0 disables.")
     parser.add_argument("--skip-ingest", action="store_true", help="Do not push evaluation markdown documents first.")
+    parser.add_argument("--out", default="", help="Optional path for a JSON report.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--quiet", action="store_true", help="Only print summary unless failing.")
     args = parser.parse_args()
@@ -54,25 +77,164 @@ def main() -> int:
             if not response.get("success"):
                 raise RuntimeError(f"Failed to ingest {document['document_id']}: {response.get('error')}")
 
-    results = [
-        evaluate_case_http(case, base_url=base_url, limit=args.limit)
-        for case in payload.get("cases", [])
-    ]
+    tasks = build_case_tasks(payload.get("cases", []), repeat=args.repeat)
+    timed_results = evaluate_cases_http_concurrently(
+        tasks,
+        base_url=base_url,
+        limit=args.limit,
+        concurrency=args.concurrency,
+    )
+    results = [item.result for item in timed_results]
     summary = summarize(results)
+    latency_summary = summarize_latency(timed_results)
+    latency_gate_failures = evaluate_latency_gates(
+        latency_summary,
+        max_p95_latency=args.max_p95_latency,
+        max_avg_latency=args.max_avg_latency,
+    )
 
     output = {
         "base_url": base_url,
         "cases_path": str(cases_path),
+        "repeat": max(1, args.repeat),
+        "concurrency": max(1, args.concurrency),
         "summary": summary,
-        "results": [result.to_dict() for result in results],
+        "latency": latency_summary,
+        "gate_failures": latency_gate_failures,
+        "results": [result.to_dict() for result in timed_results],
     }
+
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if args.json:
         print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
         print_human_report(results, summary, quiet=args.quiet)
+        print_latency_report(latency_summary, latency_gate_failures, Path(args.out) if args.out else None)
 
-    return 0 if summary["pass_rate"] >= args.fail_under else 1
+    return 0 if summary["pass_rate"] >= args.fail_under and not latency_gate_failures else 1
+
+
+def build_case_tasks(cases: list[dict[str, Any]], *, repeat: int) -> list[tuple[int, dict[str, Any]]]:
+    tasks = []
+    repeat = max(1, repeat)
+    for iteration in range(1, repeat + 1):
+        for case in cases:
+            case_copy = dict(case)
+            case_copy["_iteration"] = iteration
+            tasks.append((len(tasks) + 1, case_copy))
+    return tasks
+
+
+def evaluate_cases_http_concurrently(
+    tasks: list[tuple[int, dict[str, Any]]],
+    *,
+    base_url: str,
+    limit: int,
+    concurrency: int,
+) -> list[TimedCaseResult]:
+    if not tasks:
+        return []
+    results: list[TimedCaseResult] = []
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+        futures = [
+            executor.submit(evaluate_case_http_timed, index, case, base_url=base_url, limit=limit)
+            for index, case in tasks
+        ]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return sorted(results, key=lambda item: item.index)
+
+
+def evaluate_case_http_timed(index: int, case: dict[str, Any], *, base_url: str, limit: int) -> TimedCaseResult:
+    started = time.perf_counter()
+    try:
+        result = evaluate_case_http(case, base_url=base_url, limit=limit)
+        return TimedCaseResult(index=index, result=result, latency_seconds=round(time.perf_counter() - started, 6))
+    except Exception as exc:  # noqa: BLE001 - report per-case HTTP failures in the JSON output.
+        latency = round(time.perf_counter() - started, 6)
+        error = f"{type(exc).__name__}: {exc}"
+        return TimedCaseResult(index=index, result=failed_case_result(case, error), latency_seconds=latency, error=error)
+
+
+def failed_case_result(case: dict[str, Any], error: str) -> CaseResult:
+    return CaseResult(
+        case_id=str(case.get("id") or f"case-{case.get('_iteration', 1)}"),
+        document_id=str(case.get("document_id") or ""),
+        question=str(case.get("question") or ""),
+        answerable=bool(case.get("answerable", True)),
+        passed=False,
+        query_type="",
+        expected_query_type=str(case.get("expected_query_type") or ""),
+        query_type_match=None,
+        evidence_recall=False,
+        exact_value_match=False,
+        answerable_detection=False,
+        unsupported_guard=None,
+        top_score=0,
+        selected_count=0,
+        missing_terms=[],
+        missing_values=[],
+        notes=[error],
+    )
+
+
+def summarize_latency(results: list[TimedCaseResult]) -> dict[str, Any]:
+    latencies = sorted(result.latency_seconds for result in results)
+    successes = [result for result in results if result.result.passed and not result.error]
+    return {
+        "samples": len(latencies),
+        "successes": len(successes),
+        "avg_seconds": round(sum(latencies) / len(latencies), 6) if latencies else 0,
+        "p50_seconds": percentile(latencies, 50),
+        "p95_seconds": percentile(latencies, 95),
+        "max_seconds": max(latencies) if latencies else 0,
+    }
+
+
+def percentile(values: list[float], percentile_value: int) -> float:
+    if not values:
+        return 0
+    if len(values) == 1:
+        return values[0]
+    rank = (len(values) - 1) * percentile_value / 100
+    lower = int(rank)
+    upper = min(lower + 1, len(values) - 1)
+    weight = rank - lower
+    return round(values[lower] * (1 - weight) + values[upper] * weight, 6)
+
+
+def evaluate_latency_gates(
+    latency_summary: dict[str, Any],
+    *,
+    max_p95_latency: float,
+    max_avg_latency: float,
+) -> list[str]:
+    failures = []
+    if max_p95_latency > 0 and latency_summary["p95_seconds"] > max_p95_latency:
+        failures.append(f"p95_seconds {latency_summary['p95_seconds']:.3f}s > {max_p95_latency:.3f}s")
+    if max_avg_latency > 0 and latency_summary["avg_seconds"] > max_avg_latency:
+        failures.append(f"avg_seconds {latency_summary['avg_seconds']:.3f}s > {max_avg_latency:.3f}s")
+    return failures
+
+
+def print_latency_report(summary: dict[str, Any], failures: list[str], out_path: Path | None) -> None:
+    print()
+    print("HTTP latency")
+    print(
+        f"samples={summary['samples']} avg={summary['avg_seconds']:.3f}s "
+        f"p50={summary['p50_seconds']:.3f}s p95={summary['p95_seconds']:.3f}s "
+        f"max={summary['max_seconds']:.3f}s"
+    )
+    if failures:
+        print("latency gate failures:")
+        for failure in failures:
+            print(f"  - {failure}")
+    if out_path:
+        print(f"saved={out_path}")
 
 
 def evaluate_case_http(case: dict[str, Any], *, base_url: str, limit: int) -> CaseResult:
