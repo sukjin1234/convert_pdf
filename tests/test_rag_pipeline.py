@@ -1220,6 +1220,84 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertNotIn("2026. 2. 3.(화)", result["direct_answer"])
         self.assertIn("2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지", result["direct_answer"])
 
+    def test_explicit_academic_year_query_filters_matching_source_document(self):
+        older = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 2026학년도 전형일정
+
+| 구분 | 항목 | 수시1차 |
+| --- | --- | --- |
+| 접수 | 원서접수 | 2025. 9. 8.(월) 09:00 ~ 9. 30.(화) 21:00까지 |
+""",
+            "2026_admission.pdf",
+            document_id="doc_schedule_2026",
+        )
+        current = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 2027학년도 전형일정
+
+| 구분 | 항목 | 수시1차 |
+| --- | --- | --- |
+| 접수 | 원서접수 | 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지 |
+""",
+            "2027_admission.pdf",
+            document_id="doc_schedule_2027",
+        )
+
+        result = lookup_matches(
+            query="2026학년도 수시1차 원서접수 기간 알려줘",
+            records=[*older.records, *current.records],
+            chunks=[*older.chunks, *current.chunks],
+            limit=8,
+        )
+
+        self.assertIn("2025. 9. 8.(월)", result["direct_answer"])
+        self.assertNotIn("2026. 9. 7.(월)", result["direct_answer"])
+        self.assertEqual(result["diagnostics"]["source_version_filter"]["document_ids"], ["doc_schedule_2026"])
+
+    def test_date_year_query_does_not_filter_by_academic_year_source(self):
+        older = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 2026학년도 전형일정
+
+| 구분 | 항목 | 수시1차 |
+| --- | --- | --- |
+| 접수 | 원서접수 | 2025. 9. 8.(월) 09:00 ~ 9. 30.(화) 21:00까지 |
+""",
+            "2026_admission.pdf",
+            document_id="doc_schedule_2026",
+        )
+        current = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 2027학년도 전형일정
+
+| 구분 | 항목 | 수시1차 |
+| --- | --- | --- |
+| 접수 | 원서접수 | 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지 |
+""",
+            "2027_admission.pdf",
+            document_id="doc_schedule_2027",
+        )
+
+        result = lookup_matches(
+            query="2026년 9월 수시1차 원서접수 기간 알려줘",
+            records=[*older.records, *current.records],
+            chunks=[*older.chunks, *current.chunks],
+            limit=8,
+        )
+
+        self.assertEqual(result["diagnostics"]["source_version_filter"]["ranks"], [])
+        self.assertIn("2026. 9. 7.(월)", result["direct_answer"])
+        self.assertNotIn("2025. 9. 8.(월)", result["direct_answer"])
+
     def test_schedule_lookup_handles_duplicate_latest_academic_year_groups(self):
         older = build_rag_artifact(
             """

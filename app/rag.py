@@ -2680,6 +2680,11 @@ def lookup_matches(
     plan = plan_query(query)
     active_entities = unique_keep_order([*(entities or []), *plan["entities"]])
     active_query_type = query_type or plan["query_type"]
+    source_filter = source_version_filter_for_query(query, records, chunks)
+    if source_filter["document_ids"]:
+        active_document_ids = set(source_filter["document_ids"])
+        records = [record for record in records if record.document_id in active_document_ids]
+        chunks = [chunk for chunk in chunks if chunk.document_id in active_document_ids]
     terms = normalize_terms([query, *active_entities])
     chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
     chunk_order = {chunk.chunk_id: index for index, chunk in enumerate(chunks)}
@@ -2789,8 +2794,9 @@ def lookup_matches(
             "top_score": ranked[0]["score"] if ranked else 0,
             "average_coverage": round(sum(match["coverage"] for match in combined) / len(combined), 3) if combined else 0,
             "answerability": answerability,
+            "source_version_filter": source_filter,
         },
-}
+    }
 
 
 def merge_match_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3189,6 +3195,90 @@ def latest_versioned_source_group(matches: list[dict[str, Any]], *, query: str, 
     return merged
 
 
+def source_version_filter_for_query(
+    query: str,
+    records: list[StructuredRecord],
+    chunks: list[RagChunk],
+) -> dict[str, Any]:
+    ranks = query_source_scope_version_ranks(query)
+    if not ranks:
+        return {"ranks": [], "document_ids": [], "matched": False}
+
+    document_ids = set()
+    for record in records:
+        source_text = " ".join([record.file_name, record.section_path])
+        if source_text_matches_query_version(source_text, ranks):
+            document_ids.add(record.document_id)
+    for chunk in chunks:
+        source_text = " ".join([chunk.file_name, chunk.section_path])
+        if source_text_matches_query_version(source_text, ranks):
+            document_ids.add(chunk.document_id)
+
+    return {
+        "ranks": [list(rank) for rank in ranks],
+        "document_ids": sorted(document_ids),
+        "matched": bool(document_ids),
+    }
+
+
+def query_source_scope_version_ranks(text: str) -> list[tuple[int, int, int, int]]:
+    text = clean_cell(text)
+    if not text:
+        return []
+
+    ranks: list[tuple[int, int, int, int]] = []
+    source_context = (
+        r"학년도|年度|모집\s*요강|요강|입학\s*전형|전형\s*요강|년도\s*자료|년판|"
+        r"fy|annual|edition|version|ver\.?|release|manual|handbook|guide|policy|report|runbook|"
+        r"pricing|price|catalog|admission|admissions|"
+        r"매뉴얼|핸드북|가이드|정책|규정|보고서|런북|릴리스|개정|가격표|요금표|카탈로그|안내"
+    )
+    for pattern in (
+        rf"(?<!\d)(20\d{{2}})\s*(?:년\s*)?(?:{source_context})",
+        rf"(?:{source_context})\s*(?:for\s*)?(?<!\d)(20\d{{2}})(?!\d)",
+    ):
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            ranks.append((2, int(match.group(1)), 0, 0))
+
+    for match in re.finditer(r"\bFY[-\s]?(20\d{2})\b", text, re.IGNORECASE):
+        ranks.append((2, int(match.group(1)), 0, 0))
+
+    if source_has_version_context(text) and not DATE_RE.search(text):
+        for match in re.finditer(r"(?<!\d)(20\d{2})(?!\d)", text):
+            ranks.append((2, int(match.group(1)), 0, 0))
+
+    for match in re.finditer(r"\b(?:v|ver\.?|version|edition|release)\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?\b", text, re.IGNORECASE):
+        major = int(match.group(1))
+        minor = int(match.group(2) or 0)
+        patch = int(match.group(3) or 0)
+        ranks.append((1, major, minor, patch))
+    return unique_rank_keep_order(ranks)
+
+
+def unique_rank_keep_order(ranks: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    seen: set[tuple[int, int, int, int]] = set()
+    result: list[tuple[int, int, int, int]] = []
+    for rank in ranks:
+        if rank in seen:
+            continue
+        seen.add(rank)
+        result.append(rank)
+    return result
+
+
+def source_text_matches_query_version(text: str, query_ranks: list[tuple[int, int, int, int]]) -> bool:
+    source_ranks = extract_version_ranks(text)
+    if not source_ranks:
+        return False
+    return any(source_rank_matches_query(source_rank, query_rank) for source_rank in source_ranks for query_rank in query_ranks)
+
+
+def source_rank_matches_query(source_rank: tuple[int, int, int, int], query_rank: tuple[int, int, int, int]) -> bool:
+    if query_rank[0] == 2:
+        return source_rank[0] == 2 and source_rank[1] == query_rank[1]
+    return source_rank == query_rank
+
+
 def query_has_explicit_version_reference(text: str) -> bool:
     return bool(
         re.search(
@@ -3243,7 +3333,8 @@ def source_has_version_context(text: str) -> bool:
         re.search(
             r"학년도|年度|연도|년판|fy|annual|edition|version|ver\.?|release|changelog|"
             r"manual|handbook|guide|policy|report|runbook|pricing|price|catalog|"
-            r"요강|매뉴얼|핸드북|가이드|정책|규정|보고서|런북|릴리스|개정|가격표|요금표|카탈로그|운영|안내",
+            r"admission|admissions|"
+            r"요강|입학전형|전형|모집|매뉴얼|핸드북|가이드|정책|규정|보고서|런북|릴리스|개정|가격표|요금표|카탈로그|운영|안내",
             text,
             re.IGNORECASE,
         )
@@ -3683,6 +3774,8 @@ def build_field_value_answer(
                 continue
             if scalar_target_keys and not value_matches_scalar_query(value, query_type, detect_attribute_concepts(query)):
                 continue
+            if not value_satisfies_query_scalar_constraints(value, fields, query, query_type):
+                continue
             display_value = format_field_value_display(
                 subject_value=subject_value,
                 field_name=target_key,
@@ -3799,6 +3892,26 @@ def value_matches_scalar_query(value: str, query_type: str, query_attrs: set[str
     if query_type == "date_lookup":
         return bool(DATE_RE.search(text))
     return False
+
+
+def value_satisfies_query_scalar_constraints(value: str, fields: dict[str, str], query: str, query_type: str) -> bool:
+    if query_type != "date_lookup":
+        return True
+
+    query_dates = extract_date_values(query)
+    query_times = extract_time_values(query)
+    if not query_dates and not query_times:
+        return True
+
+    evidence_text = " ".join([value, *fields.values()])
+    evidence_dates = extract_date_values(evidence_text)
+    if query_dates and not all(date_value_supported(date, evidence_dates) for date in query_dates):
+        return False
+
+    evidence_times = extract_time_values(evidence_text)
+    if query_times and not all(time_value in evidence_times for time_value in query_times):
+        return False
+    return True
 
 
 def format_field_value_display(
