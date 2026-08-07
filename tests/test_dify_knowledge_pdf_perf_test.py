@@ -6,6 +6,7 @@ from scripts.dify_knowledge_pdf_perf_test import (
     extract_indexed_document_id,
     retrieval_items,
     sample_pdf_bytes,
+    segment_items_from_payload,
 )
 
 
@@ -52,6 +53,23 @@ class DifyKnowledgePdfPerfScriptTest(unittest.TestCase):
         self.assertEqual(items[0]["score"], 0.91)
         self.assertEqual(items[0]["segment_id"], "seg-1")
         self.assertIn("Codex Knowledge", items[0]["content_preview"])
+
+    def test_segment_items_from_payload_compacts_uploaded_document_segments(self):
+        items = segment_items_from_payload(
+            {
+                "data": [
+                    {
+                        "id": "seg-1",
+                        "word_count": 8,
+                        "content": "Codex Knowledge PDF performance smoke test segment",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(items[0]["segment_id"], "seg-1")
+        self.assertEqual(items[0]["word_count"], 8)
+        self.assertIn("smoke test", items[0]["content_preview"])
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ def main() -> int:
     parser.add_argument("--keep-document", action="store_true", help="Do not delete the uploaded smoke-test document.")
     parser.add_argument("--max-upload-seconds", type=float, default=0.0, help="0 disables this gate.")
     parser.add_argument("--max-index-seconds", type=float, default=0.0, help="0 disables this gate.")
+    parser.add_argument("--allow-segment-miss", action="store_true", help="Do not fail when uploaded PDF text is absent from its segments.")
     parser.add_argument("--fail-on-retrieve-miss", action="store_true")
     args = parser.parse_args()
 
@@ -76,6 +77,12 @@ def main() -> int:
         if not document_id:
             document_id = extract_indexed_document_id(indexing)
 
+        segments_started = time.perf_counter()
+        segments_payload = fetch_document_segments(config, document_id, timeout=args.timeout) if document_id else {}
+        segments_seconds = round(time.perf_counter() - segments_started, 6)
+        segment_items = segment_items_from_payload(segments_payload)
+        segment_hit = any(args.query.lower() in item.get("content_preview", "").lower() for item in segment_items)
+
         retrieve_started = time.perf_counter()
         retrieve_payload = retrieve_chunks(config, args.query, timeout=args.timeout)
         retrieve_seconds = round(time.perf_counter() - retrieve_started, 6)
@@ -85,6 +92,7 @@ def main() -> int:
             indexing.get("failed")
             or (args.max_upload_seconds > 0 and upload_seconds > args.max_upload_seconds)
             or (args.max_index_seconds > 0 and index_seconds > args.max_index_seconds)
+            or (not args.allow_segment_miss and not segment_hit)
             or (args.fail_on_retrieve_miss and not retrieve_hit)
         )
         report = {
@@ -96,10 +104,13 @@ def main() -> int:
             "timing": {
                 "upload_seconds": upload_seconds,
                 "index_seconds": index_seconds,
+                "segments_seconds": segments_seconds,
                 "retrieve_seconds": retrieve_seconds,
                 "total_seconds": round(time.perf_counter() - started, 6),
             },
             "indexing": indexing,
+            "segment_hit": segment_hit,
+            "segments": segment_items,
             "retrieve_hit": retrieve_hit,
             "retrieve_items": retrieve_items,
             "failed": failed,
@@ -273,6 +284,16 @@ def retrieve_chunks(config: KnowledgeConfig, query: str, *, timeout: float) -> d
     )
 
 
+def fetch_document_segments(config: KnowledgeConfig, document_id: str, *, timeout: float) -> dict[str, Any]:
+    query = urllib.parse.urlencode({"limit": 20})
+    return request_json(
+        "GET",
+        f"{config.base_url}/datasets/{config.dataset_id}/documents/{document_id}/segments?{query}",
+        config.api_key,
+        timeout=timeout,
+    )
+
+
 def delete_document(config: KnowledgeConfig, document_id: str, *, timeout: float) -> str:
     try:
         request_json(
@@ -373,6 +394,21 @@ def retrieval_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return items
 
 
+def segment_items_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    items = []
+    for segment in payload_items(payload)[:20]:
+        if not isinstance(segment, dict):
+            continue
+        items.append(
+            {
+                "segment_id": segment.get("id"),
+                "word_count": segment.get("word_count"),
+                "content_preview": compact_text(segment.get("content") or "", 500),
+            }
+        )
+    return items
+
+
 def payload_items(payload: Any) -> list[Any]:
     if isinstance(payload, dict):
         value = payload.get("data")
@@ -419,11 +455,13 @@ def print_human(report: dict[str, Any], out_path: Path) -> None:
     print(f"- document_id: {report.get('document_id')}")
     print(f"- batch: {report.get('batch')}")
     print(
-        f"- upload/index/retrieve/total: {timing.get('upload_seconds')}s/"
-        f"{timing.get('index_seconds')}s/{timing.get('retrieve_seconds')}s/"
+        f"- upload/index/segments/retrieve/total: {timing.get('upload_seconds')}s/"
+        f"{timing.get('index_seconds')}s/{timing.get('segments_seconds')}s/"
+        f"{timing.get('retrieve_seconds')}s/"
         f"{timing.get('total_seconds')}s"
     )
     print(f"- indexing statuses: {indexing.get('statuses')}, polls={indexing.get('polls')}")
+    print(f"- segment_hit: {report.get('segment_hit')}")
     print(f"- retrieve_hit: {report.get('retrieve_hit')}")
     print(f"- cleanup: {report.get('cleanup')}")
     print(f"- saved: {out_path}")
