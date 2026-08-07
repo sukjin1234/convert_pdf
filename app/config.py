@@ -79,6 +79,8 @@ class Settings:
     hybrid_mode: str = os.getenv("ODL_HYBRID_MODE", "auto").lower()
     hybrid_timeout_ms: int = _env_int("ODL_HYBRID_TIMEOUT_MS", 300_000)
     conversion_timeout_seconds: int = _env_int("ODL_CONVERSION_TIMEOUT_SECONDS", 360)
+    conversion_cache_enabled: bool = _env_bool("ODL_CONVERSION_CACHE_ENABLED", True)
+    conversion_cache_max_markdown_bytes: int = _env_int("ODL_CONVERSION_CACHE_MAX_MARKDOWN_BYTES", 20 * 1024 * 1024)
     tmp_root: Path = _default_opendataloader_tmp_root()
     max_pdf_bytes: int = _env_int("ODL_MAX_PDF_BYTES", 80 * 1024 * 1024)
     require_pdf_signature: bool = _env_bool("ODL_REQUIRE_PDF_SIGNATURE", True)
@@ -110,6 +112,8 @@ class Settings:
             raise ValueError("ODL_HYBRID_TIMEOUT_MS must be positive.")
         if self.conversion_timeout_seconds <= 0:
             raise ValueError("ODL_CONVERSION_TIMEOUT_SECONDS must be positive.")
+        if self.conversion_cache_max_markdown_bytes <= 0:
+            raise ValueError("ODL_CONVERSION_CACHE_MAX_MARKDOWN_BYTES must be positive.")
         if self.max_pdf_bytes <= 0:
             raise ValueError("ODL_MAX_PDF_BYTES must be positive.")
         if self.rasterize_dpi <= 0:

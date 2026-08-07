@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ CSV_DOCUMENT_SUFFIXES = {".csv", ".tsv"}
 IMAGE_DOCUMENT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 SUPPORTED_DOCUMENT_LABEL = "PDF, TXT, Markdown, DOCX, CSV, TSV"
 WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+PDF_CONVERSION_CACHE_SCHEMA_VERSION = "pdf-cache-v1"
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,10 @@ class PdfConverter:
         if not safe_name.lower().endswith(".pdf"):
             safe_name = f"{Path(safe_name).stem or 'document'}.pdf"
 
+        cached = _read_pdf_conversion_cache(pdf_bytes, safe_name, self.settings)
+        if cached is not None:
+            return cached
+
         tmp_dir = _create_conversion_tmp_dir(self.settings)
         try:
             input_path = tmp_dir / safe_name
@@ -111,13 +117,14 @@ class PdfConverter:
 
             try:
                 markdown = _convert_pdf_file(input_path, tmp_dir / "output-original", self.settings)
-                return _append_pdf_image_ocr(
+                markdown = _append_pdf_image_ocr(
                     markdown,
                     input_path,
                     tmp_dir,
                     self.settings,
                     source_name=safe_name,
                 )
+                return _cache_pdf_conversion_result(pdf_bytes, safe_name, self.settings, markdown)
             except ConversionError as exc:
                 errors.append(f"original: {exc}")
                 logger.info("Original PDF conversion failed; trying fallbacks. error=%s", exc)
@@ -131,13 +138,14 @@ class PdfConverter:
                         tmp_dir / "output-qpdf-repaired",
                         self.settings,
                     )
-                    return _append_pdf_image_ocr(
+                    markdown = _append_pdf_image_ocr(
                         markdown,
                         qpdf_repaired_path,
                         tmp_dir,
                         self.settings,
                         source_name=safe_name,
                     )
+                    return _cache_pdf_conversion_result(pdf_bytes, safe_name, self.settings, markdown)
                 except ConversionError as exc:
                     errors.append(f"qpdf-repaired: {exc}")
                     logger.info("qpdf/pikepdf repaired PDF conversion failed. error=%s", exc)
@@ -148,26 +156,28 @@ class PdfConverter:
                 try:
                     _repair_pdf(repair_source, repaired_path)
                     markdown = _convert_pdf_file(repaired_path, tmp_dir / "output-repaired", self.settings)
-                    return _append_pdf_image_ocr(
+                    markdown = _append_pdf_image_ocr(
                         markdown,
                         repaired_path,
                         tmp_dir,
                         self.settings,
                         source_name=safe_name,
                     )
+                    return _cache_pdf_conversion_result(pdf_bytes, safe_name, self.settings, markdown)
                 except ConversionError as exc:
                     errors.append(f"repaired: {exc}")
                     logger.info("Repaired PDF conversion failed. error=%s", exc)
 
                 if repaired_path.exists():
                     try:
-                        return _convert_pdf_file(
+                        markdown = _convert_pdf_file(
                             repaired_path,
                             tmp_dir / "output-repaired-ocr",
                             self.settings,
                             hybrid_mode="full",
                             image_output="off",
                         )
+                        return _cache_pdf_conversion_result(pdf_bytes, safe_name, self.settings, markdown)
                     except ConversionError as exc:
                         errors.append(f"repaired-ocr: {exc}")
                         logger.info("Repaired PDF OCR conversion failed. error=%s", exc)
@@ -177,13 +187,14 @@ class PdfConverter:
                 raster_source = _first_existing_path(repaired_path, qpdf_repaired_path, input_path)
                 try:
                     _rasterize_pdf(raster_source, rasterized_path, self.settings.rasterize_dpi)
-                    return _convert_pdf_file(
+                    markdown = _convert_pdf_file(
                         rasterized_path,
                         tmp_dir / "output-rasterized",
                         self.settings,
                         hybrid_mode="full",
                         image_output="off",
                     )
+                    return _cache_pdf_conversion_result(pdf_bytes, safe_name, self.settings, markdown)
                 except ConversionError as exc:
                     errors.append(f"rasterized: {exc}")
                     logger.info("Rasterized PDF conversion failed. error=%s", exc)
@@ -210,6 +221,85 @@ def sanitize_filename(filename: str) -> str:
     name = Path(filename or "document.pdf").name
     name = re.sub(r"[^A-Za-z0-9_ .-]+", "_", name).strip(" .")
     return name or "document.pdf"
+
+
+def _read_pdf_conversion_cache(pdf_bytes: bytes, filename: str, settings: Settings) -> str | None:
+    if not settings.conversion_cache_enabled:
+        return None
+    cache_path = _pdf_conversion_cache_path(pdf_bytes, filename, settings)
+    try:
+        cached = cache_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not _has_meaningful_markdown(cached):
+        return None
+    logger.info("Using cached PDF conversion. file=%s cache=%s", filename, cache_path)
+    return cached
+
+
+def _cache_pdf_conversion_result(pdf_bytes: bytes, filename: str, settings: Settings, markdown: str) -> str:
+    if not settings.conversion_cache_enabled:
+        return markdown
+    if len(markdown.encode("utf-8")) > settings.conversion_cache_max_markdown_bytes:
+        logger.info("PDF conversion cache skipped because Markdown is too large. file=%s", filename)
+        return markdown
+    try:
+        cache_path = _pdf_conversion_cache_path(pdf_bytes, filename, settings)
+        _write_text_atomic(cache_path, markdown)
+    except OSError as exc:
+        logger.info("PDF conversion cache write failed. file=%s error=%s", filename, exc)
+    return markdown
+
+
+def _pdf_conversion_cache_path(pdf_bytes: bytes, filename: str, settings: Settings) -> Path:
+    cache_dir = settings.tmp_root / "conversion-cache"
+    return cache_dir / f"{_pdf_conversion_cache_key(pdf_bytes, filename, settings)}.md"
+
+
+def _pdf_conversion_cache_key(pdf_bytes: bytes, filename: str, settings: Settings) -> str:
+    payload = {
+        "schema": PDF_CONVERSION_CACHE_SCHEMA_VERSION,
+        "content_sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+        "suffix": Path(filename).suffix.lower() or ".pdf",
+        "settings": {
+            "hybrid_backend": settings.hybrid_backend,
+            "hybrid_mode": settings.hybrid_mode,
+            "table_method": settings.table_method,
+            "reading_order": settings.reading_order,
+            "use_struct_tree": settings.use_struct_tree,
+            "native_text_layer_first": settings.native_text_layer_first,
+            "embedded_image_ocr_enabled": settings.embedded_image_ocr_enabled,
+            "embedded_image_ocr_max_images": settings.embedded_image_ocr_max_images,
+            "embedded_image_ocr_batch_size": settings.embedded_image_ocr_batch_size,
+            "embedded_image_ocr_min_pixels": settings.embedded_image_ocr_min_pixels,
+            "embedded_image_ocr_max_image_bytes": settings.embedded_image_ocr_max_image_bytes,
+            "embedded_image_ocr_pdf_max_side": settings.embedded_image_ocr_pdf_max_side,
+            "rasterize_dpi": settings.rasterize_dpi,
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_file:
+            tmp_path = tmp_file.name
+            tmp_file.write(content)
+        os.replace(tmp_path, path)
+    except OSError:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 def _read_text_document(file_bytes: bytes) -> str:

@@ -173,6 +173,26 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(convert.call_args.kwargs, {})
         ocr.assert_called_once()
 
+    def test_pdf_conversion_cache_reuses_successful_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                tmp_root=Path(tmp) / "odl",
+                qpdf_repair_pdf_on_failure=False,
+                repair_pdf_on_failure=False,
+                rasterize_pdf_on_failure=False,
+                conversion_cache_enabled=True,
+            )
+            converter = PdfConverter(settings)
+
+            with patch("app.converter._convert_pdf_file", return_value="cached markdown") as convert:
+                first = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "cached.pdf")
+                second = converter.convert_pdf_bytes(b"%PDF-1.4\n%%EOF", "cached.pdf")
+
+            self.assertEqual(first, "cached markdown")
+            self.assertEqual(second, "cached markdown")
+            self.assertEqual(convert.call_count, 1)
+            self.assertEqual(len(list((Path(tmp) / "odl" / "conversion-cache").glob("*.md"))), 1)
+
     def test_embedded_image_ocr_filters_and_batches_images(self):
         settings = Settings(
             embedded_image_ocr_max_images=3,
