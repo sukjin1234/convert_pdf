@@ -1136,6 +1136,22 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertFalse(any(issue["type"] == "unsupported_date" for issue in result["issues"]))
         self.assertFalse(any(issue["type"] == "missing_direct_answer_value" for issue in result["issues"]))
 
+    def test_verify_accepts_year_label_when_evidence_has_full_date_in_same_year(self):
+        result = verify_answer(
+            "수시1차 원서접수 기간 알려줘",
+            "2026학년도 수시1차 원서접수 기간은 2026년 9월 7일 09:00부터 9월 30일 21:00까지입니다.",
+            [
+                "[Structured Lookup - authoritative exact evidence]\n"
+                "[Direct Answer - complete structured result]\n"
+                "answer_candidate: 수시1차: 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지\n"
+                "complete_values:\n"
+                "- 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지"
+            ],
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertFalse(any(issue["type"] == "unsupported_date" for issue in result["issues"]))
+
     def test_rotated_schedule_table_filters_row_label_and_column(self):
         artifact = build_rag_artifact(
             """
@@ -1203,6 +1219,58 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertNotIn("document.pdf", result["direct_answer"])
         self.assertNotIn("2026. 2. 3.(화)", result["direct_answer"])
         self.assertIn("2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지", result["direct_answer"])
+
+    def test_schedule_lookup_handles_duplicate_latest_academic_year_groups(self):
+        older = build_rag_artifact(
+            """
+--- Page 28 ---
+
+# 2026학년도 전형일정
+
+| 구분 | Column 2 | 수시1차 |
+| --- | --- | --- |
+| 접수 | 원서접수 서류제출 | 2025. 9. 8.(월) ~ 9. 30.(화) 21:00까지 |
+""",
+            "document.pdf",
+            document_id="doc_schedule_2026",
+        )
+        current_a = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 2027학년도 전형일정
+
+| 구분 | Column 2 | 수시1차 |
+| --- | --- | --- |
+| 접수 | 원서접수 | 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지 |
+""",
+            "2.  2027학년도 입학전형 수시·정시 모집요강.pdf",
+            document_id="doc_schedule_2027_a",
+        )
+        current_b = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 2027학년도 전형일정
+
+| 구분 | Column 2 | 수시1차 |
+| --- | --- | --- |
+| 접수 | 원서접수 | 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지 |
+""",
+            "2.  2027학년도 입학전형 수시·정시 모집요강.pdf",
+            document_id="doc_schedule_2027_b",
+        )
+
+        result = lookup_matches(
+            query="수시1차 원서접수 기간 알려줘",
+            records=[*current_a.records, *older.records, *current_b.records],
+            chunks=[*current_a.chunks, *older.chunks, *current_b.chunks],
+            limit=8,
+        )
+
+        self.assertEqual(result["direct_answer"], "수시1차: 2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지")
+        self.assertNotIn("2025. 9. 8", result["direct_answer"])
+        self.assertNotIn("document.pdf", result["direct_answer"])
 
     def test_schedule_lookup_keeps_row_topic_when_payment_period_competes(self):
         older = build_rag_artifact(

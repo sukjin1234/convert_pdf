@@ -3039,10 +3039,24 @@ def latest_versioned_source_group(matches: list[dict[str, Any]], *, query: str, 
     if len(comparable) < 2:
         return []
 
-    latest = max(comparable, key=lambda item: (item["rank"], item["score"], item["coverage"]))
-    if latest["rank"] <= max(item["rank"] for item in comparable if item is not latest):
+    latest_rank = max(item["rank"] for item in comparable)
+    latest_items = [item for item in comparable if item["rank"] == latest_rank]
+    if not latest_items:
         return []
-    return latest["group"]
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in sorted(latest_items, key=lambda value: (-value["score"], -value["coverage"])):
+        for match in item["group"]:
+            key = (
+                str(match.get("record_id") or ""),
+                str(match.get("chunk_id") or ""),
+                str(match.get("match_type") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(match)
+    return merged
 
 
 def query_has_explicit_version_reference(text: str) -> bool:
@@ -5289,6 +5303,8 @@ def normalize_date_value(value: str) -> str:
 def date_value_supported(date: str, evidence_dates: list[str]) -> bool:
     if date in evidence_dates:
         return True
+    if re.fullmatch(r"(?:19|20)\d{2}", date or ""):
+        return any(evidence_date == date or str(evidence_date).startswith(f"{date}-") for evidence_date in evidence_dates)
     date_month_day = month_day_part(date)
     if not date_month_day:
         return False
