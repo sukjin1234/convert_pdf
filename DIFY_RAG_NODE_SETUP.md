@@ -485,7 +485,7 @@ Current question:
 standalone_query: string
 ```
 
-이후 `Query Plan`, `Structured Lookup`, `Knowledge Retrieval`, `Final Answer`에서 검색용 질문은 `{{Rewrite Standalone Query.standalone_query}}`를 사용한다. 최종 답변 프롬프트에는 원 질문과 검색용 질문을 둘 다 넣어 사용자의 실제 의도를 유지한다.
+이후 `Query Plan`, `Structured Lookup`, `Final Answer`에서 검색용 질문은 `{{Rewrite Standalone Query.standalone_query}}`를 사용한다. `Knowledge Retrieval`에는 긴 질문 대신 `Query Plan`이 만든 짧은 `knowledge_query`를 사용한다. 최종 답변 프롬프트에는 원 질문과 검색용 질문을 둘 다 넣어 사용자의 실제 의도를 유지한다.
 
 ### 3.2 HTTP Request: Query Plan
 
@@ -537,6 +537,7 @@ def main(body) -> dict:
     entities = data.get("entities") or []
     keywords = data.get("keywords") or []
     expanded_queries = data.get("expanded_queries") or []
+    knowledge_queries = data.get("knowledge_queries") or []
 
     return {
         "query": data.get("query", ""),
@@ -545,6 +546,9 @@ def main(body) -> dict:
         "answer_style": data.get("answer_style", "grounded_explanation"),
         "entities": entities,
         "keywords": keywords,
+        "knowledge_query": data.get("knowledge_query") or data.get("query", ""),
+        "knowledge_query_secondary": data.get("knowledge_query_secondary") or "",
+        "knowledge_queries": knowledge_queries,
         "sub_queries": data.get("sub_queries") or [],
         "expanded_queries": expanded_queries,
         "entities_text": ", ".join(entities),
@@ -562,6 +566,9 @@ query_type: string
 answer_style: string
 entities: array[string]
 keywords: array[string]
+knowledge_query: string
+knowledge_query_secondary: string
+knowledge_queries: array[string]
 sub_queries: array[string]
 expanded_queries: array[string]
 entities_text: string
@@ -658,23 +665,29 @@ Structured Lookup Raw Body:
 검색 질의:
 
 ```text
-{{Parse Query Plan.expanded_query_text}}
+{{Parse Query Plan.knowledge_query}}
 ```
 
 대체 질의:
 
 ```text
-{{Rewrite Standalone Query.standalone_query}}
+{{Parse Query Plan.knowledge_query_secondary}}
 ```
+
+긴 자연어 질문이나 여러 확장 질의를 한 문자열로 합쳐 Knowledge 노드에 넣지 않는다. 임베딩·키워드 양쪽에서 문서 원문과의 정확 일치가 약해질 수 있다. 예를 들어 `수시1차 전형의 원서접수 시작 및 마감 기간은 어떻게 되나요?`는 `원서접수`와 `수시1차`로 축약된다.
+
+기본 구성은 `knowledge_query`를 쓰는 Knowledge Retrieval 노드 하나다. 재현율이 중요한 운영 구성에서는 `knowledge_query_secondary`가 비어 있지 않을 때만 두 번째 Knowledge Retrieval 노드를 조건 분기로 병렬 실행하고, 두 결과를 `Merge Evidence Request`에 함께 전달한다. 병렬 실행이므로 직렬 노드 두 개보다 지연 증가가 작고, 구체 엔터티와 속성 용어 중 한쪽이 임베딩 검색에서 누락되는 경우를 보완한다.
 
 권장 설정:
 
 ```text
 Retrieval mode: Hybrid Search
-Top K: 8~12
-Score threshold: 처음에는 낮게 또는 비활성
-Rerank: 가능하면 활성화
+Top K: 10
+Score threshold: 비활성
+Rerank: 비활성
 ```
+
+현재 `ipsi` 데이터셋의 Ollama `qwen3-embedding:8b` 조합은 가중 재랭킹을 켰을 때 정확 용어 질의도 0건이 되는 현상이 확인됐다. 재랭킹은 운영 평가셋에서 Recall@10과 MRR이 유지되는 모델을 별도로 구성한 뒤에만 활성화한다. Knowledge API의 데이터셋 기본값도 `hybrid_search`, `top_k=10`, `score_threshold_enabled=false`, `reranking_enable=false`로 맞춘다.
 
 Knowledge에는 `/convert/rag` 응답의 `dify_markdown`만 넣는다. 현재 변환기는 Knowledge 검색용 chunk에서 큰 원본 표와 목차를 줄이고, 행 단위 `structured_record`와 `answer_hint`를 우선 노출한다. 기존 PDF 원문을 그대로 넣은 문서는 긴 숫자 표와 목차가 상위 검색을 오염시키므로, compact RAG Markdown으로 재적재한 뒤 기존 PDF 문서는 비활성화한다.
 

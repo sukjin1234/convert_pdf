@@ -89,6 +89,9 @@ class QueryPlanResponse(BaseModel):
     query_type: str
     entities: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
+    knowledge_query: str = ""
+    knowledge_query_secondary: str = ""
+    knowledge_queries: list[str] = Field(default_factory=list)
     sub_queries: list[str] = Field(default_factory=list)
     expanded_queries: list[str] = Field(default_factory=list)
     answer_style: str = "grounded_explanation"

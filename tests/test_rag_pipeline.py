@@ -106,6 +106,21 @@ class RagPipelineTest(unittest.TestCase):
         self.assertNotEqual(plan_query("v2.1 릴리스 알려줘")["query_type"], "number_lookup")
         self.assertEqual(plan_query("3개 알려줘")["query_type"], "number_lookup")
 
+    def test_plans_short_exact_queries_for_dify_knowledge_retrieval(self):
+        schedule = plan_query("수시1차 전형의 원서접수 시작 및 마감 기간은 어떻게 되나요?")
+        scholarship = plan_query("전체수석 장학금은 얼마야?")
+        department = plan_query("컴퓨터정보공학과 모집인원 알려줘")
+
+        self.assertEqual(schedule["knowledge_query"], "원서접수")
+        self.assertIn("수시1차", schedule["knowledge_queries"])
+        self.assertNotIn("어떻게", " ".join(schedule["knowledge_queries"]))
+        self.assertEqual(scholarship["knowledge_query"], "전체수석")
+        self.assertEqual(department["knowledge_query"], "컴퓨터정보공학과")
+        self.assertEqual(
+            schedule["knowledge_query_secondary"],
+            schedule["knowledge_queries"][1],
+        )
+
     def test_definition_query_uses_section_overview_not_numeric_identifier_row(self):
         artifact = build_rag_artifact(
             """

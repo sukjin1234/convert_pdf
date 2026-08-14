@@ -365,6 +365,52 @@ STOPWORDS = {
     "answer_hint",
 }
 
+KNOWLEDGE_QUERY_GENERIC_TERMS = {
+    "관련",
+    "기준",
+    "내용",
+    "방법",
+    "시작",
+    "종료",
+    "마감",
+    "날짜",
+    "기간",
+    "일정",
+    "알려줘",
+    "알려",
+    "되나요",
+    "어떻게",
+    "무엇",
+    "what",
+    "when",
+    "where",
+    "which",
+    "how",
+}
+
+KNOWLEDGE_QUERY_ENTITY_SUFFIXES = (
+    "학과",
+    "학부",
+    "전공",
+    "대학",
+    "캠퍼스",
+    "부서",
+    "센터",
+    "팀",
+    "서비스",
+    "시스템",
+    "플랫폼",
+    "API",
+    "정책",
+    "규정",
+    "제도",
+    "전형",
+    "수석",
+    "포기",
+    "반환",
+    "접수",
+)
+
 IMPORTANT_TERMS = [
     "SLA",
     "SLO",
@@ -2605,6 +2651,7 @@ def plan_query(query: str, document_id: str | None = None) -> dict[str, Any]:
     normalized_query = clean_cell(query)
     keywords = extract_keywords(normalized_query, limit=16)
     query_type = classify_query_type(normalized_query)
+    knowledge_queries = build_knowledge_queries(normalized_query, keywords)
     sub_queries = split_sub_queries(normalized_query, keywords)
     expanded_queries = build_query_variants(normalized_query, keywords, query_type)
     expanded_queries = unique_keep_order([*expanded_queries, *sub_queries])
@@ -2615,17 +2662,66 @@ def plan_query(query: str, document_id: str | None = None) -> dict[str, Any]:
         "query_type": query_type,
         "entities": keywords,
         "keywords": keywords,
+        "knowledge_query": knowledge_queries[0] if knowledge_queries else normalized_query,
+        "knowledge_query_secondary": knowledge_queries[1] if len(knowledge_queries) > 1 else "",
+        "knowledge_queries": knowledge_queries,
         "sub_queries": sub_queries,
         "expanded_queries": expanded_queries,
         "answer_style": answer_style,
         "retrieval_hints": {
             "prefer_structured_lookup": query_type in STRUCTURED_LOOKUP_TYPES,
             "prefer_exact_terms": keywords[:8],
+            "knowledge_queries": knowledge_queries,
             "answer_must_include_evidence": True,
             "answer_style": answer_style,
             "min_evidence_count": 2 if query_type in {"comparison", "summary"} else 1,
         },
     }
+
+
+def build_knowledge_queries(query: str, keywords: list[str], limit: int = 3) -> list[str]:
+    """Build short exact-term queries for Dify Knowledge Retrieval."""
+    candidates: list[tuple[int, int, str]] = []
+    important_terms = {normalize_for_match(term) for term in IMPORTANT_TERMS}
+    generic_terms = {normalize_for_match(term) for term in KNOWLEDGE_QUERY_GENERIC_TERMS}
+
+    for index, keyword in enumerate(keywords):
+        cleaned = strip_query_particle(clean_cell(keyword))
+        normalized = normalize_for_match(cleaned)
+        if len(normalized) < 2 or normalized in normalized_stopwords() or normalized in generic_terms:
+            continue
+
+        score = min(len(normalized), 30)
+        if re.search(r"[A-Za-z가-힣][0-9]|[0-9][A-Za-z가-힣]", cleaned):
+            score += 90
+        if any(
+            cleaned.lower().endswith(suffix.lower())
+            and len(normalized) > len(normalize_for_match(suffix))
+            for suffix in KNOWLEDGE_QUERY_ENTITY_SUFFIXES
+        ):
+            score += 80
+        if normalized in important_terms:
+            score += 50
+        if " " in cleaned and re.search(r"[A-Za-z]", cleaned):
+            score += 30
+        candidates.append((score, index, cleaned[:80]))
+
+    ranked = [item for _, _, item in sorted(candidates, key=lambda item: (-item[0], item[1]))]
+    ranked = unique_keep_order(ranked)
+    if ranked:
+        return ranked[: max(1, limit)]
+
+    fallback_tokens = [
+        strip_query_particle(match.group(0))
+        for match in re.finditer(r"[가-힣A-Za-z0-9._/-]{2,40}", query)
+    ]
+    fallback = [
+        token
+        for token in unique_keep_order(fallback_tokens)
+        if normalize_for_match(token) not in normalized_stopwords()
+        and normalize_for_match(token) not in generic_terms
+    ]
+    return (fallback or [clean_cell(query)[:80]])[: max(1, limit)]
 
 
 def classify_query_type(query: str) -> str:
