@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+from app import rag as rag_module
 from app.rag import (
     build_rag_artifact,
     clean_dify_markdown_metadata,
@@ -2194,6 +2196,34 @@ AK
         self.assertNotIn("\x00", artifact.dify_markdown)
         self.assertIn("2026. 9. 7.", artifact.dify_markdown)
         self.assertTrue(all("\x00" not in record.answer_text for record in artifact.records))
+
+    def test_lookup_hydrates_only_prefiltered_candidates(self):
+        rows = "\n".join(f"| 항목 {index} | 공통 운영 정책 설명 {index} |" for index in range(220))
+        artifact = build_rag_artifact(
+            f"""
+--- Page 1 ---
+
+# 운영 정책
+
+| 항목 | 내용 |
+| --- | --- |
+{rows}
+""",
+            "policy.pdf",
+            document_id="large_policy",
+        )
+
+        with patch("app.rag.format_supporting_context", wraps=rag_module.format_supporting_context) as formatter:
+            result = lookup_matches(
+                query="공통 운영 정책 항목 알려줘",
+                records=artifact.records,
+                chunks=artifact.chunks,
+                limit=3,
+            )
+
+        self.assertGreater(result["diagnostics"]["candidate_count"], 160)
+        self.assertLessEqual(result["diagnostics"]["hydrated_candidate_count"], 320)
+        self.assertLessEqual(formatter.call_count, 160)
 
 
 if __name__ == "__main__":

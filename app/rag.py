@@ -2760,12 +2760,17 @@ def lookup_matches(
     terms = normalize_terms([query, *active_entities])
     chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
     chunk_order = {chunk.chunk_id: index for index, chunk in enumerate(chunks)}
+    prefilter_limit = max(limit * 20, 160)
 
-    record_matches = []
-    for record in records:
+    scored_records = []
+    for index, record in enumerate(records):
         score = score_record(record, terms, active_query_type)
         if score <= 0:
             continue
+        scored_records.append((score, index, record))
+
+    record_matches = []
+    for score, _, record in sorted(scored_records, key=lambda item: (-item[0], item[1]))[:prefilter_limit]:
         chunk = chunk_by_id.get(record.chunk_id)
         evidence = format_record_evidence(record)
         supporting_context = format_supporting_context(
@@ -2798,11 +2803,15 @@ def lookup_matches(
             }
         )
 
-    chunk_matches = []
-    for chunk in chunks:
+    scored_chunks = []
+    for index, chunk in enumerate(chunks):
         score = score_chunk(chunk, terms, active_query_type)
         if score <= 0:
             continue
+        scored_chunks.append((score, index, chunk))
+
+    chunk_matches = []
+    for score, _, chunk in sorted(scored_chunks, key=lambda item: (-item[0], item[1]))[:prefilter_limit]:
         chunk_matches.append(
             {
                 "match_type": "chunk",
@@ -2861,7 +2870,9 @@ def lookup_matches(
         "context": format_lookup_context(context_matches, direct_answer),
         "evidence_items": build_evidence_items(context_matches),
         "diagnostics": {
-            "candidate_count": len(ranked),
+            "candidate_count": len(scored_records) + len(scored_chunks),
+            "hydrated_candidate_count": len(ranked),
+            "prefilter_limit": prefilter_limit,
             "selected_count": len(combined),
             "top_score": ranked[0]["score"] if ranked else 0,
             "average_coverage": round(sum(match["coverage"] for match in combined) / len(combined), 3) if combined else 0,
