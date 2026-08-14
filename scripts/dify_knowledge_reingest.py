@@ -44,6 +44,8 @@ MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 PLAIN_NUMBERED_HEADING_RE = re.compile(r"^(\d{1,2}[.)])\s+(.+?)\s*$")
 ROMAN_HEADING_RE = re.compile(r"^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+[.)]\s+")
 ARABIC_HEADING_RE = re.compile(r"^\d{1,2}[.)]\s+")
+RECOVERED_PARENT_WEIGHT_LIMIT = 1400
+RECOVERED_PARAGRAPH_OVERHEAD = 220
 
 
 class SourcePdfUnavailable(RuntimeError):
@@ -375,20 +377,21 @@ def rebuild_dify_markdown_from_segments(
             block_body = rewrite_source_sections(block_body, active_section)
             if not block_body.strip():
                 continue
-            block_index = len(rendered_blocks) + 1
-            chunk_id = f"{document_id}_p{safe_page_id(active_page)}_r{block_index:04d}"
-            rendered_blocks.append(
-                render_recovered_block(
-                    block_body,
-                    document_id=document_id,
-                    chunk_id=chunk_id,
-                    file_name=active_file_name,
-                    page=active_page,
-                    section=active_section,
-                    record_types=active_record_types,
-                    keywords=active_keywords,
+            for parent_body in split_recovered_parent_bodies(block_body):
+                block_index = len(rendered_blocks) + 1
+                chunk_id = f"{document_id}_p{safe_page_id(active_page)}_r{block_index:04d}"
+                rendered_blocks.append(
+                    render_recovered_block(
+                        parent_body,
+                        document_id=document_id,
+                        chunk_id=chunk_id,
+                        file_name=active_file_name,
+                        page=active_page,
+                        section=active_section,
+                        record_types=active_record_types,
+                        keywords=active_keywords,
+                    )
                 )
-            )
 
     return "\n\n---\n\n".join(rendered_blocks).strip(), len(rendered_blocks)
 
@@ -471,6 +474,54 @@ def rewrite_source_sections(body: str, section: str) -> str:
         match = SOURCE_SECTION_RE.match(line)
         lines.append(f"{match.group(1)}{section}" if match else line)
     return "\n".join(lines).strip()
+
+
+def split_recovered_parent_bodies(
+    body: str,
+    *,
+    weight_limit: int = RECOVERED_PARENT_WEIGHT_LIMIT,
+) -> list[str]:
+    paragraphs = [value.strip() for value in re.split(r"\n{2,}", body) if value.strip()]
+    units = []
+    content_limit = max(weight_limit - RECOVERED_PARAGRAPH_OVERHEAD, 200)
+    for paragraph in paragraphs:
+        units.extend(split_long_recovered_paragraph(paragraph, content_limit))
+
+    groups: list[str] = []
+    current: list[str] = []
+    current_weight = 0
+    for unit in units:
+        unit_weight = len(unit) + RECOVERED_PARAGRAPH_OVERHEAD
+        if current and current_weight + unit_weight > weight_limit:
+            groups.append("\n\n".join(current))
+            current = []
+            current_weight = 0
+        current.append(unit)
+        current_weight += unit_weight
+    if current:
+        groups.append("\n\n".join(current))
+    return groups
+
+
+def split_long_recovered_paragraph(paragraph: str, content_limit: int) -> list[str]:
+    if len(paragraph) <= content_limit:
+        return [paragraph]
+    units: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for line in paragraph.splitlines():
+        line_parts = [line[index : index + content_limit] for index in range(0, len(line), content_limit)] or [""]
+        for part in line_parts:
+            added = len(part) + (1 if current else 0)
+            if current and current_length + added > content_limit:
+                units.append("\n".join(current))
+                current = []
+                current_length = 0
+            current.append(part)
+            current_length += len(part) + (1 if len(current) > 1 else 0)
+    if current:
+        units.append("\n".join(current))
+    return [unit for unit in units if unit.strip()]
 
 
 def render_recovered_block(

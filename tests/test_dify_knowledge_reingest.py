@@ -10,6 +10,7 @@ from scripts.dify_knowledge_reingest import (
     poll_document_status,
     rebuild_dify_markdown_from_segments,
     select_documents,
+    split_recovered_parent_bodies,
     update_started_despite_response_error,
     validate_artifact,
 )
@@ -139,6 +140,14 @@ class DifyKnowledgeReingestTest(unittest.TestCase):
             line for line in markdown.splitlines() if "section=IX. 안내사항 > 4. 입학포기" in line
         )
         self.assertIn("page=37", refund_context)
+
+    def test_recovered_parent_blocks_are_split_before_dify_token_limit(self):
+        body = "\n\n".join(["structured record " + ("가" * 700)] * 4)
+
+        blocks = split_recovered_parent_bodies(body, weight_limit=1000)
+
+        self.assertEqual(len(blocks), 4)
+        self.assertTrue(all(len(block) <= 780 for block in blocks))
 
     @patch("scripts.dify_knowledge_reingest.get_knowledge_document")
     def test_response_error_is_accepted_only_when_indexing_started(self, get_document):
