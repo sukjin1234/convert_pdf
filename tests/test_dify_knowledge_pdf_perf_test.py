@@ -92,6 +92,7 @@ class DifyKnowledgePdfPerfScriptTest(unittest.TestCase):
         self.assertEqual(rule["mode"], "hierarchical")
         self.assertEqual(rule["rules"]["parent_mode"], "paragraph")
         self.assertEqual(rule["rules"]["segmentation"]["separator"], "\n\n---\n\n")
+        self.assertEqual(rule["rules"]["segmentation"]["max_tokens"], 1500)
         self.assertEqual(rule["rules"]["subchunk_segmentation"], {"separator": "\n\n", "max_tokens": 500})
 
 

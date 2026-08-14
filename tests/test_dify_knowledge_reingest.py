@@ -88,7 +88,9 @@ class DifyKnowledgeReingestTest(unittest.TestCase):
         self.assertEqual(payload["name"], "입시.pdf")
         self.assertEqual(payload["doc_form"], "hierarchical_model")
         self.assertEqual(payload["process_rule"]["mode"], "hierarchical")
-        self.assertEqual(payload["process_rule"]["rules"]["segmentation"]["separator"], "\n\n---\n\n")
+        segmentation = payload["process_rule"]["rules"]["segmentation"]
+        self.assertEqual(segmentation["separator"], "\n\n---\n\n")
+        self.assertEqual(segmentation["max_tokens"], 1500)
 
     def test_artifact_validation_requires_chunks_and_context_metadata(self):
         valid = "[document_id: doc-1]\n[context: file=a.pdf | page=1 | section=A | paragraph=p1]"
