@@ -1,10 +1,12 @@
 import unittest
+from unittest.mock import patch
 
 from scripts.dify_knowledge_pdf_perf_test import KnowledgeConfig
 from scripts.dify_knowledge_reingest import (
     build_update_payload,
     extract_artifact_document_id,
     filename_from_content_disposition,
+    download_document_pdf,
     rebuild_dify_markdown_from_segments,
     select_documents,
     validate_artifact,
@@ -48,6 +50,24 @@ class DifyKnowledgeReingestTest(unittest.TestCase):
             "입시.pdf",
         )
         self.assertEqual(filename_from_content_disposition('attachment; filename="guide.pdf"'), "guide.pdf")
+
+    def test_text_download_is_treated_as_missing_source_pdf(self):
+        class Response:
+            headers = {"Content-Disposition": 'attachment; filename="guide.md"'}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return b"[document_id: existing-text-source]"
+
+        config = KnowledgeConfig("https://example.test/v1", "secret", "dataset")
+        with patch("urllib.request.urlopen", return_value=Response()):
+            with self.assertRaisesRegex(RuntimeError, "text rather than a PDF"):
+                download_document_pdf(config, "doc-1", "guide.pdf", timeout=1)
 
     def test_update_payload_preserves_hierarchical_chunk_boundaries(self):
         payload = build_update_payload(

@@ -269,7 +269,7 @@ def download_document_pdf(
             raise SourcePdfUnavailable(text) from exc
         raise RuntimeError(f"HTTP {exc.code}: {text[:1000]}") from exc
     if not content.lstrip().startswith(b"%PDF-"):
-        raise RuntimeError("Downloaded Knowledge source is not a PDF stream.")
+        raise SourcePdfUnavailable("Downloaded Knowledge source is text rather than a PDF stream.")
     filename = filename_from_content_disposition(content_disposition) or fallback_name or "document.pdf"
     if not filename.lower().endswith(".pdf"):
         filename = f"{filename}.pdf"
