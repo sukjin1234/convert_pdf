@@ -1729,6 +1729,7 @@ Build Eval Log Body:
 
 ```powershell
 python -X utf8 scripts\dify_app_api_diagnostics.py --document-id c7b1cb1b-91a3-4a6e-a64b-a90837445f3f --out .runtime\dify_app_api_diagnostics_doc2027_latest.json
+python -X utf8 scripts\dify_app_api_diagnostics.py --skip-console-probe --fail-on-stale-deployment --timeout 300
 python -X utf8 scripts\eval_dify_chat_api.py --timeout 300
 python -X utf8 scripts\eval_dify_chat_api.py --suite mixed --timeout 300
 python -X utf8 scripts\eval_dify_chat_api.py --suite all --timeout 300
@@ -1741,6 +1742,9 @@ workflow_edit_available: false이면 API 키만으로 노드 편집 불가
 document_id_in_workflow_inputs: true여야 특정 문서 모드 정상
 query_plan_document_id: App API inputs.document_id와 같아야 정상
 structured_direct_answer: document_id 모드에서는 지정 문서 값만 포함되어야 정상
+deployment_contract_ready: true여야 knowledge_query, 조회 prefilter, 응답 경량화가 원격 FastAPI에 배포된 상태
+structured_response_chars: 배포 전후 크기를 비교하고 불필요한 수만 자 응답이면 실패 원인을 확인
+node_timings: Structured Lookup과 Final Answer가 전체 지연의 대부분인지 확인
 verify_valid: true여도 structured_direct_answer가 문서를 섞으면 운영 불합격
 ```
 

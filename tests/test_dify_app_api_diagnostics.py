@@ -1,13 +1,16 @@
 import unittest
-from tempfile import TemporaryDirectory
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from scripts.dify_app_api_diagnostics import (
+    deployment_contract_status,
     flatten_stream_event,
     has_document_id_key,
     load_inputs,
-    parse_sse_events,
+    node_response_body_chars,
+    node_timing_summary,
     parse_json_object,
+    parse_sse_events,
     summarize_stream_events,
 )
 
@@ -88,6 +91,62 @@ class DifyAppApiDiagnosticsTests(unittest.TestCase):
     def test_parse_json_object_requires_object(self):
         with self.assertRaises(ValueError):
             parse_json_object("[]")
+
+    def test_current_deployment_contract_is_ready(self):
+        status = deployment_contract_status(
+            {
+                "knowledge_query": "원서접수",
+                "knowledge_queries": ["원서접수", "수시1차"],
+            },
+            {
+                "matches": [{"evidence": "수시1차: 2026. 9. 7."}],
+                "diagnostics": {"prefilter_limit": 160, "hydrated_candidate_count": 12},
+            },
+        )
+
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["missing"], [])
+
+    def test_legacy_deployment_contract_reports_missing_features(self):
+        status = deployment_contract_status(
+            {"expanded_queries": ["긴 자연어 질문"]},
+            {
+                "matches": [{"chunk_text": "duplicated", "evidence": "value"}],
+                "diagnostics": {"candidate_count": 1000},
+            },
+        )
+
+        self.assertFalse(status["ready"])
+        self.assertEqual(
+            status["missing"],
+            ["knowledge_query", "knowledge_queries", "lookup_prefilter", "compact_matches"],
+        )
+
+    def test_node_timing_and_response_size_are_extracted(self):
+        events = [
+            {
+                "event": "node_finished",
+                "title": "Structured Lookup",
+                "node_type": "http-request",
+                "status": "succeeded",
+                "elapsed_time": 1.23456789,
+                "outputs": {"body": "12345"},
+            },
+            {"event": "message", "answer": "done"},
+        ]
+
+        self.assertEqual(node_response_body_chars(events, "Structured Lookup"), 5)
+        self.assertEqual(
+            node_timing_summary(events),
+            [
+                {
+                    "title": "Structured Lookup",
+                    "node_type": "http-request",
+                    "status": "succeeded",
+                    "elapsed_seconds": 1.234568,
+                }
+            ],
+        )
 
 
 if __name__ == "__main__":

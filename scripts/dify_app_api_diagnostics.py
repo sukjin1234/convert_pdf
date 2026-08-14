@@ -30,6 +30,11 @@ def main() -> int:
     parser.add_argument("--app-id", default="", help="Optional Dify app id for console read probes.")
     parser.add_argument("--skip-stream", action="store_true")
     parser.add_argument("--skip-console-probe", action="store_true")
+    parser.add_argument(
+        "--fail-on-stale-deployment",
+        action="store_true",
+        help="Exit 1 unless deployed Query Plan and Structured Lookup expose the current response contract.",
+    )
     parser.add_argument("--out", default=str(ROOT / ".runtime" / "dify_app_api_diagnostics_latest.json"))
     parser.add_argument("--json", action="store_true", help="Print the full JSON report.")
     args = parser.parse_args()
@@ -89,6 +94,9 @@ def main() -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         print_human(report, out_path)
+    contract = nested_get(report, "stream", "summary", "deployment_contract")
+    if args.fail_on_stale_deployment and isinstance(contract, dict) and not contract.get("ready"):
+        return 1
     return 0
 
 
@@ -267,6 +275,7 @@ def summarize_stream_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     query_plan_document_id = query_plan.get("document_id") if isinstance(query_plan, dict) else None
     verify_issues = verify_answer.get("issues") if isinstance(verify_answer, dict) else []
     metadata = message_end.get("metadata") if isinstance(message_end.get("metadata"), dict) else {}
+    deployment_contract = deployment_contract_status(query_plan, structured_lookup)
     return {
         "workflow_run_id": workflow_started.get("workflow_run_id") or message_end.get("workflow_run_id"),
         "workflow_inputs": workflow_inputs,
@@ -275,6 +284,9 @@ def summarize_stream_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         "query_plan_document_id": query_plan_document_id,
         "structured_direct_answer": structured_lookup.get("direct_answer") if isinstance(structured_lookup, dict) else "",
         "structured_answer_items": structured_lookup.get("answer_items", []) if isinstance(structured_lookup, dict) else [],
+        "structured_response_chars": node_response_body_chars(events, "Structured Lookup"),
+        "node_timings": node_timing_summary(events),
+        "deployment_contract": deployment_contract,
         "final_answer": final_answer,
         "rewrite_answer": rewrite_answer,
         "streamed_answer": "".join(answer_chunks),
@@ -291,6 +303,55 @@ def summarize_stream_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             if event.get("event") == "node_finished" and event.get("status") == "failed"
         ],
     }
+
+
+def deployment_contract_status(query_plan: Any, structured_lookup: Any) -> dict[str, Any]:
+    query_plan = query_plan if isinstance(query_plan, dict) else {}
+    structured_lookup = structured_lookup if isinstance(structured_lookup, dict) else {}
+    matches = structured_lookup.get("matches") if isinstance(structured_lookup.get("matches"), list) else []
+    diagnostics = structured_lookup.get("diagnostics") if isinstance(structured_lookup.get("diagnostics"), dict) else {}
+    checks = {
+        "knowledge_query": bool(str(query_plan.get("knowledge_query") or "").strip()),
+        "knowledge_queries": bool(query_plan.get("knowledge_queries")),
+        "lookup_prefilter": "prefilter_limit" in diagnostics and "hydrated_candidate_count" in diagnostics,
+        "compact_matches": bool(matches) and all("chunk_text" not in match for match in matches if isinstance(match, dict)),
+    }
+    return {
+        "ready": all(checks.values()),
+        "checks": checks,
+        "missing": [name for name, passed in checks.items() if not passed],
+    }
+
+
+def node_timing_summary(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    timings = []
+    for event in events:
+        if event.get("event") != "node_finished":
+            continue
+        elapsed = event.get("elapsed_time")
+        if not isinstance(elapsed, (int, float)):
+            continue
+        timings.append(
+            {
+                "title": event.get("title") or event.get("node_title") or "",
+                "node_type": event.get("node_type") or "",
+                "status": event.get("status") or "",
+                "elapsed_seconds": round(float(elapsed), 6),
+            }
+        )
+    return timings
+
+
+def node_response_body_chars(events: list[dict[str, Any]], title: str) -> int:
+    for event in events:
+        if event.get("event") != "node_finished":
+            continue
+        if (event.get("title") or event.get("node_title")) != title:
+            continue
+        outputs = event.get("outputs") if isinstance(event.get("outputs"), dict) else {}
+        body = outputs.get("body")
+        return len(body) if isinstance(body, str) else 0
+    return 0
 
 
 def first_event(events: list[dict[str, Any]], event_name: str) -> dict[str, Any]:
@@ -360,6 +421,15 @@ def print_human(report: dict[str, Any], out_path: Path) -> None:
         print(f"- document_id_in_workflow_inputs: {summary.get('document_id_in_workflow_inputs')}")
         print(f"- query_plan_document_id: {summary.get('query_plan_document_id')}")
         print(f"- verify_valid: {summary.get('verify_valid')}")
+        contract = summary.get("deployment_contract") if isinstance(summary.get("deployment_contract"), dict) else {}
+        print(f"- deployment_contract_ready: {contract.get('ready')}")
+        if contract.get("missing"):
+            print(f"- stale_contract_fields: {', '.join(contract['missing'])}")
+        print(f"- structured_response_chars: {summary.get('structured_response_chars')}")
+        timings = summary.get("node_timings") if isinstance(summary.get("node_timings"), list) else []
+        slowest = sorted(timings, key=lambda item: float(item.get("elapsed_seconds") or 0), reverse=True)[:5]
+        for item in slowest:
+            print(f"- node: {item.get('title')} {item.get('elapsed_seconds')}s")
         print(f"- event_count: {stream.get('event_count')}, elapsed: {stream.get('elapsed_seconds')}s")
     print(f"- saved: {out_path}")
 
