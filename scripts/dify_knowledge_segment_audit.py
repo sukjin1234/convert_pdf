@@ -21,6 +21,8 @@ SECTION_MARKER_RE = re.compile(r"(?m)^\s*\[section:\s*(.*?)\]\s*$")
 PAGE_MARKER_RE = re.compile(r"(?m)^\s*\[page:\s*(.*?)\]\s*$")
 SOURCE_SECTION_RE = re.compile(r"(?m)^\s*source_section:\s*(.*?)\s*$")
 SOURCE_PAGE_RE = re.compile(r"(?m)^\s*source_page:\s*(.*?)\s*$")
+CONTEXT_SECTION_RE = re.compile(r"(?m)^\s*\[context:.*?\|\s*section=(.*?)\s*\|\s*paragraph=.*?\]\s*$")
+CONTEXT_PAGE_RE = re.compile(r"(?m)^\s*\[context:.*?\|\s*page=(.*?)\s*\|\s*section=.*?\]\s*$")
 MAJOR_OUTLINE_RE = re.compile(
     r"^(?:[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+|[IVXLCDM]+|제\s*\d+\s*장|chapter|part)\b",
     re.IGNORECASE,
@@ -316,6 +318,9 @@ def extract_section(content: str) -> str:
     if match:
         return match.group(1)
     match = SOURCE_SECTION_RE.search(content or "")
+    if match:
+        return match.group(1)
+    match = CONTEXT_SECTION_RE.search(content or "")
     return match.group(1) if match else ""
 
 
@@ -324,6 +329,9 @@ def extract_page(content: str) -> str:
     if match:
         return match.group(1)
     match = SOURCE_PAGE_RE.search(content or "")
+    if match:
+        return match.group(1)
+    match = CONTEXT_PAGE_RE.search(content or "")
     return match.group(1) if match else ""
 
 

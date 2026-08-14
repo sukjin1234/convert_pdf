@@ -270,8 +270,8 @@ def build_process_rule(config: KnowledgeConfig) -> dict[str, Any]:
                     {"id": "remove_urls_emails", "enabled": False},
                 ],
                 "parent_mode": "paragraph",
-                "segmentation": {"separator": "\n\n", "max_tokens": 800},
-                "subchunk_segmentation": {"separator": "\n", "max_tokens": 300},
+                "segmentation": {"separator": "\n\n---\n\n", "max_tokens": 800},
+                "subchunk_segmentation": {"separator": "\n\n", "max_tokens": 500},
             },
         }
     return {"mode": "automatic"}

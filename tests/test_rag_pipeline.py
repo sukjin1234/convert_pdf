@@ -1,6 +1,14 @@
 import unittest
 
-from app.rag import build_rag_artifact, extract_keywords, lookup_matches, merge_evidence_context, plan_query, verify_answer
+from app.rag import (
+    build_rag_artifact,
+    clean_dify_markdown_metadata,
+    extract_keywords,
+    lookup_matches,
+    merge_evidence_context,
+    plan_query,
+    verify_answer,
+)
 
 
 class RagPipelineTest(unittest.TestCase):
@@ -1722,6 +1730,40 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         page5_sections = {chunk.section_path for chunk in artifact.chunks if chunk.page_start == 5}
         self.assertEqual(page5_sections, {"2027 Admission Guide > Ⅱ. 전형일정"})
         self.assertFalse(any("정원외 전형 모집인원" in section for section in page5_sections))
+
+    def test_dify_markdown_contextualizes_every_paragraph_with_source_metadata(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 2027 Admission Guide
+
+## Ⅱ. 전형일정
+
+원서접수는 2026년 9월 7일부터 시작한다.
+
+서류제출은 2026년 10월 2일까지 완료해야 한다.
+""",
+            "admission.pdf",
+            document_id="doc_contextual_paragraphs",
+        )
+
+        self.assertIn("[paragraph_count:", artifact.dify_markdown)
+        self.assertGreaterEqual(artifact.dify_markdown.count("[context: file=admission.pdf"), 3)
+        self.assertGreaterEqual(artifact.dify_markdown.count("section=2027 Admission Guide > Ⅱ. 전형일정"), 3)
+        self.assertIn("paragraph=doc_contextual_paragraphs_p005_c0001_p001", artifact.dify_markdown)
+        self.assertIn("paragraph=doc_contextual_paragraphs_p005_c0001_p003", artifact.dify_markdown)
+
+    def test_dify_paragraph_context_repairs_inverted_outline_metadata(self):
+        markdown = (
+            "[context: file=guide.pdf | page=5 | "
+            "section=2. 정원외 전형 모집인원 > Ⅱ. 전형일정 | paragraph=p001]\n본문"
+        )
+
+        self.assertIn(
+            "section=Ⅱ. 전형일정 | paragraph=p001",
+            clean_dify_markdown_metadata(markdown),
+        )
 
     def test_chapter_outline_is_rebuilt_for_software_manual_pages(self):
         artifact = build_rag_artifact(

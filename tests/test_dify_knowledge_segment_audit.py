@@ -26,6 +26,15 @@ class DifyKnowledgeSegmentAuditTest(unittest.TestCase):
         self.assertEqual(extract_page(content), "12")
         self.assertEqual(extract_section(content), "제1장 개요")
 
+    def test_extracts_contextual_paragraph_metadata(self):
+        content = (
+            "[context: file=guide.pdf | page=12 | "
+            "section=제2장 운영 > 제3조 보고 | paragraph=chunk_p001]\n본문"
+        )
+
+        self.assertEqual(extract_page(content), "12")
+        self.assertEqual(extract_section(content), "제2장 운영 > 제3조 보고")
+
     def test_section_issue_reasons_flags_invalid_toc_and_inversion(self):
         self.assertIn("invalid_section", section_issue_reasons("Untitled"))
         self.assertIn("table_of_contents_section", section_issue_reasons("목   차"))

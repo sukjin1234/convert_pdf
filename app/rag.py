@@ -76,6 +76,9 @@ CONTEXT_CHAR_BUDGET = 12_000
 MATCH_EVIDENCE_CHAR_LIMIT = 1_800
 SUPPORTING_CONTEXT_CHAR_LIMIT = 1_400
 NORMALIZE_CACHE_CHAR_LIMIT = 2_048
+DIFY_CONTEXT_SECTION_RE = re.compile(
+    r"^(\s*\[context:.*?\|\s*section=)(.*?)(\s*\|\s*paragraph=.*?\]\s*)$"
+)
 
 NUMBER_RECORD_TYPES = {"quantity", "quota", "money", "metric", "table_row", "key_value"}
 TABLE_RECORD_TYPES = {
@@ -1051,6 +1054,12 @@ def clean_dify_markdown_metadata(markdown: str) -> str:
             cleaned_lines.append(f"{source_section.group(1)}{section}")
             continue
 
+        paragraph_context = DIFY_CONTEXT_SECTION_RE.match(line)
+        if paragraph_context:
+            section = clean_section_path(paragraph_context.group(2)) or "Untitled"
+            cleaned_lines.append(f"{paragraph_context.group(1)}{section}{paragraph_context.group(3)}")
+            continue
+
         cleaned_lines.append(line)
     return "\n".join(cleaned_lines).strip()
 
@@ -1192,7 +1201,7 @@ def build_rag_artifact(
             record.chunk_id = first_chunk_id
             records.append(record)
 
-    dify_markdown = "\n\n---\n\n".join(f"{chunk.metadata_text}\n\n{chunk.text}" for chunk in chunks).strip()
+    dify_markdown = "\n\n---\n\n".join(render_dify_chunk(chunk) for chunk in chunks).strip()
     document_map = build_document_map(chunks, records)
     stats = {
         "chunk_count": len(chunks),
@@ -1248,6 +1257,40 @@ def build_metadata_header(
             f"[record_types: {', '.join(record_types) if record_types else 'text'}]",
             f"[keywords: {', '.join(keywords)}]",
         ]
+    )
+
+
+def render_dify_chunk(chunk: RagChunk) -> str:
+    paragraphs = split_contextual_paragraphs(chunk.text)
+    if not paragraphs:
+        return chunk.metadata_text
+
+    contextualized = []
+    for index, paragraph in enumerate(paragraphs, start=1):
+        paragraph_id = f"{chunk.chunk_id}_p{index:03d}"
+        contextualized.append(f"{build_paragraph_context(chunk, paragraph_id)}\n{paragraph}")
+
+    first, *remaining = contextualized
+    rendered = f"{chunk.metadata_text}\n[paragraph_count: {len(paragraphs)}]\n{first}"
+    if remaining:
+        rendered += "\n\n" + "\n\n".join(remaining)
+    return rendered
+
+
+def split_contextual_paragraphs(text: str) -> list[str]:
+    return [
+        paragraph
+        for paragraph in (normalize_markdown(item) for item in re.split(r"\n{2,}", text or ""))
+        if paragraph
+    ]
+
+
+def build_paragraph_context(chunk: RagChunk, paragraph_id: str) -> str:
+    page = chunk.page_start if chunk.page_start is not None else "unknown"
+    section = clean_section_path(chunk.section_path) or "Untitled"
+    return (
+        f"[context: file={clean_cell(chunk.file_name)} | page={page} | "
+        f"section={section} | paragraph={paragraph_id}]"
     )
 
 
