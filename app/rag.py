@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -875,7 +876,7 @@ class RagArtifact:
 
 
 class RagStore:
-    def __init__(self, store_dir: Path | None = None):
+    def __init__(self, store_dir: Path | None = None, *, refresh_interval_seconds: float | None = None):
         self._store_dir_candidates = _rag_store_dir_candidates(store_dir)
         self.store_dir = self._store_dir_candidates[0]
         self._writable_store_dir: Path | None = None
@@ -885,6 +886,13 @@ class RagStore:
         self._loaded = False
         self._revision = 0
         self._lock = threading.Lock()
+        self._disk_snapshot: dict[str, tuple[int, int]] = {}
+        self._last_refresh_check = 0.0
+        self._refresh_interval_seconds = (
+            _rag_store_refresh_interval_seconds()
+            if refresh_interval_seconds is None
+            else max(0.0, float(refresh_interval_seconds))
+        )
 
     def upsert(self, artifact: RagArtifact) -> None:
         with self._lock:
@@ -901,6 +909,7 @@ class RagStore:
                 path = store_dir / f"{_safe_id(artifact.document_id)}.json"
                 try:
                     _write_text_atomic(path, payload)
+                    self._remember_disk_file_locked(path)
                     return
                 except OSError as exc:
                     last_error = f"path={path} error={exc}"
@@ -954,30 +963,79 @@ class RagStore:
 
     def _ensure_loaded_locked(self) -> None:
         if self._loaded:
+            self._refresh_from_disk_if_changed_locked()
             return
         self._loaded = True
-        loaded_any = False
+        paths, snapshot = self._scan_store_files_locked()
+        loaded_any = self._load_store_paths_locked(paths)
+        self._disk_snapshot = snapshot
+        self._last_refresh_check = time.monotonic()
+        if loaded_any:
+            self._revision += 1
+
+    def _refresh_from_disk_if_changed_locked(self) -> None:
+        now = time.monotonic()
+        if now - self._last_refresh_check < self._refresh_interval_seconds:
+            return
+        self._last_refresh_check = now
+        paths, snapshot = self._scan_store_files_locked()
+        changed_paths = [path for path in paths if snapshot.get(str(path)) != self._disk_snapshot.get(str(path))]
+        removed_paths = set(self._disk_snapshot) - set(snapshot)
+        if not changed_paths and not removed_paths:
+            return
+
+        self._load_store_paths_locked(changed_paths)
+        self._disk_snapshot = snapshot
+        self._revision += 1
+
+    def _scan_store_files_locked(self) -> tuple[list[Path], dict[str, tuple[int, int]]]:
+        all_paths: list[Path] = []
+        snapshot: dict[str, tuple[int, int]] = {}
+        seen_paths: set[str] = set()
         for root in self._store_dir_candidates:
             if not root.exists():
                 continue
             try:
-                paths = sorted(root.glob("*.json"))
+                root_paths = sorted(root.glob("*.json"))
             except OSError as exc:
                 logger.warning("Could not read RAG store directory. root=%s error=%s", root, exc)
                 continue
-            for path in paths:
-                try:
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                    artifact = RagArtifact.from_dict(payload)
-                except Exception:
+            for path in root_paths:
+                path_key = str(path)
+                if path_key in seen_paths:
                     continue
-                if artifact.document_id:
-                    self._documents[artifact.document_id] = artifact
-                    loaded_any = True
-                    if artifact.to_dict() != payload:
-                        self._rewrite_migrated_artifact(path, artifact)
-        if loaded_any:
-            self._revision += 1
+                seen_paths.add(path_key)
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                all_paths.append(path)
+                snapshot[path_key] = (stat.st_mtime_ns, stat.st_size)
+        return all_paths, snapshot
+
+    def _load_store_paths_locked(self, paths: Iterable[Path]) -> bool:
+        loaded_any = False
+        for path in paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                artifact = RagArtifact.from_dict(payload)
+            except Exception:
+                continue
+            if artifact.document_id:
+                self._documents[artifact.document_id] = artifact
+                loaded_any = True
+                if artifact.to_dict() != payload:
+                    self._rewrite_migrated_artifact(path, artifact)
+                    self._remember_disk_file_locked(path)
+        return loaded_any
+
+    def _remember_disk_file_locked(self, path: Path) -> None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        self._disk_snapshot[str(path)] = (stat.st_mtime_ns, stat.st_size)
+        self._last_refresh_check = time.monotonic()
 
     def _resolve_writable_store_dir_locked(self) -> Path | None:
         if self._writable_store_dir is not None:
@@ -1129,6 +1187,15 @@ def _rag_store_dir_candidates(store_dir: Path | None = None) -> list[Path]:
 
     candidates.append(Path(tempfile.gettempdir()) / "dify-rag-store")
     return _unique_paths(candidates)
+
+
+def _rag_store_refresh_interval_seconds() -> float:
+    raw = os.getenv("RAG_STORE_REFRESH_INTERVAL_SECONDS", "0.5")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("Invalid RAG_STORE_REFRESH_INTERVAL_SECONDS=%r; using 0.5 seconds.", raw)
+        return 0.5
 
 
 def _assert_writable_dir(path: Path) -> None:

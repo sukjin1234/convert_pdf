@@ -196,6 +196,36 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
             document_ids = {item["document_id"] for item in reloaded.list_documents()}
             self.assertIn("doc_atomic_store", document_ids)
 
+    def test_rag_store_refreshes_artifacts_written_by_another_worker(self):
+        first = build_rag_artifact(
+            "--- Page 1 ---\n\n# Manual\n\n| Item | Value |\n| --- | --- |\n| SLA | 99.9% |",
+            "manual.md",
+            document_id="doc_shared_store",
+        )
+        second = build_rag_artifact(
+            "--- Page 1 ---\n\n# Manual\n\n| Item | Value |\n| --- | --- |\n| SLA | 99.95% |",
+            "manual.md",
+            document_id="doc_shared_store",
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            store_dir = Path(temp_dir)
+            reader = RagStore(store_dir, refresh_interval_seconds=0)
+            writer = RagStore(store_dir, refresh_interval_seconds=0)
+
+            self.assertEqual(reader.records("doc_shared_store"), [])
+            initial_token = reader.cache_token("doc_shared_store")
+            writer.upsert(first)
+            self.assertIn("99.9", reader.records("doc_shared_store")[0].answer_text)
+            first_token = reader.cache_token("doc_shared_store")
+
+            writer.upsert(second)
+            self.assertIn("99.95", reader.records("doc_shared_store")[0].answer_text)
+            second_token = reader.cache_token("doc_shared_store")
+
+            self.assertNotEqual(initial_token, first_token)
+            self.assertNotEqual(first_token, second_token)
+
     def test_rag_store_migrates_legacy_control_characters_on_load(self):
         artifact = build_rag_artifact(
             "--- Page 1 ---\n\n# Manual\n\n| Item | Value |\n| --- | --- |\n| SLA | 99.9% |",

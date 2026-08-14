@@ -21,6 +21,16 @@ opendataloader-pdf-hybrid --port 5002 --ocr-lang "ko,en" --enrich-picture-descri
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+운영 배포에서는 FastAPI worker를 2개로 시작하고 부하 테스트 결과와 메모리 사용량을 보고 4개까지 늘린다. 각 worker는 RAG artifact와 조회 캐시를 별도로 메모리에 올리므로 CPU 수만 보고 과도하게 늘리지 않는다.
+
+```powershell
+$env:RAG_STORE_DIR="D:\dify-rag\rag-store"
+$env:RAG_STORE_REFRESH_INTERVAL_SECONDS="0.5"
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --proxy-headers
+```
+
+모든 worker와 재시작된 컨테이너가 같은 영속 `RAG_STORE_DIR`을 사용해야 한다. 서버는 공유 디렉터리의 artifact 변경을 감지해 worker별 메모리와 조회 캐시를 갱신한다. PDF 변환은 worker 수와 무관하게 프로세스 간 파일 잠금으로 한 번에 하나만 수행해 OCR/GPU 메모리 경합을 막고, `/lookup`, `/query/plan`, `/chatflow/merge-evidence`는 병렬 처리한다.
+
 Dify가 Docker 안에서 실행 중이면 URL은 보통 다음 중 하나다.
 
 ```text
