@@ -1826,6 +1826,42 @@ Create an incident ticket and assess customer impact.
         self.assertEqual(page2_sections, ["정보보호 정책 > 제2장 사고 대응 > 제3조 보고 기한"])
         self.assertNotIn("접근 통제", page2_sections[0])
 
+    def test_plain_numbered_titles_split_sections_when_pdf_parser_misses_headings(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 37 ---
+
+# Ⅸ. 안내사항
+
+#### 2. 입학학기 휴학
+
+신입생은 입학학기 휴학이 불가하다.
+
+3. 장학제도
+
+| 장학명 | 장학금액 |
+| --- | --- |
+| 전체수석 | 수업료 전액 |
+
+4. 입학포기 및 등록금 반환
+
+| 구분 | 반환 방법 |
+| --- | --- |
+| 반환금액 | 등록금 전액 |
+""",
+            "admission.pdf",
+            document_id="doc_plain_outline_titles",
+        )
+
+        sections = {chunk.section_path for chunk in artifact.chunks}
+        self.assertIn("Ⅸ. 안내사항 > 2. 입학학기 휴학", sections)
+        self.assertIn("Ⅸ. 안내사항 > 3. 장학제도", sections)
+        self.assertIn("Ⅸ. 안내사항 > 4. 입학포기 및 등록금 반환", sections)
+        scholarship = next(record for record in artifact.records if record.fields.get("장학명") == "전체수석")
+        refund = next(record for record in artifact.records if record.fields.get("구분") == "반환금액")
+        self.assertEqual(scholarship.section_path, "Ⅸ. 안내사항 > 3. 장학제도")
+        self.assertEqual(refund.section_path, "Ⅸ. 안내사항 > 4. 입학포기 및 등록금 반환")
+
     def test_headingless_visual_page_uses_page_title_as_section(self):
         artifact = build_rag_artifact(
             """

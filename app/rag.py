@@ -1483,20 +1483,22 @@ def iter_section_blocks(markdown: str) -> Iterable[dict[str, Any]]:
                 "text": text,
             }
 
-        for line in page_text.split("\n"):
+        page_lines = page_text.split("\n")
+        for line_index, line in enumerate(page_lines):
             match = HEADING_RE.match(line.strip())
-            if match:
-                title = clean_cell(match.group(2))
+            plain_outline_title = infer_plain_outline_heading(page_lines, line_index) if not match else ""
+            if match or plain_outline_title:
+                title = clean_cell(match.group(2) if match else plain_outline_title)
                 if not title:
                     continue
                 block = flush()
                 if block:
                     yield block
-                level = len(match.group(1))
+                level = len(match.group(1)) if match else (heading_outline_depth(title) or 1)
                 section_stack = update_section_stack(section_stack, level, title)
                 current_section = " > ".join(item_title for _, item_title in section_stack)
                 current_title = title
-                current_lines = [line]
+                current_lines = [line if match else f"{'#' * min(max(level, 1), 6)} {title}"]
                 continue
             current_lines.append(line)
 
@@ -1520,6 +1522,33 @@ def split_pages(markdown: str) -> list[tuple[int | None, str]]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
         pages.append((int(match.group(1)), markdown[start:end].strip()))
     return pages
+
+
+def infer_plain_outline_heading(lines: list[str], index: int) -> str:
+    raw = lines[index]
+    title = clean_cell(raw)
+    if not title or len(title) > 100 or HEADING_RE.match(raw.strip()):
+        return ""
+    if heading_outline_depth(title) is None or looks_like_table_row(title):
+        return ""
+
+    previous_blank = index == 0 or not lines[index - 1].strip()
+    next_blank = index + 1 >= len(lines) or not lines[index + 1].strip()
+    if not previous_blank or not next_blank:
+        return ""
+
+    body = re.sub(
+        r"^(?:[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+|[IVXLCDM]+|제\s*\d+\s*(?:장|절|조)|"
+        r"\d+(?:\.\d+)*\s*[.．)]?)\s*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    if not body or body.startswith(("-", "*", "+", "※")):
+        return ""
+    if re.search(r"[.!?。！？]\s*$|(?:합니다|습니다|한다|된다|있다|없다|가능함|불가함)\s*$", body):
+        return ""
+    return title
 
 
 def should_reset_section_stack_for_page(section_stack: list[tuple[int, str]], page_text: str) -> bool:
