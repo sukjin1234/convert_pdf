@@ -221,26 +221,45 @@ def reingest_document(
         return
 
     payload = build_update_payload(config, item.name, dify_markdown, args.doc_language)
-    response = request_json(
-        "POST",
-        f"{config.base_url}/datasets/{config.dataset_id}/documents/{item.document_id}/update-by-text",
-        config.api_key,
-        body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        content_type="application/json; charset=utf-8",
-        timeout=args.timeout,
-    )
+    try:
+        response = request_json(
+            "POST",
+            f"{config.base_url}/datasets/{config.dataset_id}/documents/{item.document_id}/update-by-text",
+            config.api_key,
+            body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            content_type="application/json; charset=utf-8",
+            timeout=args.timeout,
+        )
+    except RuntimeError as exc:
+        if not update_started_despite_response_error(
+            config,
+            item.document_id,
+            previous_updated_at=document.get("updated_at"),
+            error=exc,
+            timeout=args.timeout,
+        ):
+            raise
+        response = {}
     item.batch = str(response.get("batch") or "")
-    if not item.batch:
-        raise RuntimeError(f"update-by-text response did not include batch: {response}")
 
     indexing_started = time.perf_counter()
-    indexing = poll_indexing_status(
-        config,
-        item.batch,
-        timeout=args.timeout,
-        index_timeout=args.index_timeout,
-        poll_interval=args.poll_interval,
-    )
+    if item.batch:
+        indexing = poll_indexing_status(
+            config,
+            item.batch,
+            timeout=args.timeout,
+            index_timeout=args.index_timeout,
+            poll_interval=args.poll_interval,
+        )
+    else:
+        item.batch = f"document-status:{item.document_id}"
+        indexing = poll_document_status(
+            config,
+            item.document_id,
+            timeout=args.timeout,
+            index_timeout=args.index_timeout,
+            poll_interval=args.poll_interval,
+        )
     item.indexing_seconds = round(time.perf_counter() - indexing_started, 3)
     item.indexing_statuses = list(indexing.get("statuses") or [])
     if indexing.get("failed"):
@@ -509,6 +528,66 @@ def build_update_payload(
     if config.doc_form:
         payload["doc_form"] = config.doc_form
     return payload
+
+
+def update_started_despite_response_error(
+    config: KnowledgeConfig,
+    document_id: str,
+    *,
+    previous_updated_at: Any,
+    error: RuntimeError,
+    timeout: float,
+) -> bool:
+    message = str(error)
+    if "HTTP 400" not in message or "Document is not available" not in message:
+        return False
+    document = get_knowledge_document(config, document_id, timeout=timeout)
+    status = str(document.get("indexing_status") or "")
+    if status == "indexing":
+        return True
+    return status == "completed" and bool(
+        document.get("updated_at") and document.get("updated_at") != previous_updated_at
+    )
+
+
+def poll_document_status(
+    config: KnowledgeConfig,
+    document_id: str,
+    *,
+    timeout: float,
+    index_timeout: float,
+    poll_interval: float,
+) -> dict[str, Any]:
+    deadline = time.perf_counter() + index_timeout
+    samples = []
+    while True:
+        document = get_knowledge_document(config, document_id, timeout=timeout)
+        status = str(document.get("indexing_status") or "")
+        samples.append({"status": status, "updated_at": document.get("updated_at")})
+        if status in {"completed", "error", "paused", "stopped"}:
+            return {
+                "statuses": [status],
+                "entries": [document],
+                "polls": len(samples),
+                "samples": samples,
+                "failed": status != "completed",
+            }
+        if time.perf_counter() >= deadline:
+            return {
+                "statuses": [status],
+                "entries": [document],
+                "polls": len(samples),
+                "samples": samples,
+                "failed": True,
+            }
+        time.sleep(max(poll_interval, 0.5))
+
+
+def get_knowledge_document(config: KnowledgeConfig, document_id: str, *, timeout: float) -> dict[str, Any]:
+    for document in list_existing_knowledge_documents(config, timeout=timeout):
+        if str(document.get("id") or "") == document_id:
+            return document
+    raise RuntimeError(f"Knowledge document disappeared while indexing: {document_id}")
 
 
 def validate_artifact(dify_markdown: str, chunk_count: int, document_id: str) -> None:

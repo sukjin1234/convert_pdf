@@ -7,8 +7,10 @@ from scripts.dify_knowledge_reingest import (
     extract_artifact_document_id,
     filename_from_content_disposition,
     download_document_pdf,
+    poll_document_status,
     rebuild_dify_markdown_from_segments,
     select_documents,
+    update_started_despite_response_error,
     validate_artifact,
 )
 
@@ -137,6 +139,40 @@ class DifyKnowledgeReingestTest(unittest.TestCase):
             line for line in markdown.splitlines() if "section=IX. 안내사항 > 4. 입학포기" in line
         )
         self.assertIn("page=37", refund_context)
+
+    @patch("scripts.dify_knowledge_reingest.get_knowledge_document")
+    def test_response_error_is_accepted_only_when_indexing_started(self, get_document):
+        get_document.return_value = {"indexing_status": "indexing", "updated_at": 20}
+        config = KnowledgeConfig("https://example.test/v1", "secret", "dataset")
+
+        accepted = update_started_despite_response_error(
+            config,
+            "doc-1",
+            previous_updated_at=10,
+            error=RuntimeError('HTTP 400: {"message":"Document is not available"}'),
+            timeout=1,
+        )
+
+        self.assertTrue(accepted)
+
+    @patch("scripts.dify_knowledge_reingest.get_knowledge_document")
+    def test_document_status_polling_reports_terminal_completion(self, get_document):
+        get_document.side_effect = [
+            {"indexing_status": "indexing", "updated_at": 20},
+            {"indexing_status": "completed", "updated_at": 21},
+        ]
+        config = KnowledgeConfig("https://example.test/v1", "secret", "dataset")
+
+        result = poll_document_status(
+            config,
+            "doc-1",
+            timeout=1,
+            index_timeout=1,
+            poll_interval=0,
+        )
+
+        self.assertEqual(result["statuses"], ["completed"])
+        self.assertFalse(result["failed"])
 
 
 if __name__ == "__main__":
