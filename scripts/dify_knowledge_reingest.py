@@ -355,7 +355,7 @@ def rebuild_dify_markdown_from_segments(
     active_keywords = ""
     previous_declared_section = ""
 
-    for segment in sorted(segments, key=segment_sort_key):
+    for segment in coalesce_segment_continuations(segments):
         metadata, body = split_segment_metadata(str(segment.get("content") or ""))
         declared_page = metadata.get("page", "").strip()
         declared_section = clean_section_path(metadata.get("section", ""))
@@ -394,6 +394,21 @@ def rebuild_dify_markdown_from_segments(
                 )
 
     return "\n\n---\n\n".join(rendered_blocks).strip(), len(rendered_blocks)
+
+
+def coalesce_segment_continuations(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    coalesced: list[dict[str, Any]] = []
+    for segment in sorted(segments, key=segment_sort_key):
+        content = str(segment.get("content") or "").strip()
+        metadata, _ = split_segment_metadata(content)
+        if coalesced and "document_id" not in metadata:
+            previous = dict(coalesced[-1])
+            previous_content = str(previous.get("content") or "").rstrip()
+            previous["content"] = f"{previous_content}\n\n{content}".strip()
+            coalesced[-1] = previous
+            continue
+        coalesced.append(dict(segment))
+    return coalesced
 
 
 def segment_sort_key(segment: dict[str, Any]) -> tuple[int, str]:

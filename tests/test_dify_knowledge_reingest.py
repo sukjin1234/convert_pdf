@@ -4,6 +4,7 @@ from unittest.mock import patch
 from scripts.dify_knowledge_pdf_perf_test import KnowledgeConfig
 from scripts.dify_knowledge_reingest import (
     build_update_payload,
+    coalesce_segment_continuations,
     extract_artifact_document_id,
     filename_from_content_disposition,
     download_document_pdf,
@@ -150,6 +151,19 @@ class DifyKnowledgeReingestTest(unittest.TestCase):
 
         self.assertEqual(len(blocks), 4)
         self.assertTrue(all(len(block) <= 780 for block in blocks))
+
+    def test_metadata_less_server_split_is_merged_into_previous_parent(self):
+        segments = [
+            {"id": "a", "position": 1, "content": "[document_id: stable]\n[page: 3]\n\nfirst"},
+            {"id": "b", "position": 2, "content": "forced split continuation"},
+            {"id": "c", "position": 3, "content": "[document_id: stable]\n[page: 4]\n\nnext"},
+        ]
+
+        merged = coalesce_segment_continuations(segments)
+
+        self.assertEqual(len(merged), 2)
+        self.assertIn("first\n\nforced split continuation", merged[0]["content"])
+        self.assertEqual(merged[1]["id"], "c")
 
     @patch("scripts.dify_knowledge_reingest.get_knowledge_document")
     def test_response_error_is_accepted_only_when_indexing_started(self, get_document):
