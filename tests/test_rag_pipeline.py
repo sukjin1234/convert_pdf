@@ -2225,6 +2225,32 @@ AK
         self.assertLessEqual(result["diagnostics"]["hydrated_candidate_count"], 320)
         self.assertLessEqual(formatter.call_count, 160)
 
+    def test_lookup_response_omits_duplicate_chunk_text(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 1 ---
+
+# 운영 정책
+
+| 항목 | 내용 |
+| --- | --- |
+| 장애 대응 | 로그 확인 후 서비스 재시작 |
+""",
+            "policy.pdf",
+            document_id="compact_response",
+        )
+
+        result = lookup_matches(
+            query="장애 대응 방법 알려줘",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=3,
+        )
+
+        self.assertTrue(result["matches"])
+        self.assertTrue(all("chunk_text" not in match for match in result["matches"]))
+        self.assertTrue(all(len(match["supporting_context"]) <= 1403 for match in result["matches"]))
+
 
 if __name__ == "__main__":
     unittest.main()

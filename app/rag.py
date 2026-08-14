@@ -2866,7 +2866,7 @@ def lookup_matches(
         "answer_field": direct_answer["answer_field"],
         "filter_terms": direct_answer["filter_terms"],
         "answer_contract": answer_contract,
-        "matches": combined,
+        "matches": public_lookup_matches(combined),
         "context": format_lookup_context(context_matches, direct_answer),
         "evidence_items": build_evidence_items(context_matches),
         "diagnostics": {
@@ -2880,6 +2880,21 @@ def lookup_matches(
             "source_version_filter": source_filter,
         },
     }
+
+
+def public_lookup_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    public_matches = []
+    for match in matches:
+        item = dict(match)
+        item.pop("chunk_text", None)
+        item["evidence"] = trim_text(str(item.get("evidence") or ""), MATCH_EVIDENCE_CHAR_LIMIT)
+        item["supporting_context"] = trim_text(
+            str(item.get("supporting_context") or ""),
+            SUPPORTING_CONTEXT_CHAR_LIMIT,
+        )
+        item["answer_hint"] = trim_text(str(item.get("answer_hint") or ""), MATCH_EVIDENCE_CHAR_LIMIT)
+        public_matches.append(item)
+    return public_matches
 
 
 def merge_match_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:

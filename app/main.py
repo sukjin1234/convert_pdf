@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, File, Form, Request, UploadFile
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 from .config import Settings, get_settings
@@ -29,6 +30,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Dify OpenDataLoader RAG API")
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 CONVERSION_LOCK = asyncio.Lock()
 CONVERSION_LOCK_POLL_SECONDS = 2
 
