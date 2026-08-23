@@ -8,6 +8,8 @@ from scripts.evaluate_rag_system import (
     evaluate_answer,
     evaluate_citation,
     evaluate_structure,
+    extract_artifact_document_id,
+    parse_document_id_bindings,
     percentile,
     to_segment_view,
 )
@@ -50,6 +52,24 @@ class RagSystemEvaluationTest(unittest.TestCase):
 
         self.assertEqual(view.page, 12)
         self.assertEqual(view.section, "Operations > Retry policy")
+
+    def test_artifact_document_id_is_read_from_knowledge_segment_metadata(self):
+        document_id = extract_artifact_document_id(
+            [
+                {"content": "plain preface"},
+                {"content": "[document_id: stable-artifact-id]\n[page: 12]\nbody"},
+            ]
+        )
+
+        self.assertEqual(document_id, "stable-artifact-id")
+
+    def test_explicit_document_bindings_are_domain_neutral(self):
+        bindings = parse_document_id_bindings(
+            ["operations=artifact-a", "medicine=artifact-b"],
+            [{"key": "operations"}, {"key": "medicine"}],
+        )
+
+        self.assertEqual(bindings, {"operations": "artifact-a", "medicine": "artifact-b"})
 
     def test_citation_checks_file_and_region_separately(self):
         correct, checks = evaluate_citation(

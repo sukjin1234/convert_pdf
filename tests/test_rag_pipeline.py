@@ -279,6 +279,91 @@ class RagPipelineTest(unittest.TestCase):
         self.assertNotIn("2025. 10. 18.", result["direct_answer"])
         self.assertNotIn("수시2차", result["direct_answer"])
 
+    def test_date_lookup_treats_generic_period_term_as_value_type_not_row_filter(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# Schedule
+
+| Category | Event | Phase A | Phase B |
+| --- | --- | --- | --- |
+|  | Payment period | 2027-02-10 ~ 2027-02-12 | 2027-02-15 ~ 2027-02-17 |
+| Submission | Application intake | 2026-09-07 ~ 2026-09-30 | 2026-11-11 ~ 2026-11-25 |
+|  | Interview | 2026-10-16 ~ 2026-10-18 | 2026-12-11 ~ 2026-12-13 |
+""",
+            "schedule.pdf",
+            document_id="doc_schedule_rows",
+        )
+
+        result = lookup_matches(
+            query="Phase A application intake period",
+            retrieval_query="Phase A submission period guide",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            entities=["application intake", "Phase A", "period", "submission", "guide"],
+            query_type="date_lookup",
+            limit=8,
+        )
+
+        self.assertIn("2026-09-07 ~ 2026-09-30", result["direct_answer"])
+        self.assertNotIn("2027-02-10", result["direct_answer"])
+        self.assertTrue(result["answer_items"])
+
+    def test_date_lookup_keeps_specific_event_when_generic_period_term_hits_another_row(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# 일정
+
+| 구분 | 이벤트 | A단계 | B단계 |
+| --- | --- | --- | --- |
+|  | 비용 납부기간 | 2027. 2. 10. ~ 2. 12. | 2027. 2. 15. ~ 2. 17. |
+| 접수 | 신청서 접수 | 2026. 9. 7. ~ 9. 30. | 2026. 11. 11. ~ 11. 25. |
+|  | 면접 | 2026. 10. 16. ~ 10. 18. | 2026. 12. 11. ~ 12. 13. |
+""",
+            "schedule-ko.pdf",
+            document_id="doc_schedule_rows_ko",
+        )
+
+        result = lookup_matches(
+            query="A단계 신청서 접수 기간 알려줘",
+            retrieval_query="A단계 접수 기간 안내",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            entities=["신청서 접수", "A단계", "기간", "접수", "안내"],
+            query_type="date_lookup",
+            limit=8,
+        )
+
+        self.assertIn("2026. 9. 7. ~ 9. 30.", result["direct_answer"])
+        self.assertNotIn("2027. 2. 10.", result["direct_answer"])
+        self.assertTrue(result["answer_items"])
+
+    def test_field_value_row_filter_does_not_require_generic_scalar_attribute(self):
+        matches = [
+            {
+                "record_id": "payment",
+                "fields": {"이벤트": "비용 납부기간", "A단계": "2027. 2. 10. ~ 2. 12."},
+            },
+            {
+                "record_id": "intake",
+                "fields": {"이벤트": "신청 접수", "A단계": "2026. 9. 7. ~ 9. 30."},
+            },
+        ]
+
+        result = rag_module.build_field_value_answer(
+            "A단계 신청 접수 기간",
+            "date_lookup",
+            ["A단계", "신청 접수", "기간"],
+            matches,
+        )
+
+        self.assertIn("2026. 9. 7. ~ 9. 30.", result["direct_answer"])
+        self.assertNotIn("2027. 2. 10.", result["direct_answer"])
+        self.assertEqual(result["filter_terms"], ["신청 접수"])
+
     def test_lookup_rejects_evidence_missing_required_query_entity(self):
         artifact = build_rag_artifact(
             """

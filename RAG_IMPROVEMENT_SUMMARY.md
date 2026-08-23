@@ -54,7 +54,7 @@ python -X utf8 scripts\evaluate_rag_system.py `
 4. 기존 Knowledge PDF는 파서 변경이 실제 인덱스에 반영되도록 재처리한다. 이번 작업에서는 운영 인덱스를 변경하지 않았다.
 5. 위 통합 평가를 1회 실행한다. 10초 게이트를 넘으면 보고서의 `slowest_nodes`에서 p95가 가장 큰 노드부터 조정한다.
 
-현재 API 키로는 Dify App/Knowledge 호출은 가능하지만 Console workflow 편집 권한은 확인되지 않았다(`workflow_edit_available: false`). 따라서 원격 노드 그래프는 `DIFY_RAG_NODE_SETUP.md`의 변경 계약을 Dify Studio에서 반영해야 한다.
+Console access JWT와 CSRF 토큰이 `.env`에 제공되면 `scripts/dify_workflow_patch.py`로 draft 백업, 그래프 패치, 검증, 게시까지 수행할 수 있다. 토큰과 쿠키는 코드나 보고서에 저장하지 않는다.
 
 ## 2026-08-23 배포 후 보정 라운드
 
@@ -81,3 +81,42 @@ python -X utf8 scripts\evaluate_rag_system.py `
 - 수정 평가기로 재측정한 현재 Knowledge 구조 정확도: 93.06%
 
 구조 정확도는 기존 인덱스 기준선이므로 이번 API/Chatflow 보정만 배포해도 자동으로 바뀌지 않는다. 파서 구조 변경을 Knowledge에 반영하는 라운드에서는 두 PDF를 다시 처리·색인한 뒤 측정해야 한다.
+
+## 2026-08-23 Console API 노드 반영 및 게시본 검증
+
+Console API로 현재 draft를 백업한 뒤 44개 노드/30개 엣지 그래프를 검증하고 게시했다. 게시된 그래프 해시는 `0b485ed45c5932f8f6c3318c1822b865a2ef1d9d56fb576a8ec68a09b7621cf6`이다.
+
+반영한 범용 데이터 흐름:
+
+1. Start에 선택 입력 `document_id`를 추가하고 Query Plan, Structured Lookup까지 전달한다.
+2. 사용자 원문 `query`와 문맥 보완용 `retrieval_query`를 분리한다.
+3. Knowledge 검색과 Structured Lookup을 병렬 실행한다.
+4. Structured Lookup의 완전한 단일값 답변은 `IF Deterministic Direct Answer`에서 Final/Verify/Rewrite LLM을 우회한다.
+5. 직접답변이 불가능한 질문만 기존 생성·검증·재작성 경로로 보낸다.
+
+게시본 단건 검증에서 배포 계약은 통과했고, 문서 범위를 지정한 `수시1차 원서접수 기간`은 정답과 단일 출처가 일치했다. 해당 실행의 전체 스트림은 14.137초였고 주요 노드는 질문 재작성 5.634초, Structured Lookup 0.613초, 최종 생성 3.557초였다. 문서 범위를 지정하지 않은 동일 질의는 서로 다른 문서의 동명 일정이 섞여 오답이므로, 호출자가 선택한 문서의 RAG 아티팩트 ID를 `inputs.document_id`로 전달해야 한다.
+
+문서별 아티팩트 ID를 명시해 실행한 36문항 게시본 결과:
+
+- 요청 성공률: 100% (36/36)
+- 답변 정확도: 19.44% (7/36)
+- 출처 정확도: 30.56% (11/36)
+- 답변과 출처 모두 통과: 13.89% (5/36)
+- 평균/p50/p95/최대: 18.064/17.530/29.284/30.715초
+- 노드 p95: 분류 4.990초, 생성 3.731초, 검색 1.330초, 검증 0.197초
+
+직접답변 분기는 일정형 문항에서 4.469~8.053초 실행을 만들었지만, 현재 운영 FastAPI는 `기간`, `값`, `몇`, `amount`, `period` 같은 값 유형 단어를 표 행 식별자로 강제해 올바른 행을 버리는 문제가 남아 있다. 로컬 수정은 이 단어들을 정확 일치하는 범용 scalar 속성으로 분류하고, 이벤트·항목명 같은 실제 행 식별어만 필터에 사용한다. 입학전형 키워드나 문서명은 사용하지 않는다.
+
+평가 도구도 Knowledge 문서 UUID와 RAG 아티팩트 UUID를 구분한다. 세그먼트의 `[document_id: ...]`를 자동 해석하며, 운영 메타데이터가 오래된 경우 다음처럼 매니페스트 문서키별 ID를 명시할 수 있다.
+
+```powershell
+python -X utf8 scripts\evaluate_rag_system.py `
+  --manifest evaluation\rag_acceptance_cases.json `
+  --skip-structure `
+  --document-id <manifest-key>=<artifact-id> `
+  --concurrency 4
+```
+
+현재 Knowledge API 키가 조회하는 두 데이터셋은 비어 있고, Chatflow가 연결한 `ipsi` 데이터셋은 Console 세션에서만 확인된다. 또한 Knowledge 세그먼트의 `[document_id]` 값과 현재 구조화 저장소 ID가 일치하지 않는다. 따라서 다음 배포에서는 FastAPI 재시작 후 아티팩트/Knowledge 동기화를 다시 수행하고, UUID 바인딩을 확인한 뒤 36문항을 재측정해야 한다.
+
+이번 로컬 검증은 `200 passed, 1 skipped`를 기준으로 한다. 운영에 아직 반영되지 않은 코드는 범용 scalar 행 선택 수정, 평가기의 아티팩트 ID 바인딩, Console 세션 진단 지원이다.

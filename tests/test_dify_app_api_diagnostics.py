@@ -1,8 +1,10 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from scripts.dify_app_api_diagnostics import (
+    console_request_headers,
     deployment_contract_status,
     flatten_stream_event,
     has_document_id_key,
@@ -87,6 +89,18 @@ class DifyAppApiDiagnosticsTests(unittest.TestCase):
             path.write_text('{"document_id":"doc-1"}', encoding="utf-8")
 
             self.assertEqual(load_inputs("{}", str(path)), {"document_id": "doc-1"})
+
+    def test_console_headers_support_bearer_session_and_csrf(self):
+        with patch.dict(
+            "os.environ",
+            {"DIFY_CONSOLE_COOKIE": "console-access-token", "DIFY_CONSOLE_CSRF_TOKEN": "csrf-value"},
+            clear=False,
+        ):
+            headers = console_request_headers("app-api-key")
+
+        self.assertEqual(headers["Authorization"], "Bearer console-access-token")
+        self.assertEqual(headers["X-CSRF-Token"], "csrf-value")
+        self.assertIn("__Host-csrf_token=csrf-value", headers["Cookie"])
 
     def test_parse_json_object_requires_object(self):
         with self.assertRaises(ValueError):

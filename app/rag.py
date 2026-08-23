@@ -4056,6 +4056,7 @@ def build_field_value_answer(
         for term in query_terms
         if not any(term_matches_key(term, target_key) for target_key in target_keys)
         and not any(term_in_text(term, value) for value in constraints)
+        and not is_generic_scalar_value_term(term, query_type)
     ]
     row_filter_terms = terms_that_match_any_row_value(row_filter_terms, matches, exclude_keys=target_key_set)
     filtered_matches = filter_matches_by_row_terms(matches, row_filter_terms, exclude_keys=target_key_set)
@@ -4125,6 +4126,61 @@ def build_field_value_answer(
         "filter_terms": row_filter_terms,
         "mode": "field_value",
     }
+
+
+def is_generic_scalar_value_term(term: str, query_type: str) -> bool:
+    """Return true for value-type words that must not identify a table row.
+
+    A query such as "application intake period" uses ``period`` to describe
+    the requested scalar, while ``application intake`` identifies the row.
+    Requiring both terms to occur in a row can accidentally select a different
+    row such as "payment period". Exact matching keeps compound event labels
+    such as "payment period" or "registration deadline" usable as row terms.
+    """
+
+    normalized = normalize_for_match(term).replace(" ", "")
+    generic_terms = {
+        "date_lookup": {
+            "언제",
+            "일정",
+            "기간",
+            "날짜",
+            "일자",
+            "일시",
+            "마감",
+            "기한",
+            "시작",
+            "종료",
+            "schedule",
+            "date",
+            "period",
+            "deadline",
+            "time",
+            "duration",
+        },
+        "number_lookup": {
+            "몇",
+            "얼마",
+            "값",
+            "숫자",
+            "수량",
+            "개수",
+            "건수",
+            "횟수",
+            "인원",
+            "금액",
+            "비율",
+            "율",
+            "value",
+            "number",
+            "count",
+            "quantity",
+            "amount",
+            "rate",
+            "ratio",
+        },
+    }
+    return normalized in generic_terms.get(query_type, set())
 
 
 def choose_scalar_value_field_keys(query: str, query_type: str, matches: list[dict[str, Any]]) -> list[str]:

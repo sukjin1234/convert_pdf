@@ -148,8 +148,9 @@ def probe_console_api(base_url: str, api_key: str, *, app_id: str = "", timeout:
             ]
         )
     probes = {}
+    headers = console_request_headers(api_key)
     for path in paths:
-        status, payload = request_json_or_text("GET", f"{origin}{path}", api_key, timeout=timeout)
+        status, payload = request_json_or_text("GET", f"{origin}{path}", api_key, timeout=timeout, headers=headers)
         probes[path] = summarize_probe_response(status, payload)
     return probes
 
@@ -163,10 +164,35 @@ def console_origin(base_url: str) -> str:
     return base_url.rstrip("/")
 
 
-def request_json_or_text(method: str, url: str, api_key: str, *, timeout: float) -> tuple[int | None, Any]:
+def console_request_headers(fallback_api_key: str) -> dict[str, str]:
+    configured = (os.getenv("DIFY_CONSOLE_COOKIE") or "").strip()
+    headers: dict[str, str] = {}
+    if not configured:
+        headers["Authorization"] = f"Bearer {fallback_api_key}"
+        return headers
+    if "=" in configured:
+        headers["Cookie"] = configured
+    else:
+        headers["Authorization"] = f"Bearer {configured}"
+    csrf = (os.getenv("DIFY_CONSOLE_CSRF_TOKEN") or "").strip()
+    if csrf:
+        headers["X-CSRF-Token"] = csrf
+        if "Cookie" not in headers:
+            headers["Cookie"] = f"csrf_token={csrf}; __Host-csrf_token={csrf}"
+    return headers
+
+
+def request_json_or_text(
+    method: str,
+    url: str,
+    api_key: str,
+    *,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+) -> tuple[int | None, Any]:
     request = urllib.request.Request(
         url,
-        headers={"Authorization": f"Bearer {api_key}"},
+        headers=headers or {"Authorization": f"Bearer {api_key}"},
         method=method,
     )
     try:

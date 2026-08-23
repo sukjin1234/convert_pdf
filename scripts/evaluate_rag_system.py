@@ -64,6 +64,13 @@ def main() -> int:
     parser.add_argument("--env-file", default=str(ROOT / ".env"))
     parser.add_argument("--dataset-id", default=os.getenv("DIFY_KNOWLEDGE_DATASET_ID") or os.getenv("DIFY_DATASET_ID") or "")
     parser.add_argument("--dataset-name", default=os.getenv("DIFY_DATASET_NAME") or "")
+    parser.add_argument(
+        "--document-id",
+        action="append",
+        default=[],
+        metavar="KEY=ARTIFACT_ID",
+        help="Bind a manifest document key to the deployed RAG artifact id. Repeatable.",
+    )
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--segment-concurrency", type=int, default=6)
@@ -83,6 +90,7 @@ def main() -> int:
     manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     documents = validate_manifest(manifest, manifest_path)
+    explicit_document_ids = parse_document_id_bindings(args.document_id, documents)
     cases = list(manifest.get("cases") or [])
     if args.limit > 0:
         cases = cases[: args.limit]
@@ -90,20 +98,22 @@ def main() -> int:
     base_url = (os.getenv("DIFY_API_BASE_URL") or "").rstrip("/")
     knowledge_key = os.getenv("DIFY_KNOWLEDGE_API_KEY") or ""
     app_key = os.getenv("DIFY_APP_API_KEY") or os.getenv("DIFY_API_KEY") or ""
-    if (not args.skip_structure and (not base_url or not knowledge_key)) or (
-        not args.skip_chat and (not base_url or not app_key)
-    ):
+    missing_chat_bindings = {item["key"] for item in documents} - set(explicit_document_ids)
+    knowledge_required = not args.skip_structure or (not args.skip_chat and bool(missing_chat_bindings))
+    if (knowledge_required and (not base_url or not knowledge_key)) or (not args.skip_chat and (not base_url or not app_key)):
         print("Missing DIFY_API_BASE_URL or the required API key in the env file.", file=sys.stderr)
         return 2
 
     started = time.perf_counter()
     dataset_id = args.dataset_id
     knowledge_documents: list[dict[str, Any]] = []
-    document_bindings: dict[str, dict[str, Any]] = {}
+    document_bindings: dict[str, dict[str, Any]] = {
+        key: {"artifact_document_id": document_id} for key, document_id in explicit_document_ids.items()
+    }
     segments_by_document: dict[str, list[dict[str, Any]]] = {}
     structure_results: list[dict[str, Any]] = []
 
-    if not args.skip_structure or not args.skip_chat:
+    if knowledge_required:
         dataset_id, knowledge_documents = resolve_dataset(
             base_url,
             knowledge_key,
@@ -114,7 +124,9 @@ def main() -> int:
         )
         if not dataset_id:
             raise RuntimeError("Could not resolve a Knowledge dataset containing the manifest documents.")
-        document_bindings = bind_documents(documents, knowledge_documents)
+        knowledge_bindings = bind_documents(documents, knowledge_documents)
+        for key, binding in knowledge_bindings.items():
+            document_bindings.setdefault(key, {}).update(binding)
 
     if not args.skip_structure:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(documents), 2))) as pool:
@@ -147,6 +159,27 @@ def main() -> int:
             )
             structure_results.append(result)
 
+    if not args.skip_chat:
+        for item in documents:
+            key = item["key"]
+            if document_bindings[key].get("artifact_document_id"):
+                continue
+            segments = segments_by_document.get(key)
+            if segments is None:
+                segments = fetch_segment_page(
+                    base_url,
+                    knowledge_key,
+                    dataset_id,
+                    str(document_bindings[key]["id"]),
+                    timeout=args.timeout,
+                )
+                segments_by_document[key] = segments
+            if not document_bindings[key].get("artifact_document_id"):
+                artifact_document_id = extract_artifact_document_id(segments)
+                document_bindings[key]["artifact_document_id"] = artifact_document_id or str(
+                    document_bindings[key]["id"]
+                )
+
     quality_results: list[dict[str, Any]] = []
     if not args.skip_chat:
         indexed_cases = list(enumerate(cases))
@@ -157,7 +190,7 @@ def main() -> int:
                     case,
                     base_url=base_url,
                     api_key=app_key,
-                    document_id=str(document_bindings[str(case["document"])]["id"]),
+                    document_id=str(document_bindings[str(case["document"])]["artifact_document_id"]),
                     document=next(item for item in documents if item["key"] == case["document"]),
                     timeout=args.timeout,
                 ): index
@@ -251,6 +284,21 @@ def validate_manifest(payload: dict[str, Any], manifest_path: Path) -> list[dict
         if not case.get("question"):
             raise ValueError(f"Case {case.get('id')} has no question.")
     return documents
+
+
+def parse_document_id_bindings(values: list[str], documents: list[dict[str, Any]]) -> dict[str, str]:
+    valid_keys = {str(item["key"]) for item in documents}
+    bindings: dict[str, str] = {}
+    for value in values:
+        key, separator, document_id = value.partition("=")
+        key = key.strip()
+        document_id = document_id.strip()
+        if not separator or not key or not document_id:
+            raise ValueError(f"Invalid --document-id binding: {value!r}; expected KEY=ARTIFACT_ID")
+        if key not in valid_keys:
+            raise ValueError(f"Unknown manifest document key in --document-id: {key}")
+        bindings[key] = document_id
+    return bindings
 
 
 def load_env_file(path: Path) -> None:
@@ -382,6 +430,34 @@ def fetch_segments_parallel(
                 pages[future_by_page[future]] = future.result()
     segments = [item for page in sorted(pages) for item in payload_items(pages[page]) if isinstance(item, dict)]
     return sorted(segments, key=lambda item: int(item.get("position") or item.get("segment_position") or 0))
+
+
+def fetch_segment_page(
+    base_url: str,
+    api_key: str,
+    dataset_id: str,
+    document_id: str,
+    *,
+    timeout: float,
+) -> list[dict[str, Any]]:
+    query = urllib.parse.urlencode({"page": 1, "limit": 100})
+    payload = request_json(
+        "GET",
+        f"{base_url}/datasets/{dataset_id}/documents/{document_id}/segments?{query}",
+        api_key,
+        timeout=timeout,
+    )
+    return [item for item in payload_items(payload) if isinstance(item, dict)]
+
+
+def extract_artifact_document_id(segments: list[dict[str, Any]]) -> str:
+    pattern = re.compile(r"^\[document_id:\s*([^\]]+)\]", flags=re.MULTILINE)
+    for segment in segments:
+        content = str(segment.get("content") or segment.get("text") or "")
+        match = pattern.search(content)
+        if match:
+            return match.group(1).strip()
+    return ""
 
 
 def extract_pdf_structure(path: Path) -> tuple[list[StructureAnchor], set[int]]:
