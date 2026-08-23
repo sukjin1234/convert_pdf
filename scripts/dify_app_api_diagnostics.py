@@ -341,10 +341,12 @@ def deployment_contract_status(query_plan: Any, structured_lookup: Any) -> dict[
         "knowledge_queries": bool(query_plan.get("knowledge_queries")),
         "lookup_prefilter": "prefilter_limit" in diagnostics and "hydrated_candidate_count" in diagnostics,
         "compact_matches": bool(matches) and all("chunk_text" not in match for match in matches if isinstance(match, dict)),
+        "pipeline_revision": str(diagnostics.get("pipeline_revision") or "").startswith("rag-"),
     }
     return {
         "ready": all(checks.values()),
         "checks": checks,
+        "pipeline_revision": diagnostics.get("pipeline_revision") or "",
         "missing": [name for name, passed in checks.items() if not passed],
     }
 

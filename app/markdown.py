@@ -338,7 +338,9 @@ def _is_page_content_element(element: dict[str, Any]) -> bool:
     element_type = _element_type(element)
     if element_type in {"header", "footer"}:
         return False
-    if _looks_like_running_page_label(_clean_text(element.get("content", ""))):
+    if element_type in {"paragraph", "text"} and _looks_like_running_page_label(
+        _clean_text(element.get("content", ""))
+    ):
         return False
     if element_type == "table" and not _element_has_text(element):
         return False
@@ -349,13 +351,11 @@ def _looks_like_running_page_label(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text).strip()
     if not normalized:
         return False
-    college_name = "\uc778\ud558\uacf5\uc5c5\uc804\ubb38\ub300\ud559"
-    admission_guide = "\ubaa8\uc9d1\uc694\uac15"
-    if re.fullmatch(rf"\d+\s+{re.escape(college_name)}(?:\s+\d{{4}}\S*\s+{re.escape(admission_guide)}\s+\d+)?", normalized):
-        return True
-    if re.fullmatch(rf"\d{{4}}\S*\s+{re.escape(admission_guide)}\s+\d+", normalized):
-        return True
-    return False
+    return bool(
+        re.fullmatch(r"(?:page|p\.?|페이지)?\s*\d{1,4}(?:\s*(?:/|of)\s*\d{1,4})?", normalized, re.IGNORECASE)
+        or re.fullmatch(r"\d{1,3}\s+\S.{1,100}", normalized)
+        or re.fullmatch(r"\S.{1,100}\s+\d{1,3}", normalized)
+    )
 
 
 def _render_metric_grid_page(elements: list[dict[str, Any]]) -> str:
@@ -666,7 +666,7 @@ def _text_items(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rendered = []
     for index, item in enumerate(items):
         text = item["text"]
-        if not text or _is_page_noise(text):
+        if not text or _is_text_item_page_noise(item):
             continue
         bbox = item["bbox"]
         rendered.append(
@@ -750,6 +750,10 @@ def _is_event_text(text: str) -> bool:
 
 def _is_page_noise(text: str) -> bool:
     return _looks_like_running_page_label(text)
+
+
+def _is_text_item_page_noise(item: dict[str, Any]) -> bool:
+    return item.get("type") in {"paragraph", "text"} and _is_page_noise(item.get("text", ""))
 
 
 def _content_fingerprint(value: str) -> str:

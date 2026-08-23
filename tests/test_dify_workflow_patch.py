@@ -22,13 +22,13 @@ def node(node_id, node_type, title, x=0, y=0, **data):
     }
 
 
-def edge(source, target, source_type, target_type):
+def edge(source, target, source_type, target_type, source_handle="source"):
     return {
-        "id": f"{source}-source-{target}-target",
+        "id": f"{source}-{source_handle}-{target}-target",
         "type": "custom",
         "source": source,
         "target": target,
-        "sourceHandle": "source",
+        "sourceHandle": source_handle,
         "targetHandle": "target",
         "data": {"sourceType": source_type, "targetType": target_type, "isInLoop": False},
         "zIndex": 0,
@@ -39,6 +39,8 @@ def sample_graph():
     state_code = "def main(question='', answer='', source_summary=''): return {}"
     nodes = [
         node("start", "start", "Start", variables=[]),
+        node("guard", "code", "Session Follow-up Guard", code="", outputs={}),
+        node("previous-if", "if-else", "IF Previous Source Follow-up", cases=[]),
         node("rewrite", "llm", "Rewrite Standalone Query"),
         node("plan", "http-request", "Query Plan", body={}),
         node("parse-plan", "code", "Parse Query Plan", code="", outputs={}),
@@ -68,6 +70,8 @@ def sample_graph():
     return {
         "nodes": nodes,
         "edges": [
+            edge("previous-if", "rewrite", "if-else", "llm", source_handle="false"),
+            edge("rewrite", "plan", "llm", "http-request"),
             edge("parse-plan", "lookup", "code", "http-request"),
             edge("lookup", "knowledge", "http-request", "knowledge-retrieval"),
             edge("knowledge", "build-merge", "knowledge-retrieval", "code"),
@@ -92,6 +96,8 @@ class DifyWorkflowPatchTests(unittest.TestCase):
         plan_body = plan["data"]["body"]["data"][0]["value"]
         self.assertIn("{{#sys.query#}}", plan_body)
         self.assertIn('"retrieval_query"', plan_body)
+        self.assertIn("{{#guard.standalone_query#}}", plan_body)
+        self.assertFalse(any(item["data"]["title"] == "Rewrite Standalone Query" for item in graph["nodes"]))
         direct_if = next(item for item in graph["nodes"] if item["id"] == DIRECT_IF_ID)
         self.assertEqual(direct_if["data"]["cases"][0]["conditions"][0]["variable_selector"], ["parse-merge", "has_direct_answer"])
         direct_answer = next(item for item in graph["nodes"] if item["id"] == DIRECT_ANSWER_ID)
@@ -100,6 +106,7 @@ class DifyWorkflowPatchTests(unittest.TestCase):
         self.assertNotIn(("lookup", "knowledge"), edge_pairs)
         self.assertIn(("parse-plan", "knowledge"), edge_pairs)
         self.assertIn(("lookup", "build-merge"), edge_pairs)
+        self.assertIn(("previous-if", "plan"), edge_pairs)
 
     def test_patch_is_idempotent(self):
         graph = sample_graph()

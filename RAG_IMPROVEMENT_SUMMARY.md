@@ -120,3 +120,48 @@ python -X utf8 scripts\evaluate_rag_system.py `
 현재 Knowledge API 키가 조회하는 두 데이터셋은 비어 있고, Chatflow가 연결한 `ipsi` 데이터셋은 Console 세션에서만 확인된다. 또한 Knowledge 세그먼트의 `[document_id]` 값과 현재 구조화 저장소 ID가 일치하지 않는다. 따라서 다음 배포에서는 FastAPI 재시작 후 아티팩트/Knowledge 동기화를 다시 수행하고, UUID 바인딩을 확인한 뒤 36문항을 재측정해야 한다.
 
 이번 로컬 검증은 `200 passed, 1 skipped`를 기준으로 한다. 운영에 아직 반영되지 않은 코드는 범용 scalar 행 선택 수정, 평가기의 아티팩트 ID 바인딩, Console 세션 진단 지원이다.
+
+## 2026-08-23 구조 복구·빠른 경로 최종 로컬 검증
+
+원격 재기동 후 단건 실행을 다시 추적한 결과 전체 16.551초 중 `Rewrite Standalone Query`가 5.723초, Structured Lookup이 4.171초, Final LLM이 3.894초였다. 로컬 검색 p95는 1초 미만이므로 주 병목은 검색 엔진이 아니라 모든 독립 질문에 강제된 재작성 LLM이었다. 또한 원격 Structured Lookup 응답에 최신 scalar 수정 결과가 없어서 실행 중인 코드와 저장소 버전을 구분할 수 없었다.
+
+이번 변경은 다음을 반영한다.
+
+- Chatflow에서 `Rewrite Standalone Query` LLM 노드를 제거하고 `Session Follow-up Guard`가 짧은 후속 질문에만 이전 질문을 결정적으로 결합한다. 일반 질문은 원문 그대로 Query Plan으로 전달한다.
+- `/health`와 Structured Lookup 진단에 `pipeline_revision=rag-20260823-fastpath-v2`를 넣어 실제 배포 버전을 추적한다.
+- OpenDataLoader의 제목·표·읽기 순서를 기본으로 유지하면서, 같은 페이지에서 누락된 네이티브 PDF 텍스트 블록만 `Text-layer recovery` 구간에 병합한다. 파일명이나 입학 용어는 사용하지 않는다.
+- PDF 목록 렌더러가 붙인 `1. Ⅴ.` 형태의 중복 번호를 구조적으로 해석해 장/절 계층을 복구한다.
+- 표의 일반 열 이름, 섹션 제목, 페이지 내 인접 캡션과 값의 관계를 분리한다. 이웃 문맥은 검색에는 쓰지만 행에 명시되지 않은 숫자의 직접답변 생성에는 쓰지 않는다.
+- 파일명(`*.pdf`)을 표의 필수 행 엔터티로 오인하지 않으며, 복합 질문은 직접답변 근거 행과 같은 표/섹션의 형제 근거를 앞쪽 문맥에 함께 배치한다.
+- 평가기의 수식 기호 별칭을 문자 그대로 검증해 `÷`, `/` 같은 기호가 정규화 과정에서 사라지지 않게 한다.
+
+실제 두 PDF와 36문항 골든셋을 새 파서로 로컬 평가한 결과:
+
+| 지표 | 결과 | 목표 |
+| --- | ---: | ---: |
+| 구조 경계 정확도 | 97.73% | 95% |
+| 원문 구조 앵커 회수율 | 95.98% | 참고 |
+| 페이지 커버리지 | 99.18% | 참고 |
+| 답변 근거 내용 회수 | 100.00% (36/36) | 95% |
+| 출처 구간 Recall@8 | 100.00% (36/36) | 95% |
+| 답변 근거+출처 동시 통과 | 100.00% (36/36) | 95% |
+| 로컬 분류+검색 p95 | 1.170초 | 참고 |
+| 전체 회귀 테스트 | 204 passed, 1 skipped | 전체 통과 |
+
+차트 축과 값이 별도 그래픽 객체인 구간도 누락된 네이티브 텍스트 블록을 페이지 단위로 복구해 근거 회수 게이트를 통과했다. 숫자형 제목을 페이지 번호로 제거하지 않도록 요소 타입을 보존하며, 캐시 스키마를 `pdf-cache-v6-typed-page-noise`로 올려 이전 변환 결과가 재사용되지 않게 했다.
+
+위 정확도는 최종 LLM 생성 전의 구조·근거·출처 검색 게이트다. 게시된 Chatflow의 최종 답변 내용/인용 정확도와 전체 p95 10초는 빠른 경로 그래프 게시 후 별도로 최종 판정한다.
+
+재사용 가능한 로컬 검증 명령:
+
+```powershell
+python scripts\evaluate_local_pdf_rag.py `
+  --manifest evaluation\rag_acceptance_cases.json `
+  --out .runtime\local_pdf_rag_evaluation.json
+```
+
+현재 Console API 세션 JWT는 만료되어 빠른 경로 그래프의 게시와 게시 후 10초 게이트 측정은 대기 상태다. `.env`의 Console 세션 값을 새로 저장한 뒤 다음 명령으로 백업·검증·게시하며, 게시 후 36문항 Chatflow 평가에서 답변/출처 95%와 p95 10초를 최종 판정한다.
+
+```powershell
+python scripts\dify_workflow_patch.py --apply --publish
+```

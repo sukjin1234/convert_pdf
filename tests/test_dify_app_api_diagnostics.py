@@ -114,7 +114,11 @@ class DifyAppApiDiagnosticsTests(unittest.TestCase):
             },
             {
                 "matches": [{"evidence": "수시1차: 2026. 9. 7."}],
-                "diagnostics": {"prefilter_limit": 160, "hydrated_candidate_count": 12},
+                "diagnostics": {
+                    "prefilter_limit": 160,
+                    "hydrated_candidate_count": 12,
+                    "pipeline_revision": "rag-20260823-fastpath-v2",
+                },
             },
         )
 
@@ -133,7 +137,7 @@ class DifyAppApiDiagnosticsTests(unittest.TestCase):
         self.assertFalse(status["ready"])
         self.assertEqual(
             status["missing"],
-            ["knowledge_query", "knowledge_queries", "lookup_prefilter", "compact_matches"],
+            ["knowledge_query", "knowledge_queries", "lookup_prefilter", "compact_matches", "pipeline_revision"],
         )
 
     def test_node_timing_and_response_size_are_extracted(self):

@@ -2386,6 +2386,13 @@ AK
         self.assertTrue(all("chunk_text" not in match for match in result["matches"]))
         self.assertTrue(all(len(match["supporting_context"]) <= 1403 for match in result["matches"]))
 
+    def test_lookup_diagnostics_expose_pipeline_revision(self):
+        artifact = build_rag_artifact("# Policy\n\nRetention is 30 days.", "policy.md", document_id="revision")
+
+        result = lookup_matches(query="retention period", records=artifact.records, chunks=artifact.chunks)
+
+        self.assertRegex(result["diagnostics"]["pipeline_revision"], r"^rag-\d{8}-")
+
 
 if __name__ == "__main__":
     unittest.main()

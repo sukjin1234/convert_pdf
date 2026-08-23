@@ -701,10 +701,10 @@ def evaluate_answer(answer: str, expected: dict[str, Any]) -> tuple[bool, list[l
     missing = []
     for raw_group in groups:
         group = raw_group if isinstance(raw_group, list) else [raw_group]
-        aliases = [str(value) for value in group if normalize_text(value)]
+        aliases = [str(value) for value in group if clean_text(value)]
         if aliases and not any(answer_contains_alias(answer, alias) for alias in aliases):
             missing.append([str(value) for value in group])
-    forbidden = [str(value) for value in expected.get("none_of") or [] if normalize_text(value)]
+    forbidden = [str(value) for value in expected.get("none_of") or [] if clean_text(value)]
     forbidden_found = any(answer_contains_alias(answer, value) for value in forbidden)
     return bool(groups) and not missing and not forbidden_found, missing
 
@@ -716,6 +716,8 @@ def answer_contains_alias(answer: str, alias: str) -> bool:
         numeric_answer = str(answer or "").replace(",", "")
         return bool(re.search(rf"(?<![\d.]){re.escape(numeric_alias)}(?![\d.])", numeric_answer))
     normalized_alias = normalize_text(cleaned_alias)
+    if not normalized_alias:
+        return cleaned_alias in str(answer or "")
     return bool(normalized_alias and normalized_alias in normalize_text(answer))
 
 

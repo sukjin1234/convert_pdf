@@ -57,6 +57,72 @@ def main(body) -> dict:
 '''
 
 
+SESSION_FOLLOWUP_GUARD_CODE = '''import re
+
+def text(value) -> str:
+    return "" if value is None else str(value)
+
+def parse_session_context(raw: str) -> dict:
+    fields = {}
+    pattern = re.compile(
+        r"<<<DIFY_SESSION_FIELD:([a-zA-Z0-9_]+)>>>\\s*(.*?)\\s*(?=<<<DIFY_SESSION_FIELD:|<<<DIFY_SESSION_END>>>|\\Z)",
+        re.S,
+    )
+    for key, value in pattern.findall(text(raw)):
+        fields[key] = value.strip()
+    return fields
+
+def contains_any(value: str, terms) -> bool:
+    lowered = value.lower()
+    return any(term in lowered for term in terms)
+
+def build_standalone_query(query: str, last_question: str, has_previous_answer: bool) -> str:
+    if not query or not last_question or not has_previous_answer:
+        return query
+    followup_terms = (
+        "그것", "그거", "그건", "그게", "그중", "그 중", "해당", "위의", "앞의", "이전", "방금",
+        "that", "those", "it", "them", "previous", "above",
+    )
+    compact_followup = len(query.split()) <= 5
+    if compact_followup or contains_any(query, followup_terms):
+        return f"{last_question} / 후속 질문: {query}"
+    return query
+
+def main(session_context="", **kwargs) -> dict:
+    if not text(session_context).strip():
+        session_context = kwargs.get("", "")
+    data = parse_session_context(session_context)
+    query = text(data.get("query")).strip()
+    last_question = text(data.get("last_question")).strip()
+    last_answer_brief = text(data.get("last_answer_brief")).strip()
+    last_source_summary = text(data.get("last_source_summary")).strip()
+    last_document_names = text(data.get("last_document_names")).strip()
+
+    asks_source = contains_any(query, ("참조", "출처", "문서", "파일", "페이지", "근거", "source", "document", "file", "page"))
+    refers_previous = contains_any(query, ("방금", "이전", "위 답변", "앞서", "그 답변", "저 답변", "last", "previous", "above", "that"))
+    is_source_followup = asks_source and refers_previous and bool(last_source_summary)
+
+    direct_answer = ""
+    if is_source_followup:
+        if contains_any(query, ("이름", "문서명", "파일명", "name")) and last_document_names:
+            direct_answer = last_document_names
+        else:
+            direct_answer = last_source_summary
+
+    return {
+        "is_source_followup": is_source_followup,
+        "direct_answer": direct_answer,
+        "has_previous_answer": bool(last_answer_brief),
+        "query": query,
+        "standalone_query": build_standalone_query(query, last_question, bool(last_answer_brief)),
+        "last_question": last_question,
+        "last_answer_brief": last_answer_brief,
+        "last_source_summary": last_source_summary,
+        "last_document_names": last_document_names,
+    }
+'''
+
+
 BUILD_LOOKUP_CODE = '''import json
 
 def parse_json_like(value, default=None):
@@ -220,7 +286,9 @@ def patch_workflow(graph: dict[str, Any]) -> list[str]:
         changes.append("migrated generated node ids to Dify-compatible numeric ids")
 
     start = find_node(nodes, node_type="start")
-    rewrite = find_node(nodes, title="Rewrite Standalone Query")
+    rewrite = find_node_optional(nodes, title="Rewrite Standalone Query")
+    session_guard = find_node(nodes, title="Session Follow-up Guard")
+    previous_source_if = find_node(nodes, title="IF Previous Source Follow-up")
     query_plan = find_node(nodes, title="Query Plan")
     parse_plan = find_node(nodes, title="Parse Query Plan")
     structured = find_node(nodes, title="Structured Lookup")
@@ -247,6 +315,9 @@ def patch_workflow(graph: dict[str, Any]) -> list[str]:
         )
         changes.append("added Start.document_id")
 
+    session_guard["data"]["code"] = SESSION_FOLLOWUP_GUARD_CODE
+    session_guard["data"].setdefault("outputs", {})["standalone_query"] = copy.deepcopy(STRING_OUTPUT)
+
     query_plan["data"]["body"] = {
         "type": "json",
         "data": [
@@ -257,14 +328,28 @@ def patch_workflow(graph: dict[str, Any]) -> list[str]:
                 "value": (
                     "{\n"
                     '  "query": {{#sys.query#}},\n'
-                    f'  "retrieval_query": {{{{#{rewrite["id"]}.text#}}}},\n'
+                    f'  "retrieval_query": {{{{#{session_guard["id"]}.standalone_query#}}}},\n'
                     f'  "document_id": {{{{#{start["id"]}.document_id#}}}}\n'
                     "}"
                 ),
             }
         ],
     }
-    changes.append("preserved original query in Query Plan")
+    if rewrite is not None:
+        remove_edges(edges, previous_source_if["id"], rewrite["id"])
+        remove_edges(edges, rewrite["id"], query_plan["id"])
+    ensure_edge(
+        edges,
+        previous_source_if["id"],
+        query_plan["id"],
+        "if-else",
+        "http-request",
+        source_handle="false",
+    )
+    if rewrite is not None:
+        replace_variable_references(nodes, rewrite["id"], "text", parse_plan["id"], "retrieval_query")
+        nodes[:] = [node for node in nodes if node.get("id") != rewrite["id"]]
+    changes.append("replaced unconditional rewrite LLM with deterministic follow-up query fast path")
 
     parse_plan["data"]["code"] = PARSE_QUERY_PLAN_CODE
     parse_plan["data"]["outputs"] = {
@@ -293,7 +378,7 @@ def patch_workflow(graph: dict[str, Any]) -> list[str]:
         "code_language": "python3",
         "variables": [
             selector("query", "sys", "query", "string"),
-            selector("retrieval_query", rewrite["id"], "text", "string"),
+            selector("retrieval_query", parse_plan["id"], "retrieval_query", "string"),
             selector("document_id", parse_plan["id"], "document_id", "string"),
             selector("entities", parse_plan["id"], "entities", "array[string]"),
             selector("query_type", parse_plan["id"], "query_type", "string"),
@@ -434,6 +519,15 @@ def find_node(nodes: list[dict[str, Any]], *, title: str | None = None, node_typ
     return matches[0]
 
 
+def find_node_optional(
+    nodes: list[dict[str, Any]], *, title: str | None = None, node_type: str | None = None
+) -> dict[str, Any] | None:
+    try:
+        return find_node(nodes, title=title, node_type=node_type)
+    except ValueError:
+        return None
+
+
 def upsert_cloned_node(nodes: list[dict[str, Any]], template: dict[str, Any], node_id: str) -> dict[str, Any]:
     for node in nodes:
         if node.get("id") == node_id:
@@ -443,6 +537,23 @@ def upsert_cloned_node(nodes: list[dict[str, Any]], template: dict[str, Any], no
     node["selected"] = False
     nodes.append(node)
     return node
+
+
+def replace_variable_references(value: Any, old_node: str, old_output: str, new_node: str, new_output: str) -> Any:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            value[key] = replace_variable_references(child, old_node, old_output, new_node, new_output)
+        return value
+    if isinstance(value, list):
+        if value == [old_node, old_output]:
+            value[:] = [new_node, new_output]
+            return value
+        for index, child in enumerate(value):
+            value[index] = replace_variable_references(child, old_node, old_output, new_node, new_output)
+        return value
+    if isinstance(value, str):
+        return value.replace(f"{{{{#{old_node}.{old_output}#}}}}", f"{{{{#{new_node}.{new_output}#}}}}")
+    return value
 
 
 def offset_position(node: dict[str, Any], dx: float, dy: float) -> dict[str, float]:

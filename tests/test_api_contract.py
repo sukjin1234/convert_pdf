@@ -195,6 +195,8 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
             reloaded = RagStore(store_dir)
             document_ids = {item["document_id"] for item in reloaded.list_documents()}
             self.assertIn("doc_atomic_store", document_ids)
+            self.assertEqual(reloaded.get_document("doc_atomic_store").file_name, "manual.md")
+            self.assertIsNone(reloaded.get_document("missing"))
 
     def test_rag_store_refreshes_artifacts_written_by_another_worker(self):
         first = build_rag_artifact(
@@ -461,6 +463,13 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
                 detail = detail_response.json()
                 self.assertTrue(detail["success"])
                 self.assertEqual(detail["log"]["query_plan"]["query_type"], "table_lookup")
+
+    def test_health_exposes_pipeline_revision(self):
+        response = TestClient(app).get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ok")
+        self.assertRegex(response.json()["pipeline_revision"], r"^rag-\d{8}-")
 
 
 if __name__ == "__main__":

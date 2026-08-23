@@ -44,7 +44,7 @@ CSV_DOCUMENT_SUFFIXES = {".csv", ".tsv"}
 IMAGE_DOCUMENT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 SUPPORTED_DOCUMENT_LABEL = "PDF, TXT, Markdown, DOCX, CSV, TSV"
 WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-PDF_CONVERSION_CACHE_SCHEMA_VERSION = "pdf-cache-v1"
+PDF_CONVERSION_CACHE_SCHEMA_VERSION = "pdf-cache-v6-typed-page-noise"
 
 
 @dataclass(frozen=True)
@@ -124,6 +124,7 @@ class PdfConverter:
                     self.settings,
                     source_name=safe_name,
                 )
+                markdown = _append_native_pdf_text_gaps(markdown, input_path)
                 return _cache_pdf_conversion_result(pdf_bytes, safe_name, self.settings, markdown)
             except ConversionError as exc:
                 errors.append(f"original: {exc}")
@@ -145,6 +146,7 @@ class PdfConverter:
                         self.settings,
                         source_name=safe_name,
                     )
+                    markdown = _append_native_pdf_text_gaps(markdown, qpdf_repaired_path)
                     return _cache_pdf_conversion_result(pdf_bytes, safe_name, self.settings, markdown)
                 except ConversionError as exc:
                     errors.append(f"qpdf-repaired: {exc}")
@@ -163,6 +165,7 @@ class PdfConverter:
                         self.settings,
                         source_name=safe_name,
                     )
+                    markdown = _append_native_pdf_text_gaps(markdown, repaired_path)
                     return _cache_pdf_conversion_result(pdf_bytes, safe_name, self.settings, markdown)
                 except ConversionError as exc:
                     errors.append(f"repaired: {exc}")
@@ -249,6 +252,118 @@ def _cache_pdf_conversion_result(pdf_bytes: bytes, filename: str, settings: Sett
     except OSError as exc:
         logger.info("PDF conversion cache write failed. file=%s error=%s", filename, exc)
     return markdown
+
+
+def _append_native_pdf_text_gaps(markdown: str, input_path: Path) -> str:
+    """Recover meaningful text-layer blocks omitted by the layout renderer.
+
+    OpenDataLoader remains the primary parser and determines headings, tables,
+    and reading order.  The native PDF layer is used only as a loss-prevention
+    channel: a block is appended to its original page when its normalized text
+    is not already represented on that page.  This is intentionally based on
+    page/block structure, not document names or domain vocabulary.
+    """
+    page_pattern = re.compile(r"(?m)^\s*---\s*Page\s+(\d+)\s*---\s*$")
+    markers = list(page_pattern.finditer(markdown or ""))
+    if not markers:
+        return markdown
+
+    fitz = _load_pymupdf()
+    document = None
+    supplements: dict[int, list[str]] = {}
+    try:
+        document = fitz.open(str(input_path))
+        for page_number, page in enumerate(document, start=1):
+            page_markdown = _markdown_page_body(markdown, markers, page_number)
+            if page_markdown is None:
+                continue
+            page_fingerprint = _text_fingerprint(page_markdown)
+            recovered: list[str] = []
+            for block in page.get_text("blocks", sort=True):
+                if len(block) < 5:
+                    continue
+                text = _normalize_native_text_block(str(block[4] or ""))
+                if not text or _is_native_margin_page_label(text, block, page_number, float(page.rect.height or 1)):
+                    continue
+                fingerprint = _text_fingerprint(text)
+                if len(fingerprint) < 4 or (fingerprint in page_fingerprint and not _is_native_axis_value(text)):
+                    continue
+                if fingerprint in {_text_fingerprint(item) for item in recovered}:
+                    continue
+                recovered.append(text)
+            if recovered:
+                supplements[page_number] = recovered
+    except Exception as exc:
+        logger.info("Native PDF text gap recovery skipped. file=%s error=%s", input_path.name, exc)
+        return markdown
+    finally:
+        if document is not None:
+            document.close()
+
+    if not supplements:
+        return markdown
+    blocks: list[str] = []
+    preface = markdown[: markers[0].start()].strip()
+    if preface:
+        blocks.append(preface)
+    for index, marker in enumerate(markers):
+        page_number = int(marker.group(1))
+        body_start = marker.end()
+        body_end = markers[index + 1].start() if index + 1 < len(markers) else len(markdown)
+        body = markdown[body_start:body_end].strip()
+        recovered = supplements.get(page_number) or []
+        if recovered:
+            recovery = "\n\n".join(recovered)
+            body = f"{body}\n\n# Text-layer recovery\n\n{recovery}".strip()
+        blocks.append(f"--- Page {page_number} ---\n\n{body}".rstrip())
+    return _normalize_markdown("\n\n".join(blocks))
+
+
+def _markdown_page_body(markdown: str, markers: list[re.Match[str]], page_number: int) -> str | None:
+    for index, marker in enumerate(markers):
+        if int(marker.group(1)) != page_number:
+            continue
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(markdown)
+        return markdown[marker.end() : end]
+    return None
+
+
+def _normalize_native_text_block(value: str) -> str:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in value.replace("\r", "\n").split("\n")]
+    return "\n".join(line for line in lines if line)
+
+
+def _text_fingerprint(value: str) -> str:
+    return "".join(re.findall(r"[0-9A-Za-z가-힣]+", str(value or "").lower()))
+
+
+def _is_native_axis_value(text: str) -> bool:
+    """Keep repeated short numeric labels because their order conveys charts."""
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    return len(compact) <= 80 and bool(
+        re.fullmatch(
+            r"(?:[A-Za-z가-힣]*\s*)?[-+]?\d[\d,.]*(?:\s*(?:%|년|월|일|명|개|원|만원|억원|점|ms|s))?"
+            r"(?:\s+[-+]?\d[\d,.]*(?:\s*(?:%|년|월|일|명|개|원|만원|억원|점|ms|s))?)*",
+            compact,
+        )
+    )
+
+
+def _is_native_margin_page_label(text: str, block: Sequence[object], page_number: int, page_height: float) -> bool:
+    if len(block) < 4:
+        return False
+    try:
+        y0, y1 = float(block[1]), float(block[3])
+    except (TypeError, ValueError):
+        return False
+    if y0 < page_height * 0.90 and y1 < page_height * 0.94:
+        return False
+    normalized = re.sub(r"\s+", " ", text).strip()
+    return bool(
+        re.fullmatch(rf"{page_number}\s+\S.{{1,100}}", normalized)
+        or re.fullmatch(rf"\S.{{1,100}}\s+{page_number}", normalized)
+        or re.fullmatch(rf"{page_number}", normalized)
+    )
 
 
 def _pdf_conversion_cache_path(pdf_bytes: bytes, filename: str, settings: Settings) -> Path:

@@ -17,6 +17,7 @@ from .config import Settings, get_settings
 from .converter import DocumentConverter
 from .eval_logs import EVAL_LOG_STORE
 from .rag import (
+    RAG_PIPELINE_REVISION,
     STORE,
     build_grounded_answer_draft,
     build_rag_artifact,
@@ -586,4 +587,4 @@ async def rag_documents() -> dict[str, Any]:
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "pipeline_revision": RAG_PIPELINE_REVISION}

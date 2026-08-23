@@ -225,6 +225,15 @@ FIELD_ALIAS_GROUPS = [
     {"내용", "설명", "정책", "규정", "비고", "content", "detail", "description", "policy", "note"},
 ]
 
+# Cross-domain section-label aliases used only for lexical retrieval expansion.
+# These describe document structures rather than any business domain.
+STRUCTURAL_QUERY_ALIAS_GROUPS = [
+    {"연혁", "연혁상", "걸어온 길", "history", "timeline", "changelog"},
+    {"목차", "table of contents", "contents"},
+    {"요약", "개요", "summary", "overview"},
+    {"유의사항", "주의사항", "notes", "cautions", "important notes"},
+]
+
 CONCEPT_TERMS = {
     "storage": ["저장공간", "저장 공간", "스토리지", "용량", "storage", "storage space", "storage limit", "storage quota", "quota"],
     "compensation": ["연봉", "급여", "임금", "보상", "인상률", "salary", "compensation", "raise"],
@@ -310,6 +319,10 @@ ATTRIBUTE_CONCEPT_TERMS = {
 }
 
 STRICT_ATTRIBUTE_CONCEPTS = {"price", "schedule", "location", "contact", "document", "score"}
+
+# Stable fingerprint used in API traces to prove which deployment handled a
+# request even when git metadata is unavailable in the service container.
+RAG_PIPELINE_REVISION = "rag-20260823-fastpath-v2"
 
 STOPWORDS = {
     "그리고",
@@ -933,6 +946,11 @@ class RagStore:
                 }
                 for artifact in sorted(self._documents.values(), key=lambda item: item.file_name)
             ]
+
+    def get_document(self, document_id: str) -> RagArtifact | None:
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._documents.get(document_id)
 
     def records(self, document_id: str | None = None) -> list[StructuredRecord]:
         with self._lock:
@@ -1669,6 +1687,8 @@ def should_reset_section_stack_for_page(section_stack: list[tuple[int, str]], pa
     if not section_stack:
         return False
     current_title = section_stack[-1][1]
+    if normalize_for_match(current_title) == "text-layer recovery":
+        return True
     if is_table_of_contents_title(current_title):
         return True
     if split_compact_visual_titles(current_title):
@@ -1716,6 +1736,12 @@ def heading_outline_depth(title: str) -> int | None:
     text = clean_cell(title)
     if not text:
         return None
+    # Some PDF list renderers prefix an outline heading with their own ordered
+    # list marker ("1. Ⅴ. 제출서류").  Remove only that wrapper when the
+    # remaining text is itself an unambiguous major-outline marker.
+    wrapped = re.match(r"^\d+\s*[.．)]\s+(.+)$", text)
+    if wrapped and OUTLINE_MAJOR_RE.match(wrapped.group(1)):
+        text = wrapped.group(1)
     if OUTLINE_MAJOR_RE.match(text):
         return 1
 
@@ -1767,7 +1793,13 @@ def repair_outline_section_parts(parts: list[str]) -> list[str]:
 def should_skip_section_block(text: str, section_path: str) -> bool:
     visible = strip_heading_lines(text)
     if not visible:
-        return True
+        # Numeric/formula headings in dashboards and charts carry the value
+        # themselves; dropping a heading-only block loses valid evidence.
+        heading_values = [match.group(2) for line in text.splitlines() if (match := HEADING_RE.match(line.strip()))]
+        return not any(
+            re.fullmatch(r"[\s\d.,:/%()=÷×+\-$₩€]+", value)
+            for value in heading_values
+        )
     if is_table_of_contents_title(section_path):
         return True
     visible_lines = [line for line in visible.splitlines() if line.strip()]
@@ -2952,8 +2984,15 @@ def lookup_matches(
     prefilter_limit = max(limit * 20, 160)
 
     scored_records = []
+    nearby_bonus_cache: dict[str, float] = {}
     for index, record in enumerate(records):
         score = score_record(record, terms, active_query_type)
+        if score > 0:
+            if record.chunk_id not in nearby_bonus_cache:
+                nearby_bonus_cache[record.chunk_id] = nearby_chunk_term_bonus(
+                    record.chunk_id, chunks, chunk_order, terms
+                )
+            score += nearby_bonus_cache[record.chunk_id]
         if score <= 0:
             continue
         scored_records.append((score, index, record))
@@ -3068,6 +3107,7 @@ def lookup_matches(
         "context": context,
         "evidence_items": evidence_items,
         "diagnostics": {
+            "pipeline_revision": RAG_PIPELINE_REVISION,
             "candidate_count": len(scored_records) + len(scored_chunks),
             "hydrated_candidate_count": len(ranked),
             "prefilter_limit": prefilter_limit,
@@ -3132,8 +3172,19 @@ def format_supporting_context(
     if index is None:
         return trim_text(chunk.text, SUPPORTING_CONTEXT_CHAR_LIMIT)
 
+    neighbor_indexes = [index]
+    neighbor_indexes.extend(
+        sorted(
+            (
+                neighbor_index
+                for neighbor_index in range(max(0, index - 3), min(len(chunks), index + 4))
+                if neighbor_index != index
+            ),
+            key=lambda neighbor_index: (len(chunks[neighbor_index].text), abs(neighbor_index - index)),
+        )
+    )
     neighbors = []
-    for neighbor_index in range(max(0, index - 1), min(len(chunks), index + 2)):
+    for neighbor_index in neighbor_indexes:
         neighbor = chunks[neighbor_index]
         if neighbor.document_id != chunk.document_id:
             continue
@@ -3144,6 +3195,25 @@ def format_supporting_context(
         label = "current" if neighbor_index == index else "neighbor"
         neighbors.append(f"[{label} chunk {neighbor.chunk_id} page={neighbor.page_start}]\n{neighbor.text}")
     return trim_text("\n\n".join(neighbors), SUPPORTING_CONTEXT_CHAR_LIMIT)
+
+
+def nearby_chunk_term_bonus(
+    chunk_id: str,
+    chunks: list[RagChunk],
+    chunk_order: dict[str, int],
+    terms: list[str],
+) -> float:
+    """Add a small page-local bonus when a caption and its values were split."""
+    index = chunk_order.get(chunk_id)
+    if index is None:
+        return 0.0
+    current = chunks[index]
+    parts = []
+    for neighbor_index in range(max(0, index - 3), min(len(chunks), index + 4)):
+        neighbor = chunks[neighbor_index]
+        if neighbor.document_id == current.document_id and neighbor.page_start == current.page_start:
+            parts.extend([neighbor.section_path, neighbor.text])
+    return min(6.0, term_coverage(" ".join(parts), terms) * 8.0)
 
 
 def matched_terms(text: str, terms: list[str]) -> list[str]:
@@ -3234,8 +3304,36 @@ def filter_context_matches_for_answer(matches: list[dict[str, Any]], direct_answ
     }
     if not record_ids:
         return filter_context_matches_for_query_type(matches, query_type)
-    filtered = [match for match in matches if str(match.get("record_id") or "") in record_ids]
-    return filtered or matches
+    # Put deterministic answer evidence first but retain the other ranked
+    # evidence.  Multi-row questions and partially extracted visual layouts can
+    # require sibling records that a scalar answer selector did not choose.
+    selected = [match for match in matches if str(match.get("record_id") or "") in record_ids]
+    selected_groups = {
+        (
+            str(match.get("document_id") or ""),
+            str(match.get("chunk_id") or ""),
+            str(match.get("section_path") or ""),
+        )
+        for match in selected
+    }
+    siblings = [
+        match
+        for match in matches
+        if str(match.get("record_id") or "") not in record_ids
+        and (
+            str(match.get("document_id") or ""),
+            str(match.get("chunk_id") or ""),
+            str(match.get("section_path") or ""),
+        )
+        in selected_groups
+    ]
+    sibling_ids = {id(match) for match in siblings}
+    remaining = [
+        match
+        for match in matches
+        if str(match.get("record_id") or "") not in record_ids and id(match) not in sibling_ids
+    ]
+    return [*selected, *siblings, *remaining] or matches
 
 
 def filter_context_matches_for_query_type(matches: list[dict[str, Any]], query_type: str) -> list[dict[str, Any]]:
@@ -3305,6 +3403,8 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
     query_keywords = meaningful_answer_terms([*extract_keywords(query, limit=16), *entities])
     if not query_keywords:
         return empty
+    if not direct_answer_scope_is_explicit(query_keywords, top_group, structured):
+        return empty
 
     if should_build_inverse_list:
         inverse = build_inverse_value_list_answer(query, query_type, query_keywords, top_group)
@@ -3336,6 +3436,55 @@ def build_direct_answer(query: str, query_type: str, entities: list[str], matche
             return pivoted
 
     return empty
+
+
+def direct_answer_scope_is_explicit(
+    query_terms: list[str],
+    matches: list[dict[str, Any]],
+    context_matches: list[dict[str, Any]],
+) -> bool:
+    """Reject scalar synthesis when a required topic exists only in other evidence.
+
+    Neighbor text is valuable for retrieval, but it must not be used to bind an
+    unrelated structured scalar unless the row/section explicitly carries the
+    requested topic.
+    """
+    row_text = " ".join(
+        " ".join(
+            [
+                str(match.get("section_path") or ""),
+                " ".join(str(key) for key in (match.get("fields") or {})),
+                " ".join(str(value) for value in (match.get("fields") or {}).values()),
+            ]
+        )
+        for match in matches
+    )
+    context_text = " ".join(
+        " ".join(
+            [
+                str(match.get("section_path") or ""),
+                str(match.get("evidence") or ""),
+                str(match.get("supporting_context") or ""),
+            ]
+        )
+        for match in context_matches
+    )
+    for term in query_terms:
+        cleaned = strip_query_particle(clean_cell(term))
+        norm = normalize_for_match(cleaned)
+        if (
+            len(norm) < 2
+            or norm in normalized_stopwords()
+            or norm in normalized_generic_list_terms()
+            or is_source_reference_term(cleaned)
+            or is_attribute_only_query_term(cleaned)
+            or looks_like_numeric_or_date(cleaned)
+            or is_generic_topic_term(cleaned)
+        ):
+            continue
+        if term_in_text(cleaned, context_text) and not term_in_text(cleaned, row_text):
+            return False
+    return True
 
 
 def stronger_unstructured_evidence_precedes_structured(matches: list[dict[str, Any]], structured: list[dict[str, Any]]) -> bool:
@@ -3442,6 +3591,12 @@ def latest_versioned_source_group(matches: list[dict[str, Any]], *, query: str, 
     if query_type not in STRUCTURED_LOOKUP_TYPES:
         return []
     if query_has_explicit_version_reference(query):
+        return []
+    # Version preference is a source-selection rule. Dates found in unrelated
+    # rows of one document must never be interpreted as competing source
+    # versions.
+    document_ids = {str(match.get("document_id") or "") for match in matches if match.get("document_id")}
+    if len(document_ids) < 2:
         return []
 
     groups: dict[tuple[Any, Any, Any], list[dict[str, Any]]] = {}
@@ -4189,6 +4344,8 @@ def choose_scalar_value_field_keys(query: str, query_type: str, matches: list[di
 
     query_terms = meaningful_answer_terms(extract_keywords(query, limit=16))
     query_attrs = detect_attribute_concepts(query)
+    numeric_constraints = set(extract_number_values(query)) if query_type == "number_lookup" else set()
+    asks_year = bool(re.search(r"몇\s*년|어느\s*해|what\s+year|which\s+year", query, re.IGNORECASE))
     scores: Counter[str] = Counter()
     explicit_hits: Counter[str] = Counter()
     key_by_norm: dict[str, str] = {}
@@ -4204,6 +4361,11 @@ def choose_scalar_value_field_keys(query: str, query_type: str, matches: list[di
             value = clean_cell(value)
             if not value or not value_matches_scalar_query(value, query_type, query_attrs):
                 continue
+            value_numbers = set(extract_number_values(value))
+            if numeric_constraints and value_numbers and value_numbers <= numeric_constraints:
+                # A value already stated in the question scopes the row; it is
+                # not the unknown scalar to return (e.g. a requested year).
+                continue
 
             key_norm = normalize_for_match(key)
             if not key_norm:
@@ -4218,6 +4380,10 @@ def choose_scalar_value_field_keys(query: str, query_type: str, matches: list[di
                 score += 3.0
             if query_type == "number_lookup" and "price" in query_attrs and MONEY_VALUE_RE.search(value):
                 score += 4.0
+            if asks_year and re.search(r"식별자|identifier|year|연도|년도", key, re.IGNORECASE) and re.search(
+                r"(?<!\d)(?:19|20)\d{2}(?!\d)", value
+            ):
+                score += 12.0
             if query_type == "date_lookup" and "schedule" in query_attrs:
                 score += 3.0
             for term in query_terms:
@@ -4763,13 +4929,27 @@ def structured_row_scope_support(
 
 def structured_match_row_text(match: dict[str, Any]) -> str:
     fields = match.get("fields") or {}
-    parts = []
+    # A section/title is part of a row's semantic scope when visual tables use
+    # generic column names such as "제목" and "내용".
+    parts = [
+        str(match.get("section_path") or match.get("section") or ""),
+        supporting_context_headings(str(match.get("supporting_context") or "")),
+    ]
     for key, value in fields.items():
         if key in MARKER_METADATA_FIELDS:
             continue
         parts.append(str(key))
         parts.append(str(value))
     return " ".join(parts)
+
+
+def supporting_context_headings(text: str) -> str:
+    """Keep only structural headings from neighbor context for row scope."""
+    return " ".join(
+        match.group(2)
+        for line in str(text or "").splitlines()
+        if (match := HEADING_RE.match(line.strip()))
+    )
 
 
 def row_text_supports_term(term: str, row_text: str) -> bool:
@@ -4805,6 +4985,16 @@ def detect_attribute_concepts(text: str) -> set[str]:
         concepts.add("price")
     if DATE_RE.search(text or ""):
         concepts.add("schedule")
+    # Recognize structural location notation across domains without a fixed
+    # place-name dictionary (for example "3호관 1층" or "Building A, floor 2").
+    if re.search(
+        r"(?:\b(?:building|room|floor|hall)\s*[A-Za-z0-9-]+\b|"
+        r"\d+\s*(?:호관|관|동|층|호)\b|"
+        r"\b\d{1,5}\s+[A-Za-z가-힣][A-Za-z가-힣 .-]+(?:street|st\.?|road|rd\.?|로|길)\b)",
+        text or "",
+        re.IGNORECASE,
+    ):
+        concepts.add("location")
     return concepts
 
 
@@ -4840,9 +5030,19 @@ def salient_query_terms_for_answerability(query: str, entities: list[str]) -> li
             continue
         if is_generic_topic_term(term):
             continue
+        if is_source_reference_term(term):
+            continue
         if is_named_query_entity(term) or is_identifier_query_term(term) or re.search(r"\d", term):
             terms.append(term)
     return unique_keep_order(terms)[:6]
+
+
+def is_source_reference_term(term: str) -> bool:
+    """Return true for media/file labels that identify a source, not a row."""
+    norm = normalize_for_match(term)
+    if norm in {"pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv", "markdown"}:
+        return True
+    return bool(re.search(r"\.(?:pdf|docx?|pptx?|xlsx?|csv|md|txt)$", norm, re.IGNORECASE))
 
 
 def is_named_query_entity(term: str) -> bool:
@@ -4879,17 +5079,81 @@ def is_generic_topic_term(term: str) -> bool:
     }
 
 
+def salient_query_pair_phrases(terms: list[str]) -> list[str]:
+    """Build compact two-concept phrases from the original query text."""
+    return list(_salient_query_pair_phrases_cached(tuple(terms)))
+
+
+@lru_cache(maxsize=2_000)
+def _salient_query_pair_phrases_cached(terms: tuple[str, ...]) -> tuple[str, ...]:
+    full_query = next((term for term in terms if len(term.split()) >= 3), "")
+    if not full_query:
+        return ()
+    ignored = normalized_stopwords() | normalized_generic_list_terms() | {
+        "대상",
+        "관련",
+        "경우",
+        "곳",
+        "알려주세요",
+        "설명해주세요",
+    }
+    tokens = []
+    for raw in re.findall(r"[가-힣A-Za-z0-9._/-]{2,40}", full_query):
+        token = strip_query_particle(raw)
+        norm = normalize_for_match(token)
+        if not norm or norm in ignored or looks_like_numeric_or_date(token) or is_source_reference_term(token):
+            continue
+        tokens.append(token)
+    tokens = unique_keep_order(tokens)[:7]
+    return tuple(
+        unique_keep_order(
+            f"{left} {right}"
+            for index, left in enumerate(tokens)
+            for right in tokens[index + 1 :]
+        )[:16]
+    )
+
+
 def score_record(record: StructuredRecord, terms: list[str], query_type: str) -> float:
+    marker_meaning = clean_cell(record.fields.get("표시 의미", ""))
+    include_marker_metadata = any(
+        MARKER_SYMBOL_RE.search(term)
+        or normalize_for_match(term) in {"표시", "표시 의미", "범례", "marker", "legend"}
+        or (
+            len(normalize_for_match(term).replace(" ", "")) >= 4
+            and term_in_text(term, marker_meaning)
+        )
+        for term in terms
+    )
+    searchable_fields = {
+        key: value
+        for key, value in record.fields.items()
+        if include_marker_metadata or key not in MARKER_METADATA_FIELDS
+    }
+    searchable_keywords = [
+        keyword
+        for keyword in record.keywords
+        if include_marker_metadata
+        or not any(term_in_text(keyword, record.fields.get(key, "")) for key in MARKER_METADATA_FIELDS)
+    ]
+    searchable_source = record.source_text
+    searchable_answer = record.answer_text
+    if not include_marker_metadata:
+        for key in MARKER_METADATA_FIELDS:
+            marker_value = clean_cell(record.fields.get(key, ""))
+            if marker_value:
+                searchable_source = searchable_source.replace(marker_value, " ")
+                searchable_answer = searchable_answer.replace(marker_value, " ")
     haystack = normalize_for_match(
         " ".join(
             [
                 record.section_path,
                 record.record_type,
-                record.source_text,
-                record.answer_text,
-                " ".join(record.fields.keys()),
-                " ".join(record.fields.values()),
-                " ".join(record.keywords),
+                searchable_source,
+                searchable_answer,
+                " ".join(searchable_fields.keys()),
+                " ".join(searchable_fields.values()),
+                " ".join(searchable_keywords),
             ]
         )
     )
@@ -4910,6 +5174,9 @@ def score_record(record: StructuredRecord, terms: list[str], query_type: str) ->
                     score += 0.8
     if matched_terms >= 2:
         score += 4.0
+    for phrase in salient_query_pair_phrases(terms):
+        if normalize_for_match(phrase).replace(" ", "") in haystack_compact:
+            score += 5.0
     coverage = term_coverage(haystack, terms)
     has_term_signal = matched_terms > 0 or coverage > 0
     score += coverage * 6.0
@@ -4952,6 +5219,9 @@ def score_chunk(chunk: RagChunk, terms: list[str], query_type: str) -> float:
     score += coverage * 3.0
     if query_type == "number_lookup" and has_term_signal and NUMBER_RE.search(chunk.text):
         score += 1.0
+    for phrase in salient_query_pair_phrases(terms):
+        if normalize_for_match(phrase).replace(" ", "") in haystack_compact:
+            score += 3.0
     if query_type == "date_lookup" and has_term_signal and DATE_RE.search(chunk.text):
         score += 1.0
     if has_term_signal and query_type == "troubleshooting" and re.search(r"오류|에러|장애|실패|원인|해결|error|failure|incident|resolution", chunk.text, re.IGNORECASE):
@@ -6055,6 +6325,11 @@ def query_term_variants(term: str) -> list[str]:
     compact = normalize_for_match(cleaned).replace(" ", "")
     if compact and compact != normalize_for_match(cleaned):
         variants.append(compact)
+    cleaned_norm = normalize_for_match(cleaned)
+    for aliases in STRUCTURAL_QUERY_ALIAS_GROUPS:
+        normalized_aliases = {normalize_for_match(alias): alias for alias in aliases}
+        if any(alias_norm and alias_norm in cleaned_norm for alias_norm in normalized_aliases):
+            variants.extend(normalized_aliases.values())
     return variants
 
 
