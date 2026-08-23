@@ -570,6 +570,12 @@ class RagPipelineTest(unittest.TestCase):
         self.assertIn("[knowledge 1] source=admission.md page=4 score=0.91", merged["knowledge_context"])
         self.assertIn("전공심화 과정은 야간 수업으로 운영됩니다.", merged["evidence_context"])
         self.assertIn("참조 문서: admission.md (p.4)", merged["source_summary"])
+        self.assertTrue(merged["has_direct_answer"])
+        self.assertEqual(merged["answer_contract_status"], "direct_answer")
+        self.assertEqual(
+            merged["deterministic_answer"],
+            "개설 학과: 컴퓨터정보공학과, 기계공학과\n\n참조 문서: admission.md (p.4)",
+        )
 
     def test_merge_evidence_summarizes_structured_sources_before_knowledge_sources(self):
         artifact = build_rag_artifact(
@@ -1205,6 +1211,35 @@ AUTH_401 오류는 Reissue API key로 해결한다.
         self.assertIn("2026. 9. 7.(월) 09:00 ~ 9. 30.(수) 21:00까지", result["direct_answer"])
         self.assertNotIn("10. 2.(금)", result["direct_answer"])
         self.assertNotIn("10. 10.(토)", result["direct_answer"])
+
+    def test_lookup_preserves_original_query_when_retrieval_query_is_rewritten(self):
+        artifact = build_rag_artifact(
+            """
+--- Page 5 ---
+
+# Schedule
+
+| Category | Item | Round A | Round B |
+| --- | --- | --- | --- |
+| Intake | Application submission | 2026-09-07 09:00 ~ 2026-09-30 21:00 | 2026-11-11 09:00 ~ 2026-11-25 21:00 |
+| Intake | Document submission | 2026-10-02 17:00 | 2026-11-27 17:00 |
+| Interview | Interview booking | 2026-10-10 13:00 ~ 17:00 | 2026-12-05 13:00 ~ 17:00 |
+""",
+            "schedule.pdf",
+            document_id="doc_rewritten_schedule",
+        )
+
+        result = lookup_matches(
+            query="Round A application submission period",
+            retrieval_query="What are all dates for Round A in the 2027 schedule?",
+            records=artifact.records,
+            chunks=artifact.chunks,
+            limit=8,
+        )
+
+        self.assertIn("2026-09-07 09:00 ~ 2026-09-30 21:00", result["direct_answer"])
+        self.assertNotIn("2026-10-02", result["direct_answer"])
+        self.assertNotIn("2026-10-10", result["direct_answer"])
 
     def test_schedule_lookup_prefers_latest_academic_year_document(self):
         older = build_rag_artifact(

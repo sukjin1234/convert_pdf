@@ -211,22 +211,22 @@ Start
             -> Build Merge Evidence Body
             -> Merge Evidence Request
             -> Parse Merge Evidence
-            -> Final Answer LLM, 답변 끝에 참조 문서 표시
-            -> Build Verify Body
-            -> Verify Answer
-            -> Parse Verify Result
-            -> Conditional
-               TRUE  -> Build Conversation State(Final Answer)
+            -> IF Deterministic Direct Answer
+               TRUE  -> Build Conversation State(Parse Merge Evidence.deterministic_answer)
                         -> Variable Assigner
                         -> Build Eval Log Body
                         -> Eval Log
                         -> Answer
-               FALSE -> Rewrite Answer LLM
-                        -> Build Conversation State(Rewrite Answer)
-                        -> Variable Assigner
-                        -> Build Eval Log Body
-                        -> Eval Log
-                        -> Answer
+               FALSE -> Final Answer LLM, 답변 끝에 참조 문서 표시
+                        -> Build Verify Body
+                        -> Verify Answer
+                        -> Parse Verify Result
+                        -> Conditional
+                           TRUE  -> Build Conversation State(Final Answer)
+                                    -> Variable Assigner -> Eval Log -> Answer
+                           FALSE -> Rewrite Answer LLM
+                                    -> Build Conversation State(Rewrite Answer)
+                                    -> Variable Assigner -> Eval Log -> Answer
 ```
 
 ### 3.1 Start
@@ -465,9 +465,10 @@ Rewrite Standalone Query
 LLM System Prompt:
 
 ```text
-Rewrite the user's current Korean question into a standalone retrieval query.
+Rewrite the user's current question into a standalone retrieval query in the same language as the current question.
 Use the previous answer only to resolve pronouns and omitted subjects.
 Do not answer the question.
+Never translate the question.
 Keep exact document names, years, departments, dates, and fields if mentioned.
 If the current question is already standalone, return it unchanged.
 Return only the rewritten query.
@@ -495,7 +496,7 @@ Current question:
 standalone_query: string
 ```
 
-이후 `Query Plan`, `Structured Lookup`, `Final Answer`에서 검색용 질문은 `{{Rewrite Standalone Query.standalone_query}}`를 사용한다. `Knowledge Retrieval`에는 긴 질문 대신 `Query Plan`이 만든 짧은 `knowledge_query`를 사용한다. 최종 답변 프롬프트에는 원 질문과 검색용 질문을 둘 다 넣어 사용자의 실제 의도를 유지한다.
+이후 API의 `query`에는 항상 `{{sys.query}}` 원문을 넣고, 독립형 재작성문은 별도 `retrieval_query`에 넣는다. 서버는 두 질의를 검색 신호로 합치되 원문의 언어와 필드 표현을 잃지 않는다. `Knowledge Retrieval`에는 긴 질문 대신 `Query Plan`이 만든 짧은 `knowledge_query`를 사용한다.
 
 ### 3.2 HTTP Request: Query Plan
 
@@ -524,7 +525,8 @@ JSON Body:
 
 ```json
 {
-  "query": "{{Rewrite Standalone Query.standalone_query}}",
+  "query": "{{sys.query}}",
+  "retrieval_query": "{{Rewrite Standalone Query.standalone_query}}",
   "document_id": "{{Start.document_id}}"
 }
 ```
@@ -551,6 +553,7 @@ def main(body) -> dict:
 
     return {
         "query": data.get("query", ""),
+        "retrieval_query": data.get("retrieval_query", ""),
         "document_id": data.get("document_id") or "",
         "query_type": data.get("query_type", "semantic"),
         "answer_style": data.get("answer_style", "grounded_explanation"),
@@ -571,6 +574,7 @@ def main(body) -> dict:
 
 ```text
 query: string
+retrieval_query: string
 document_id: string
 query_type: string
 answer_style: string
@@ -617,7 +621,8 @@ Content-Type: application/json
 입력 변수:
 
 ```text
-query = {{Rewrite Standalone Query.standalone_query}}
+query = {{sys.query}}
+retrieval_query = {{Rewrite Standalone Query.standalone_query}}
 document_id = {{Parse Query Plan.document_id}}
 entities = {{Parse Query Plan.entities}}
 query_type = {{Parse Query Plan.query_type}}
@@ -641,7 +646,7 @@ def parse_json_like(value, default=None):
     except Exception:
         return default
 
-def main(query="", document_id="", entities=None, query_type="semantic", **kwargs) -> dict:
+def main(query="", retrieval_query="", document_id="", entities=None, query_type="semantic", **kwargs) -> dict:
     parsed_entities = parse_json_like(entities, [])
     if isinstance(parsed_entities, str):
         parsed_entities = [part.strip() for part in parsed_entities.split(",") if part.strip()]
@@ -650,6 +655,7 @@ def main(query="", document_id="", entities=None, query_type="semantic", **kwarg
 
     body = {
         "query": str(query or "").strip(),
+        "retrieval_query": str(retrieval_query or "").strip(),
         "document_id": str(document_id or "").strip(),
         "entities": [str(item) for item in parsed_entities if str(item).strip()],
         "query_type": str(query_type or "semantic").strip(),
@@ -829,6 +835,10 @@ def main(body, status_code=200) -> dict:
         "answer_contract_text": as_text(data.get("answer_contract_text")),
         "lookup_diagnostics": as_text(data.get("lookup_diagnostics")),
         "lookup_answerability": as_text(data.get("lookup_answerability")),
+        "answer_contract_status": as_text(data.get("answer_contract_status")),
+        "direct_answer": as_text(data.get("direct_answer")),
+        "has_direct_answer": bool(data.get("has_direct_answer", False)),
+        "deterministic_answer": as_text(data.get("deterministic_answer")),
     }
 ```
 
@@ -844,11 +854,27 @@ answer_contract: string
 answer_contract_text: string
 lookup_diagnostics: string
 lookup_answerability: string
+answer_contract_status: string
+direct_answer: string
+has_direct_answer: boolean
+deterministic_answer: string
 ```
 
 이 구조가 기존의 긴 Dify Code 병합보다 낫다. 정확도에 영향을 주는 근거 병합, `required_values`, Knowledge Retrieval 중첩 포맷 파싱은 FastAPI 한 곳에서 관리하고, Dify Code 노드는 HTTP `body`를 검증하고 펼치는 역할만 한다.
 
-### 3.8 LLM: Final Answer
+### 3.7.1 IF: Deterministic Direct Answer
+
+조건:
+
+```text
+{{Parse Merge Evidence.has_direct_answer}} is true
+```
+
+`true` 분기는 `Parse Merge Evidence.deterministic_answer`를 최종 답변으로 바로 사용한다. 이 값은 구조화 `direct_answer`와 `source_summary`를 서버가 결정적으로 결합한 문자열이므로 Final Answer LLM, Verify Answer, Rewrite Answer LLM을 거치지 않는다. 날짜·요일·금액·목록을 다시 생성 모델에 통과시키지 않아 값 왜곡을 막고 LLM 두 번의 지연을 제거한다.
+
+`false` 분기만 아래 Final Answer LLM과 검증/재작성 경로로 연결한다.
+
+### 3.8 LLM: Final Answer (non-direct path only)
 
 System Prompt:
 
@@ -916,9 +942,9 @@ Answer in Korean unless the user asks for another language.
 
 ### 3.8.1 Save Conversation State
 
-conversation variables는 `Final Answer` 직후가 아니라 `Parse Verify Result` 뒤의 Conditional 분기에서 최종 출력할 답변이 확정된 뒤 갱신한다. 검증 실패한 `Final Answer.text`를 먼저 저장하면 다음 질문에서 “방금 답변의 출처”를 물었을 때 실패 답변의 상태가 재사용될 수 있다.
+conversation variables는 각 분기에서 최종 출력할 답변이 확정된 뒤 갱신한다. 검증 실패한 `Final Answer.text`를 먼저 저장하면 다음 질문에서 “방금 답변의 출처”를 물었을 때 실패 답변의 상태가 재사용될 수 있다.
 
-정상 분기에서는 `Final Answer.text`를 저장하고, 검증 실패 후 재작성 분기에서는 `Rewrite Answer.text`를 저장한다. Dify의 Variable Assigner 노드를 사용하고, 노드 입력으로 필요한 값을 만들기 위해 Code 노드를 하나 둔다.
+결정적 direct 분기에서는 `Parse Merge Evidence.deterministic_answer`, 일반 정상 분기에서는 `Final Answer.text`, 검증 실패 후 재작성 분기에서는 `Rewrite Answer.text`를 저장한다. Dify의 Variable Assigner 노드를 사용하고, 노드 입력으로 필요한 값을 만들기 위해 Code 노드를 하나 둔다.
 
 노드 이름:
 
@@ -930,7 +956,7 @@ Build Conversation State
 
 ```text
 question = {{sys.query}}
-answer = {{Final Answer.text}} 또는 {{Rewrite Answer.text}}
+answer = {{Parse Merge Evidence.deterministic_answer}} 또는 {{Final Answer.text}} 또는 {{Rewrite Answer.text}}
 source_summary = {{Parse Merge Evidence.source_summary}}
 ```
 
@@ -1132,8 +1158,8 @@ evidence_priority = {{Parse Merge Evidence.evidence_priority}}
 source_summary = {{Parse Merge Evidence.source_summary}}
 answer_contract_text = {{Parse Merge Evidence.answer_contract_text}}
 lookup_answerability = {{Parse Merge Evidence.lookup_answerability}}
-final_answer = {{Final Answer.text}}
-verify_answer_body = {{Verify Answer.body}}
+final_answer = 현재 분기의 {{Parse Merge Evidence.deterministic_answer}}, {{Final Answer.text}}, 또는 {{Rewrite Answer.text}}
+verify_answer_body = direct 분기는 빈 문자열, 일반 분기는 {{Verify Answer.body}}
 ```
 
 중요: `knowledge_context`에는 `Knowledge Retrieval.result`를 직접 넣지 말고, 반드시 `Parse Merge Evidence.knowledge_context`를 넣는다. 이 값은 앞선 Merge Evidence Request 응답을 파싱해 검색 결과를 문자열로 정리한 출력이다.
@@ -1285,6 +1311,8 @@ curl http://<fastapi-host>:8000/eval/logs/<run_id>
 ```
 
 ### 3.14 Conditional
+
+이 조건은 `IF Deterministic Direct Answer`의 false 경로에서만 실행한다.
 
 조건:
 
@@ -1669,6 +1697,7 @@ Session Follow-up Guard:
 
 Parse Query Plan:
 - query: string
+- retrieval_query: string
 - document_id: string
 - query_type: string
 - answer_style: string
@@ -1696,6 +1725,10 @@ Parse Merge Evidence:
 - answer_contract_text: string
 - lookup_diagnostics: string
 - lookup_answerability: string
+- answer_contract_status: string
+- direct_answer: string
+- has_direct_answer: boolean
+- deterministic_answer: string
 
 Build Verify Body:
 - verify_body_json: string
@@ -1712,7 +1745,7 @@ Build Eval Log Body:
 - eval_log_body_json: string
 ```
 
-목표 품질을 ChatGPT/Claude에 문서 전체를 넣은 답변에 가깝게 만들려면, Dify Knowledge Retrieval만으로 단정하지 않는다. 현재 구조처럼 `Structured Lookup -> Knowledge Retrieval -> Merge Evidence -> Verify -> Rewrite`를 유지하고, API 점검에서 다음 조건을 통과해야 운영 가능 상태로 본다.
+목표 품질을 ChatGPT/Claude에 문서 전체를 넣은 답변에 가깝게 만들려면, Dify Knowledge Retrieval만으로 단정하지 않는다. 구조화 direct answer는 `Structured Lookup -> Merge Evidence -> Deterministic Answer`로 끝내고, direct answer가 없는 서술형 질문만 `Knowledge Retrieval -> Final Answer -> Verify -> Rewrite`를 사용한다. API 점검에서 다음 조건을 통과해야 운영 가능 상태로 본다.
 
 ```text
 1. /chat-messages가 200을 반환한다.

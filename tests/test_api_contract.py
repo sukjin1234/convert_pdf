@@ -340,6 +340,7 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         response = await chatflow_debug(
             ChatflowDebugRequest(
                 query="전공심화 개설 학과 알려줘",
+                retrieval_query="직전 대화의 전공심화 과정에서 개설된 학과 목록",
                 document_id="doc_chatflow_debug",
                 knowledge_result=[],
                 answer="제공된 문서에는 충분한 근거가 없습니다.",
@@ -348,6 +349,10 @@ class ApiContractTest(unittest.IsolatedAsyncioTestCase):
         payload = response.model_dump() if hasattr(response, "model_dump") else response.dict()
 
         self.assertEqual(payload["query_plan"]["query_type"], "table_lookup")
+        self.assertEqual(
+            payload["query_plan"]["retrieval_query"],
+            "직전 대화의 전공심화 과정에서 개설된 학과 목록",
+        )
         self.assertTrue(payload["node_status"]["structured_lookup_has_context"])
         self.assertIn("Structured Lookup - authoritative exact evidence", payload["merge_evidence"]["evidence_context"])
         self.assertEqual(payload["answer_contract"]["status"], "direct_answer")

@@ -2715,17 +2715,33 @@ def build_document_map(chunks: list[RagChunk], records: list[StructuredRecord]) 
     return list(grouped.values())
 
 
-def plan_query(query: str, document_id: str | None = None) -> dict[str, Any]:
+def plan_query(
+    query: str,
+    document_id: str | None = None,
+    retrieval_query: str | None = None,
+) -> dict[str, Any]:
     normalized_query = clean_cell(query)
-    keywords = extract_keywords(normalized_query, limit=16)
+    normalized_retrieval_query = clean_cell(retrieval_query)
+    search_query = combine_query_text(normalized_query, normalized_retrieval_query)
+    keywords = extract_keywords(search_query, limit=16)
     query_type = classify_query_type(normalized_query)
-    knowledge_queries = build_knowledge_queries(normalized_query, keywords)
-    sub_queries = split_sub_queries(normalized_query, keywords)
-    expanded_queries = build_query_variants(normalized_query, keywords, query_type)
+    if query_type == "semantic" and normalized_retrieval_query:
+        query_type = classify_query_type(search_query)
+    knowledge_queries = build_knowledge_queries(normalized_query, extract_keywords(normalized_query, limit=16))
+    if normalized_retrieval_query:
+        knowledge_queries = unique_keep_order(
+            [
+                *knowledge_queries,
+                *build_knowledge_queries(normalized_retrieval_query, extract_keywords(normalized_retrieval_query, limit=16)),
+            ]
+        )[:3]
+    sub_queries = split_sub_queries(search_query, keywords)
+    expanded_queries = build_query_variants(search_query, keywords, query_type)
     expanded_queries = unique_keep_order([*expanded_queries, *sub_queries])
     answer_style = classify_answer_style(normalized_query, query_type)
     return {
         "query": normalized_query,
+        "retrieval_query": normalized_retrieval_query,
         "document_id": document_id,
         "query_type": query_type,
         "entities": keywords,
@@ -2745,6 +2761,10 @@ def plan_query(query: str, document_id: str | None = None) -> dict[str, Any]:
             "min_evidence_count": 2 if query_type in {"comparison", "summary"} else 1,
         },
     }
+
+
+def combine_query_text(query: str, retrieval_query: str | None = None) -> str:
+    return " ".join(unique_keep_order(clean_cell(value) for value in (query, retrieval_query) if clean_cell(value)))
 
 
 def build_knowledge_queries(query: str, keywords: list[str], limit: int = 3) -> list[str]:
@@ -2907,6 +2927,7 @@ def build_query_variants(query: str, keywords: list[str], query_type: str) -> li
 def lookup_matches(
     *,
     query: str,
+    retrieval_query: str | None = None,
     records: list[StructuredRecord],
     chunks: list[RagChunk],
     entities: list[str] | None = None,
@@ -2914,16 +2935,17 @@ def lookup_matches(
     limit: int = 8,
 ) -> dict[str, Any]:
     timer = StageTimer()
-    plan = plan_query(query)
+    plan = plan_query(query, retrieval_query=retrieval_query)
+    search_query = combine_query_text(query, retrieval_query)
     active_entities = unique_keep_order([*(entities or []), *plan["entities"]])
     active_query_type = query_type or plan["query_type"]
     timer.mark("query_plan")
-    source_filter = source_version_filter_for_query(query, records, chunks)
+    source_filter = source_version_filter_for_query(search_query, records, chunks)
     if source_filter["document_ids"]:
         active_document_ids = set(source_filter["document_ids"])
         records = [record for record in records if record.document_id in active_document_ids]
         chunks = [chunk for chunk in chunks if chunk.document_id in active_document_ids]
-    terms = normalize_terms([query, *active_entities])
+    terms = normalize_terms([search_query, *active_entities])
     timer.mark("source_filter_and_terms")
     chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
     chunk_order = {chunk.chunk_id: index for index, chunk in enumerate(chunks)}
@@ -3011,11 +3033,11 @@ def lookup_matches(
         key=lambda item: (-item["score"], -item["coverage"], item["match_type"]),
     )
     combined = select_evidence_matches(ranked, limit)
-    answerability = assess_answerability(query, active_query_type, active_entities, combined)
+    answerability = assess_answerability(search_query, active_query_type, active_entities, combined)
     if not answerability["answerable"]:
         combined = []
     direct_candidates = select_evidence_matches(ranked, max(limit * 6, 40)) if answerability["answerable"] else []
-    direct_answer = build_direct_answer(query, active_query_type, active_entities, direct_candidates)
+    direct_answer = build_direct_answer(search_query, active_query_type, active_entities, direct_candidates)
     context_source_matches = merge_match_lists(direct_candidates, combined)
     context_matches = filter_context_matches_for_answer(context_source_matches, direct_answer, active_query_type)
     answer_contract = build_answer_contract(
@@ -3032,6 +3054,7 @@ def lookup_matches(
     stage_latency_ms = timer.snapshot(final_stage="evidence_and_response")
     return {
         "query": query,
+        "retrieval_query": clean_cell(retrieval_query),
         "query_type": active_query_type,
         "entities": active_entities,
         "sub_queries": plan.get("sub_queries", []),
@@ -3053,6 +3076,7 @@ def lookup_matches(
             "average_coverage": round(sum(match["coverage"] for match in combined) / len(combined), 3) if combined else 0,
             "answerability": answerability,
             "source_version_filter": source_filter,
+            "retrieval_query_used": bool(clean_cell(retrieval_query)),
             "stage_latency_ms": stage_latency_ms,
         },
     }
@@ -5082,7 +5106,7 @@ def format_answer_contract_context(contract: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result: Any = None) -> dict[str, str]:
+def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result: Any = None) -> dict[str, Any]:
     lookup_payload = parse_json_like(lookup)
     if not isinstance(lookup_payload, dict):
         lookup_payload = {}
@@ -5122,6 +5146,12 @@ def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result
         else "Use Knowledge Retrieval only because Structured Lookup is empty."
     )
     source_summary = build_source_summary(lookup_payload, knowledge_items, prefer_structured=bool(structured_context))
+    answer_contract_status = clean_cell(answer_contract.get("status", ""))
+    direct_answer = clean_cell(answer_contract.get("answer_candidate", ""))
+    has_direct_answer = answer_contract_status == "direct_answer" and bool(direct_answer)
+    deterministic_answer = (
+        f"{direct_answer}\n\n{source_summary}" if has_direct_answer and source_summary else direct_answer
+    )
 
     return {
         "structured_context": structured_context,
@@ -5133,6 +5163,10 @@ def merge_evidence_context(lookup: dict[str, Any] | str | None, knowledge_result
         "answer_contract_text": answer_contract_block,
         "lookup_diagnostics": json.dumps(diagnostics, ensure_ascii=False),
         "lookup_answerability": json.dumps(diagnostics.get("answerability") or {}, ensure_ascii=False),
+        "answer_contract_status": answer_contract_status,
+        "direct_answer": direct_answer,
+        "has_direct_answer": has_direct_answer,
+        "deterministic_answer": deterministic_answer,
     }
 
 

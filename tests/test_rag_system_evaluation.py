@@ -9,6 +9,7 @@ from scripts.evaluate_rag_system import (
     evaluate_citation,
     evaluate_structure,
     percentile,
+    to_segment_view,
 )
 
 
@@ -27,6 +28,28 @@ class RagSystemEvaluationTest(unittest.TestCase):
 
         self.assertFalse(correct)
         self.assertEqual(missing, [["Platform"]])
+
+    def test_numeric_alias_does_not_match_a_larger_number(self):
+        correct, missing = evaluate_answer("This guide is for version 2027.", {"all_of": [["20"]]})
+
+        self.assertFalse(correct)
+        self.assertEqual(missing, [["20"]])
+
+    def test_segment_view_extracts_metadata_before_whitespace_is_collapsed(self):
+        segment = {
+            "id": "segment-1",
+            "content": (
+                "[document_id: doc-1]\n"
+                "[page: 12]\n"
+                "[section: Operations > Retry policy]\n"
+                "Retry attempts are limited to three."
+            ),
+        }
+
+        view = to_segment_view(segment)
+
+        self.assertEqual(view.page, 12)
+        self.assertEqual(view.section, "Operations > Retry policy")
 
     def test_citation_checks_file_and_region_separately(self):
         correct, checks = evaluate_citation(

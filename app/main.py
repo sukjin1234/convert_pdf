@@ -74,6 +74,7 @@ class ConvertRagBatchResponse(BaseModel):
 
 class QueryPlanRequest(BaseModel):
     query: str
+    retrieval_query: str | None = None
     document_id: str | None = None
 
 
@@ -85,6 +86,7 @@ class MarkdownIngestRequest(BaseModel):
 
 class QueryPlanResponse(BaseModel):
     query: str
+    retrieval_query: str = ""
     document_id: str | None = None
     query_type: str
     entities: list[str] = Field(default_factory=list)
@@ -100,6 +102,7 @@ class QueryPlanResponse(BaseModel):
 
 class LookupRequest(BaseModel):
     query: str
+    retrieval_query: str | None = None
     document_id: str | None = None
     entities: list[str] = Field(default_factory=list)
     query_type: str | None = None
@@ -108,6 +111,7 @@ class LookupRequest(BaseModel):
 
 class LookupResponse(BaseModel):
     query: str
+    retrieval_query: str = ""
     query_type: str
     entities: list[str] = Field(default_factory=list)
     sub_queries: list[str] = Field(default_factory=list)
@@ -145,6 +149,7 @@ class VerifyResponse(BaseModel):
 
 class ChatflowDebugRequest(BaseModel):
     query: str
+    retrieval_query: str | None = None
     document_id: str | None = None
     limit: int = 8
     knowledge_result: Any = None
@@ -168,12 +173,16 @@ class MergeEvidenceResponse(BaseModel):
     answer_contract_text: str = ""
     lookup_diagnostics: str = ""
     lookup_answerability: str = ""
+    answer_contract_status: str = ""
+    direct_answer: str = ""
+    has_direct_answer: bool = False
+    deterministic_answer: str = ""
 
 
 class ChatflowDebugResponse(BaseModel):
     query_plan: dict[str, Any]
     structured_lookup: dict[str, Any]
-    merge_evidence: dict[str, str]
+    merge_evidence: dict[str, Any]
     answer_contract: dict[str, Any] = Field(default_factory=dict)
     draft_answer: str
     draft_verification: dict[str, Any]
@@ -419,7 +428,7 @@ def _build_and_store_markdown_artifact(request: MarkdownIngestRequest):
 
 @app.post("/query/plan", response_model=QueryPlanResponse)
 async def query_plan(request: QueryPlanRequest) -> QueryPlanResponse:
-    return QueryPlanResponse(**plan_query(request.query, request.document_id))
+    return QueryPlanResponse(**plan_query(request.query, request.document_id, request.retrieval_query))
 
 
 @app.post("/lookup", response_model=LookupResponse)
@@ -431,6 +440,7 @@ async def lookup(request: LookupRequest) -> LookupResponse:
 
 def _lookup_from_store(request: LookupRequest, limit: int) -> dict[str, Any]:
     document_id = request.document_id or ""
+    retrieval_query = request.retrieval_query or ""
     query_type = request.query_type or ""
     entities = tuple(request.entities or [])
     store_token = STORE.cache_token(document_id or None)
@@ -438,6 +448,7 @@ def _lookup_from_store(request: LookupRequest, limit: int) -> dict[str, Any]:
         id(STORE),
         store_token,
         request.query,
+        retrieval_query,
         document_id,
         entities,
         query_type,
@@ -450,6 +461,7 @@ def _lookup_from_store_cached(
     store_identity: int,
     store_token: str,
     query: str,
+    retrieval_query: str,
     document_id: str,
     entities: tuple[str, ...],
     query_type: str,
@@ -459,6 +471,7 @@ def _lookup_from_store_cached(
     active_document_id = document_id or None
     return lookup_matches(
         query=query,
+        retrieval_query=retrieval_query or None,
         records=STORE.records(active_document_id),
         chunks=STORE.chunks(active_document_id),
         entities=list(entities),
@@ -505,9 +518,10 @@ async def chatflow_debug(request: ChatflowDebugRequest) -> ChatflowDebugResponse
 
 
 def _build_chatflow_debug_payload(request: ChatflowDebugRequest, limit: int) -> dict[str, Any]:
-    plan = plan_query(request.query, request.document_id)
+    plan = plan_query(request.query, request.document_id, request.retrieval_query)
     lookup_result = lookup_matches(
         query=request.query,
+        retrieval_query=request.retrieval_query,
         records=STORE.records(request.document_id),
         chunks=STORE.chunks(request.document_id),
         entities=plan["entities"],

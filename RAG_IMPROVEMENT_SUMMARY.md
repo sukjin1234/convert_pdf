@@ -54,4 +54,30 @@ python -X utf8 scripts\evaluate_rag_system.py `
 4. 기존 Knowledge PDF는 파서 변경이 실제 인덱스에 반영되도록 재처리한다. 이번 작업에서는 운영 인덱스를 변경하지 않았다.
 5. 위 통합 평가를 1회 실행한다. 10초 게이트를 넘으면 보고서의 `slowest_nodes`에서 p95가 가장 큰 노드부터 조정한다.
 
-현재 API 키로는 Dify App/Knowledge 호출은 가능하지만 Console workflow 편집 권한은 확인되지 않았다(`workflow_edit_available: false`). 따라서 원격 노드 그래프를 직접 변경하지 않았으며, 구버전 배포를 로컬 수정 후 다시 확인하는 반복도 수행하지 않는다.
+현재 API 키로는 Dify App/Knowledge 호출은 가능하지만 Console workflow 편집 권한은 확인되지 않았다(`workflow_edit_available: false`). 따라서 원격 노드 그래프는 `DIFY_RAG_NODE_SETUP.md`의 변경 계약을 Dify Studio에서 반영해야 한다.
+
+## 2026-08-23 배포 후 보정 라운드
+
+원격 적용 후 36문항을 다시 측정한 결과는 답변 22.22%, 출처 22.22%, 둘 다 통과 11.11%, 전체 p95 58.056초였다. Structured Lookup p95는 20.743초에서 7.314초로 개선됐지만 다음 데이터 흐름 결함이 남아 있었다.
+
+1. 독립형 질문 재작성 노드가 한국어 원문을 영어로 바꿔 표의 행 식별어를 잃었다.
+2. 구조화 검색이 열은 찾았지만 행을 구분하지 못해 관련 없는 일정까지 `required_values`로 만들었다.
+3. 정확한 구조화 날짜도 Final/Rewrite LLM을 다시 통과하면서 요일이 변조됐다.
+4. 평가기는 세그먼트 줄바꿈을 먼저 제거해 page/section 메타데이터를 읽지 못했고, 숫자 `20`을 `2027` 내부에서 찾는 부분 문자열 오탐 가능성이 있었다.
+
+이번 보정은 문서명이나 입학전형 키워드를 추가하지 않고 다음 범용 계약을 반영한다.
+
+- `/query/plan`, `/lookup`에 `retrieval_query`를 추가한다. `query`는 원문, `retrieval_query`는 문맥 보완용 독립 질문이다.
+- 검색 점수에는 두 질의를 함께 쓰되 필드·행 선택에 필요한 원문 어휘를 보존한다.
+- Merge Evidence 응답에 `has_direct_answer`, `deterministic_answer`, `answer_contract_status`를 추가한다.
+- direct answer가 있으면 Dify에서 Final/Verify/Rewrite LLM을 우회하고 정확한 값과 출처를 그대로 출력한다.
+- 구조 평가기는 raw segment에서 page/section을 먼저 읽은 뒤 표시용 텍스트만 정리한다.
+- 숫자-only 정답 별칭은 숫자 경계를 사용해 더 큰 숫자의 일부와 일치하지 않게 한다.
+
+로컬 검증 결과:
+
+- 전체 테스트: 191 passed, 1 skipped
+- 범용 RAG 품질셋: 33/33, 100%
+- 수정 평가기로 재측정한 현재 Knowledge 구조 정확도: 93.06%
+
+구조 정확도는 기존 인덱스 기준선이므로 이번 API/Chatflow 보정만 배포해도 자동으로 바뀌지 않는다. 파서 구조 변경을 Knowledge에 반영하는 라운드에서는 두 PDF를 다시 처리·색인한 뒤 측정해야 한다.

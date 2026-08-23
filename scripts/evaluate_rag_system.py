@@ -463,14 +463,14 @@ def deduplicate_anchors(anchors: list[StructureAnchor]) -> list[StructureAnchor]
 
 
 def to_segment_view(segment: dict[str, Any]) -> SegmentView:
-    content = clean_text(segment_content(segment))
-    raw_page = extract_page(content)
+    raw_content = segment_content(segment)
+    raw_page = extract_page(raw_content)
     match = re.search(r"\d+", raw_page or "")
     return SegmentView(
         segment_id=str(segment.get("id") or ""),
         page=int(match.group()) if match else None,
-        section=clean_text(extract_section(content)),
-        content=content,
+        section=clean_text(extract_section(raw_content)),
+        content=clean_text(raw_content),
     )
 
 
@@ -621,17 +621,26 @@ def failed_chat_case(case: dict[str, Any], exc: Exception) -> dict[str, Any]:
 
 
 def evaluate_answer(answer: str, expected: dict[str, Any]) -> tuple[bool, list[list[str]]]:
-    normalized = normalize_text(answer)
     groups = expected.get("all_of") or []
     missing = []
     for raw_group in groups:
         group = raw_group if isinstance(raw_group, list) else [raw_group]
-        aliases = [normalize_text(value) for value in group if normalize_text(value)]
-        if aliases and not any(alias in normalized for alias in aliases):
+        aliases = [str(value) for value in group if normalize_text(value)]
+        if aliases and not any(answer_contains_alias(answer, alias) for alias in aliases):
             missing.append([str(value) for value in group])
-    forbidden = [normalize_text(value) for value in expected.get("none_of") or [] if normalize_text(value)]
-    forbidden_found = any(value in normalized for value in forbidden)
+    forbidden = [str(value) for value in expected.get("none_of") or [] if normalize_text(value)]
+    forbidden_found = any(answer_contains_alias(answer, value) for value in forbidden)
     return bool(groups) and not missing and not forbidden_found, missing
+
+
+def answer_contains_alias(answer: str, alias: str) -> bool:
+    cleaned_alias = clean_text(alias)
+    if re.fullmatch(r"[+-]?\d[\d,.]*", cleaned_alias):
+        numeric_alias = cleaned_alias.replace(",", "")
+        numeric_answer = str(answer or "").replace(",", "")
+        return bool(re.search(rf"(?<![\d.]){re.escape(numeric_alias)}(?![\d.])", numeric_answer))
+    normalized_alias = normalize_text(cleaned_alias)
+    return bool(normalized_alias and normalized_alias in normalize_text(answer))
 
 
 def evaluate_citation(answer: str, *, file_name: str, source: dict[str, Any]) -> tuple[bool, dict[str, bool]]:
