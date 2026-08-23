@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import APP_RUNTIME_DIR_NAME
+from .pipeline_metrics import StageTimer
 
 
 logger = logging.getLogger(__name__)
@@ -2912,15 +2913,18 @@ def lookup_matches(
     query_type: str | None = None,
     limit: int = 8,
 ) -> dict[str, Any]:
+    timer = StageTimer()
     plan = plan_query(query)
     active_entities = unique_keep_order([*(entities or []), *plan["entities"]])
     active_query_type = query_type or plan["query_type"]
+    timer.mark("query_plan")
     source_filter = source_version_filter_for_query(query, records, chunks)
     if source_filter["document_ids"]:
         active_document_ids = set(source_filter["document_ids"])
         records = [record for record in records if record.document_id in active_document_ids]
         chunks = [chunk for chunk in chunks if chunk.document_id in active_document_ids]
     terms = normalize_terms([query, *active_entities])
+    timer.mark("source_filter_and_terms")
     chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
     chunk_order = {chunk.chunk_id: index for index, chunk in enumerate(chunks)}
     prefilter_limit = max(limit * 20, 160)
@@ -2931,6 +2935,7 @@ def lookup_matches(
         if score <= 0:
             continue
         scored_records.append((score, index, record))
+    timer.mark("record_scoring")
 
     record_matches = []
     for score, _, record in sorted(scored_records, key=lambda item: (-item[0], item[1]))[:prefilter_limit]:
@@ -2965,6 +2970,7 @@ def lookup_matches(
                 "reason": explain_match(record.record_type, active_query_type, coverage_text, terms),
             }
         )
+    timer.mark("record_hydration")
 
     scored_chunks = []
     for index, chunk in enumerate(chunks):
@@ -2972,6 +2978,7 @@ def lookup_matches(
         if score <= 0:
             continue
         scored_chunks.append((score, index, chunk))
+    timer.mark("chunk_scoring")
 
     chunk_matches = []
     for score, _, chunk in sorted(scored_chunks, key=lambda item: (-item[0], item[1]))[:prefilter_limit]:
@@ -2997,6 +3004,7 @@ def lookup_matches(
                 "reason": explain_match(",".join(chunk.record_types) or "text", active_query_type, chunk.text, terms),
             }
         )
+    timer.mark("chunk_hydration")
 
     ranked = sorted(
         [*record_matches, *chunk_matches],
@@ -3018,6 +3026,10 @@ def lookup_matches(
         answerability=answerability,
         has_structured_context=bool(context_matches),
     )
+    public_matches = public_lookup_matches(combined)
+    context = format_lookup_context(context_matches, direct_answer)
+    evidence_items = build_evidence_items(context_matches)
+    stage_latency_ms = timer.snapshot(final_stage="evidence_and_response")
     return {
         "query": query,
         "query_type": active_query_type,
@@ -3029,9 +3041,9 @@ def lookup_matches(
         "answer_field": direct_answer["answer_field"],
         "filter_terms": direct_answer["filter_terms"],
         "answer_contract": answer_contract,
-        "matches": public_lookup_matches(combined),
-        "context": format_lookup_context(context_matches, direct_answer),
-        "evidence_items": build_evidence_items(context_matches),
+        "matches": public_matches,
+        "context": context,
+        "evidence_items": evidence_items,
         "diagnostics": {
             "candidate_count": len(scored_records) + len(scored_chunks),
             "hydrated_candidate_count": len(ranked),
@@ -3041,6 +3053,7 @@ def lookup_matches(
             "average_coverage": round(sum(match["coverage"] for match in combined) / len(combined), 3) if combined else 0,
             "answerability": answerability,
             "source_version_filter": source_filter,
+            "stage_latency_ms": stage_latency_ms,
         },
     }
 

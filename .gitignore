@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 uvicorn.log
 uvicorn.err
+.env
+.runtime

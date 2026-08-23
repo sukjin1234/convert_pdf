@@ -168,6 +168,24 @@ python scripts/dify_perf_test.py --questions evaluation/dify_perf_questions.json
 
 `scripts/dify_perf_test.py`는 Dify `/chat-messages` API에 질문만 동시 전송합니다. `DIFY_DOCUMENT_ID`가 있으면 Dify App `inputs.document_id`로 자동 전달하고, 질문 JSON에 `document_id`가 있으면 질문별 값이 우선합니다. 노드 결과와 테스트 결과 저장은 Dify Chatflow의 `eval_log` 노드에서 처리합니다. 질문 파일은 `evaluation/dify_perf_questions.json` 같은 JSON, 한 줄에 한 질문을 둔 TXT, 또는 `evaluation/manual_test_questions.md` 같은 Markdown 표를 사용할 수 있습니다.
 
+배포된 Dify Chatflow 답변 품질과 문서/연도 혼합 점검:
+
+```powershell
+python -X utf8 scripts\eval_dify_chat_api.py --timeout 300
+python -X utf8 scripts\eval_dify_chat_api.py --suite mixed --timeout 300
+python -X utf8 scripts\eval_dify_chat_api.py --suite all --timeout 300
+```
+
+이 스크립트는 로컬 FastAPI를 사용하지 않고 Dify App API만 호출합니다. `--suite admission`은 2026/2027 입학 문서와 `inputs.document_id` 제한을, `--suite mixed`는 입학 문서와 소프트웨어 문서가 서로 섞이지 않는지를, `--suite all`은 둘 다 확인합니다. 모든 케이스에서 답변 끝에 `참조 문서:`가 붙는지와 평균 지연시간도 함께 확인합니다.
+
+Dify Knowledge의 페이지/section metadata 전수 점검:
+
+```powershell
+python -X utf8 scripts\check_dify_api_state.py --sections-only --timeout 180
+```
+
+이 검사는 활성 문서의 모든 segment를 순회하며 `[page]/[section]`과 구조화 자식 chunk의 `source_page/source_section`을 함께 확인합니다. 빈 section, `Untitled`, 목차, 제어문자, `하위 번호 > 상위 번호` 형태의 잘못된 개요 계층이 하나라도 있으면 실패합니다. 파서를 배포한 뒤에는 기존 PDF를 Knowledge Pipeline에서 다시 실행해야 segment가 새 metadata로 교체됩니다.
+
 RAG 품질 평가:
 
 ```powershell

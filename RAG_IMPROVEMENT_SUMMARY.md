@@ -1,0 +1,57 @@
+# Dify 사내 RAG 개선 요약
+
+## 적용 범위
+
+이번 변경은 입학전형 전용 분기나 문서명 하드코딩을 파이프라인 코드에 추가하지 않는다. 실제 문서의 질문과 정답은 교체 가능한 `evaluation/rag_acceptance_cases.json`에만 저장하고, 평가기는 제목·문단·표·리스트·수식이라는 구조 유형과 일반적인 정답 별칭/출처 스키마만 이해한다.
+
+## 기준선
+
+- 로컬 단위/통합 테스트: 182 passed, 1 skipped.
+- 운영 Knowledge API: 문서 2개, 세그먼트 1,407개, 기존 메타데이터 감사 이슈 0건. 첫 문서는 610개 세그먼트/22페이지/34개 섹션, 두 번째 문서는 797개 세그먼트/60페이지/81개 섹션이다.
+- 운영 Chatflow 단일 추적: 전체 22.313초. `Structured Lookup` 15.744초, 최종 생성 2.337초, 독립질문 재작성 1.335초, Knowledge 검색 0.490초.
+- 운영 응답 계약은 로컬 최신 계약보다 오래된 상태다. 구조화 조회 응답은 37,346자였고 compact match/prefilter 진단 필드가 없었다.
+- 저장된 8문항 운영 평가 기준선은 답변 통과 3/8(37.5%), 평균 42.405초, 최대 53.315초였다. 당시 문서 ID 기본값이 현재 Knowledge 문서 ID와 달라 문서 필터 실패도 함께 섞여 있었다.
+
+## Before / After
+
+| 구분 | Before | After |
+| --- | --- | --- |
+| 파싱 검증 | page/section 누락과 제어문자 감사 | 원본 PDF의 구조 앵커와 Knowledge 세그먼트 경계를 비교하고 95% 게이트 적용 |
+| 질문셋 | 합성 Markdown 중심 33문항, 운영용 8문항 | 실제 PDF 각 18문항, 총 36문항과 문서/페이지/구간 정답 |
+| 정확도 | 단일 pass/fail 또는 문자열 포함 검사 | 답변 내용 정확도와 인용 출처 정확도를 독립 집계 |
+| 문서 연결 | 오래된 UUID 기본값 | Knowledge 문서명을 조회해 실행 시점 UUID 자동 연결 |
+| 속도 | 전체 시간 위주 | Chatflow 노드/단계별 평균·p95와 로컬 조회 세부 단계 밀리초 기록 |
+| 재사용성 | 입학 문서 기본값이 스크립트에 존재 | 문서 경로·이름·질문·정답을 매니페스트 파라미터로 분리 |
+
+## 반영 파일
+
+- `app/pipeline_metrics.py`: 단조 시계 기반 단계 계측기.
+- `app/rag.py`: `lookup_matches` 진단에 `stage_latency_ms` 추가.
+- `scripts/evaluate_rag_system.py`: Knowledge API 구조 감사, Chatflow 품질/출처/속도 통합 평가기.
+- `evaluation/rag_acceptance_cases.json`: 두 실제 PDF를 균등하게 다루는 36문항 골든셋.
+- `tests/test_rag_system_evaluation.py`: 도메인 독립 평가 계약과 계측 회귀 테스트.
+
+## 실행 방법
+
+```powershell
+python -X utf8 scripts\evaluate_rag_system.py `
+  --manifest evaluation\rag_acceptance_cases.json `
+  --dataset-id <Knowledge dataset UUID> `
+  --concurrency 4 `
+  --fail-under-boundary 0.95 `
+  --fail-under-answer 0.95 `
+  --fail-under-citation 0.95 `
+  --max-p95-latency 10
+```
+
+다른 도메인은 매니페스트의 `documents`와 `cases`만 교체한다. 각 케이스는 질문, 허용 정답 별칭 그룹, 금지값(선택), 출처 페이지/섹션을 선언한다.
+
+## 배포 후 적용 사항
+
+1. 담당자가 운영 서버에서 `git pull`한다.
+2. FastAPI 서비스를 재시작하여 최신 `Query Plan`/`Structured Lookup`/`Verify Answer` 응답 계약을 배포한다.
+3. Dify Chatflow의 HTTP 노드가 새 서비스 주소와 기존 `.env` 키를 그대로 사용하도록 확인한다.
+4. 기존 Knowledge PDF는 파서 변경이 실제 인덱스에 반영되도록 재처리한다. 이번 작업에서는 운영 인덱스를 변경하지 않았다.
+5. 위 통합 평가를 1회 실행한다. 10초 게이트를 넘으면 보고서의 `slowest_nodes`에서 p95가 가장 큰 노드부터 조정한다.
+
+현재 API 키로는 Dify App/Knowledge 호출은 가능하지만 Console workflow 편집 권한은 확인되지 않았다(`workflow_edit_available: false`). 따라서 원격 노드 그래프를 직접 변경하지 않았으며, 구버전 배포를 로컬 수정 후 다시 확인하는 반복도 수행하지 않는다.
